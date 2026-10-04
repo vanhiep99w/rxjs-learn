@@ -45,6 +45,14 @@ Types: `info` (default), `warn`, `error`, `idea`.
 
 ---
 
+## MarbleDiagram (project-specific)
+
+`<MarbleDiagram>` is not built into Fumadocs. Use it for RxJS emission, subscription, cancellation, completion, and error timelines only after confirming that the project registers it in `mdx-components.tsx`.
+
+Read [`marble-diagrams.md`](marble-diagrams.md) for the exact project API, notation, alignment rules, fallback behavior, and worked MDX example. Do not substitute Mermaid for an RxJS marble timeline.
+
+---
+
 ## Mermaid diagrams
 
 Plain fenced code block with `mermaid` as the language:

@@ -1,25 +1,33 @@
 ---
 name: fumadocs-technical-writer
-description: Use this skill whenever the user asks Claude to write, draft, or restructure technical documentation intended for a Fumadocs-based docs site (architecture docs, design docs, API docs, runbooks, guides, READMEs headed for a docs/ folder, or any .mdx/.md technical write-up). Trigger it any time the user mentions "fumadocs", "tài liệu kỹ thuật", "technical doc", "design doc", "kiến trúc hệ thống", "API doc", "runbook", or asks for a document that needs a diagram (Mermaid or ASCII) explaining a flow, architecture, or process — even if they don't explicitly say "Fumadocs" or "MDX". Also use it when editing/improving an existing .mdx doc, or when the user wants diagrams embedded inside a markdown document rather than as a standalone image. Do NOT use this for generic blog posts, marketing copy, or Word/PDF/PPTX deliverables (use the docx/pptx/pdf skills for those instead).
+description: Write, draft, or restructure technical documentation for Fumadocs-based sites, including architecture docs, design docs, API docs, runbooks, guides, docs-folder READMEs, and other .mdx/.md technical pages. Use when the user mentions Fumadocs, tài liệu kỹ thuật, technical docs, design docs, kiến trúc hệ thống, API docs, runbooks, embedded Mermaid/ASCII diagrams, or RxJS marble/timeline diagrams; also use when editing existing MDX documentation. Do not use for generic blog posts, marketing copy, or Word/PDF/PPTX deliverables.
 ---
 
 # Fumadocs Technical Writer
 
 Write technical documentation as `.mdx`/`.md` files styled for [Fumadocs](https://www.fumadocs.dev/) — the React.js documentation framework. Fumadocs renders GitHub-Flavored Markdown plus MDX (JSX-in-Markdown) and ships a set of built-in components (Callout, Cards, Tabs, Steps, TypeTable, Files, Accordion, etc.) that make technical docs far more readable than plain prose.
 
-This skill covers: **what to output, how to structure it, which Fumadocs component to reach for, and how to decide between Mermaid diagrams and ASCII diagrams.**
+This skill covers: **what to output, how to structure it, which Fumadocs component to reach for, and how to choose among RxJS marble diagrams, Mermaid, and ASCII.**
 
 ## Workflow
 
 1. **Figure out the doc type.** Architecture/design doc, API reference, runbook/operations guide, getting-started guide, or a general explainer. The doc type drives structure (see `references/doc-structures.md` if you want fuller templates — but for most requests you can just use the patterns below directly).
-2. **Figure out the diagram strategy** (see below) before writing — plan diagrams alongside the content, not as an afterthought bolted on at the end.
+2. **Figure out the diagram strategy** (see below) before writing — plan RxJS marble, Mermaid, or ASCII diagrams alongside the content, not as an afterthought bolted on at the end.
 3. **Write the file** with correct Fumadocs frontmatter and componentized structure (see `references/fumadocs-components.md` for full syntax of every component), in the human voice described under "Voice" below.
 4. **Save as `.mdx`** by default (safe superset — plain Markdown files still work fine as `.mdx`), unless the user's project clearly uses plain `.md` (e.g., they show you existing `.md` files in the repo — then match that).
 5. Create the file with the `create_file`/file tools as normal (see file-creation guidance in the main instructions) — this produces a real file the user can drop into their `content/docs/` folder, not just a chat reply.
 
-## Diagram strategy: Mermaid vs ASCII
+## Diagram strategy: Marble vs Mermaid vs ASCII
 
 Don't default to one blindly — pick per-diagram based on this:
+
+**Use `<MarbleDiagram>` when:**
+- The subject is an RxJS or ReactiveX timeline: emissions, completion, error, subscription windows, cancellation, scheduler behavior, or flattening operators.
+- Multiple streams must align on the same virtual-time axis so the reader can compare source, inner, subscription, and output rows.
+- The project already registers a marble component in `mdx-components.tsx`, or the user asks you to add the renderer. Inspect the actual component and its prop types before writing MDX; never guess a custom API.
+- Read `references/marble-diagrams.md` for the canonical API, notation, alignment rules, and verification checklist used by this project.
+
+Do **not** use Mermaid for RxJS marble timelines. Mermaid can draw a generic sequence, but it does not preserve marble notation or frame alignment cleanly.
 
 **Use Mermaid (` ```mermaid ` code block) when:**
 - The diagram is non-trivial (more than ~5 nodes, has branching/decision logic, sequence/timing matters, or is a flowchart/sequence/state/ER/gantt diagram).
@@ -32,9 +40,9 @@ Don't default to one blindly — pick per-diagram based on this:
 - It's decorative/illustrative rather than precise (e.g., a rough mental model), where hand-drawn boxes read faster than a rendered graph.
 - Directory/file trees — use Fumadocs' `<Files>` component instead if it's an actual file structure being documented (see reference doc), otherwise plain ASCII tree.
 
-**Default when unsure:** Mermaid for architecture/flow/sequence diagrams (they're the modern standard and Fumadocs users who ask for this skill are almost always on a Mermaid-capable setup or will configure it), ASCII for small inline sketches and file trees. If truly ambiguous and it materially changes the deliverable, ask — otherwise just pick and mention the choice briefly.
+**Default when unsure:** use `<MarbleDiagram>` for RxJS timing/lifecycle behavior when the renderer exists, Mermaid for architecture/flow/sequence diagrams, and ASCII for small inline sketches, hand-drawn marble fallbacks, and file trees. If the renderer is absent and adding it is outside scope, use a `text` marble block and say that the visual component is unavailable. If ambiguity materially changes the deliverable, ask; otherwise pick and mention the choice briefly.
 
-Never generate diagrams as external image files/PNGs for content that's naturally a diagram — keep it as text (Mermaid/ASCII) so it stays version-controllable and matches how Fumadocs docs are normally authored. Only reach for an actual image file (`![alt](/path.png)`) for genuine screenshots, photos, or logos.
+Never generate diagrams as external image files/PNGs for content that's naturally a diagram — keep the source as MDX props, Mermaid, or ASCII so it stays version-controllable. Only reach for an actual image file (`![alt](/path.png)`) for genuine screenshots, photos, or logos.
 
 ## Multi-part technical series
 
@@ -128,6 +136,7 @@ Reach for these components as the content calls for them (full syntax in the ref
 - **`<Files>`** — showing a project/directory file tree.
 - **`<Accordion>`** — optional/advanced detail that would clutter the main flow (FAQs, edge cases).
 - **`<Cards>`** — linking out to related pages at the end of a doc.
+- **`<MarbleDiagram>`** — project-specific visual timelines for RxJS emissions and lifecycle; inspect registration first and follow `references/marble-diagrams.md`.
 - Tabbed code blocks (` ```npm ` style) — install commands across package managers.
 
 Don't over-componentize a short doc — a two-paragraph doc doesn't need Steps/Tabs/Accordion just because they exist. Match component density to doc complexity.
@@ -163,5 +172,6 @@ There is no target length and no ceiling — never cut content, explanation, or 
 
 Before producing the file:
 
-- View `references/fumadocs-components.md` for exact import statements and JSX syntax for every component mentioned above — get these right the first time rather than guessing at prop names.
+- View `references/fumadocs-components.md` for exact import statements and JSX syntax for built-in components — get these right the first time rather than guessing at prop names.
 - View `references/writing-voice.md` for the voice rules, the list of machine-sounding phrases to avoid, and the per-doc-type register. Run its short self-check before saving the file.
+- When the page contains an RxJS marble/timeline, view `references/marble-diagrams.md`, then inspect the project's actual `MarbleDiagram` implementation and global MDX registration before authoring the rows.
