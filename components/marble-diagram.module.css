@@ -1,78 +1,53 @@
 .figure {
-  --marble-surface: oklch(0.985 0.008 78);
-  --marble-surface-strong: oklch(0.965 0.012 78);
-  --marble-ink: oklch(0.25 0.025 255);
-  --marble-muted: oklch(0.5 0.025 255);
-  --marble-border: oklch(0.86 0.018 78);
-  --marble-grid: oklch(0.87 0.018 255 / 55%);
-  --marble-source: oklch(0.55 0.14 55);
-  --marble-inner: oklch(0.49 0.12 252);
-  --marble-output: oklch(0.48 0.12 153);
-  --marble-error: oklch(0.54 0.18 27);
-  --marble-marker-ink: oklch(0.985 0.006 78);
+  --marble-surface: #ffffff;
+  --marble-page: #ececec;
+  --marble-ink: #323232;
+  --marble-muted: #7c7c7c;
+  --marble-border: #d4d4d4;
+  --marble-rule: #323232;
+  --marble-error: #d6402f;
+  --marble-outline: #161616;
+  --marble-text: #171717;
+  --marble-blue: #3ea1cb;
+  --marble-green: #82d736;
+  --marble-yellow: #ffcb46;
+  --marble-red: #ff6946;
 
   margin-block: 1.75rem;
   overflow: hidden;
   border: 1px solid var(--marble-border);
-  border-radius: 0.75rem;
+  border-radius: 3px;
   background: var(--marble-surface);
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 12%),
+    0 3px 10px rgb(0 0 0 / 5%);
   color: var(--marble-ink);
 }
 
 :global(.dark) .figure {
-  --marble-surface: oklch(0.225 0.018 255);
-  --marble-surface-strong: oklch(0.255 0.021 255);
-  --marble-ink: oklch(0.92 0.012 78);
-  --marble-muted: oklch(0.7 0.025 255);
-  --marble-border: oklch(0.36 0.025 255);
-  --marble-grid: oklch(0.42 0.025 255 / 52%);
-  --marble-source: oklch(0.66 0.14 63);
-  --marble-inner: oklch(0.65 0.11 252);
-  --marble-output: oklch(0.65 0.12 153);
-  --marble-error: oklch(0.66 0.17 28);
-  --marble-marker-ink: oklch(0.18 0.018 255);
+  --marble-surface: #202224;
+  --marble-page: #181a1b;
+  --marble-ink: #eeeeec;
+  --marble-muted: #a7a7a7;
+  --marble-border: #45484b;
+  --marble-rule: #eeeeec;
+  --marble-error: #ff6946;
+  --marble-outline: #101112;
+  --marble-text: #171717;
+
+  box-shadow:
+    0 1px 2px rgb(0 0 0 / 38%),
+    0 4px 14px rgb(0 0 0 / 22%);
 }
 
-.header {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 1.5rem;
-  padding: 1rem 1.125rem 0.9rem;
+.fallbackTitle {
+  padding: 1.15rem 1.25rem;
   border-bottom: 1px solid var(--marble-border);
-  background: var(--marble-surface-strong);
-}
-
-.eyebrow {
-  margin-bottom: 0.28rem;
-  color: var(--marble-muted);
-  font-size: 0.67rem;
-  font-weight: 700;
-  letter-spacing: 0.14em;
-  line-height: 1;
-  text-transform: uppercase;
-}
-
-.title {
   color: var(--marble-ink);
-  font-size: clamp(0.92rem, 1.6vw, 1.04rem);
-  font-weight: 650;
-  letter-spacing: -0.012em;
-  line-height: 1.35;
-}
-
-.frameLabel {
-  flex: none;
-  margin-top: 0.1rem;
-  padding: 0.26rem 0.48rem;
-  border: 1px solid var(--marble-border);
-  border-radius: 0.3rem;
-  color: var(--marble-muted);
-  font-size: 0.7rem;
-  font-variant-numeric: tabular-nums;
-  font-weight: 600;
-  line-height: 1.25;
-  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 1.05rem;
+  font-weight: 500;
+  text-align: center;
 }
 
 .mobileScrollHint {
@@ -88,7 +63,7 @@
 }
 
 .scroller:focus-visible {
-  outline: 2px solid var(--marble-inner);
+  outline: 2px solid var(--marble-blue);
   outline-offset: -2px;
 }
 
@@ -98,88 +73,93 @@
   background: var(--marble-surface);
 }
 
-.axisText {
+.axisText,
+.frameText {
   fill: var(--marble-muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 9px;
   font-variant-numeric: tabular-nums;
+}
+
+.axisText {
+  font-size: 9px;
   font-weight: 600;
 }
 
-.gridLine,
-.majorGridLine,
-.rowDivider,
+.frameText {
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.015em;
+}
+
+.rulerTick,
 .baseline,
 .terminalMarker line,
 .errorMarker circle,
 .errorMarker line,
 .lifecycleMarker line,
-.lifecycleMarker path {
+.lifecycleMarker path,
+.unsubscribeMarker line {
   vector-effect: non-scaling-stroke;
 }
 
-.gridLine {
-  stroke: var(--marble-grid);
-  stroke-dasharray: 2 5;
-  stroke-width: 0.65;
-}
-
-.majorGridLine {
-  stroke: var(--marble-grid);
+.rulerTick {
+  stroke: var(--marble-border);
   stroke-width: 1;
 }
 
-.row {
-  --row-accent: var(--marble-inner);
-}
-
-.source {
-  --row-accent: var(--marble-source);
-}
-
-.inner,
-.subscription {
-  --row-accent: var(--marble-inner);
-}
-
-.output {
-  --row-accent: var(--marble-output);
-}
-
-.outputBand {
-  fill: color-mix(in oklab, var(--marble-output) 8%, transparent);
-}
-
-.rowDivider {
-  stroke: color-mix(in oklab, var(--marble-border) 70%, transparent);
-  stroke-width: 0.75;
-}
-
 .rowLabel {
-  fill: var(--marble-ink);
+  fill: var(--marble-muted);
   font-size: 11px;
-  font-weight: 650;
-  letter-spacing: -0.01em;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.output .rowLabel {
+  fill: var(--marble-ink);
+  font-weight: 750;
 }
 
 .baseline {
-  stroke: color-mix(in oklab, var(--row-accent) 72%, var(--marble-surface));
-  stroke-linecap: round;
-  stroke-width: 2;
+  stroke: var(--marble-rule);
+  stroke-linecap: square;
+  stroke-width: 1.8;
+}
+
+.axisArrow {
+  fill: var(--marble-rule);
 }
 
 .eventCircle {
-  fill: var(--row-accent);
-  stroke: var(--marble-surface);
+  stroke: var(--marble-outline);
   stroke-width: 2;
   vector-effect: non-scaling-stroke;
 }
 
+.marbleBlue {
+  fill: var(--marble-blue);
+  background: var(--marble-blue);
+}
+
+.marbleGreen {
+  fill: var(--marble-green);
+  background: var(--marble-green);
+}
+
+.marbleYellow {
+  fill: var(--marble-yellow);
+  background: var(--marble-yellow);
+}
+
+.marbleRed {
+  fill: var(--marble-red);
+  background: var(--marble-red);
+}
+
 .eventText {
-  fill: var(--marble-marker-ink);
+  fill: var(--marble-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 10px;
-  font-weight: 750;
+  font-weight: 700;
   pointer-events: none;
 }
 
@@ -187,7 +167,15 @@
 .lifecycleMarker line,
 .lifecycleMarker path {
   fill: none;
-  stroke: var(--row-accent);
+  stroke: var(--marble-rule);
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 2;
+}
+
+.unsubscribeMarker line {
+  fill: none;
+  stroke: var(--marble-error);
   stroke-linecap: round;
   stroke-linejoin: round;
   stroke-width: 2;
@@ -205,10 +193,29 @@
   stroke-width: 2;
 }
 
+.operatorGroup {
+  filter: drop-shadow(0 2px 2px rgb(0 0 0 / 12%));
+}
+
+.operatorBand {
+  fill: var(--marble-surface);
+  stroke: var(--marble-border);
+  stroke-width: 1;
+  vector-effect: non-scaling-stroke;
+}
+
+.operatorTitle {
+  fill: var(--marble-ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 17px;
+  font-weight: 500;
+  letter-spacing: -0.025em;
+}
+
 .footer {
-  padding: 0.9rem 1.125rem 1rem;
+  padding: 0.95rem 1.15rem 1.05rem;
   border-top: 1px solid var(--marble-border);
-  background: var(--marble-surface-strong);
+  background: var(--marble-surface);
 }
 
 .caption {
@@ -221,14 +228,14 @@
 .syntaxLegend {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.45rem 1rem;
-  margin-top: 0.72rem;
+  gap: 0.5rem 1.05rem;
+  margin-top: 0.75rem;
 }
 
 .syntaxItem {
   display: inline-flex;
   align-items: center;
-  gap: 0.38rem;
+  gap: 0.4rem;
   color: var(--marble-muted);
   font-size: 0.72rem;
   font-weight: 550;
@@ -237,25 +244,21 @@
 
 .legendSymbol {
   display: inline-grid;
-  width: 1.15rem;
-  height: 1.15rem;
+  width: 1.2rem;
+  height: 1.2rem;
   place-items: center;
-  color: var(--marble-inner);
+  color: var(--marble-rule);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 0.74rem;
+  font-size: 0.76rem;
   font-weight: 800;
   line-height: 1;
 }
 
 .legendNext {
+  border: 1.5px solid var(--marble-outline);
   border-radius: 50%;
-  background: var(--marble-inner);
-  color: var(--marble-marker-ink);
+  color: var(--marble-text);
   font-size: 0.62rem;
-}
-
-.legend-complete {
-  letter-spacing: -0.2em;
 }
 
 .legend-error,
@@ -266,29 +269,29 @@
 .valueLegend {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.45rem 1.1rem;
-  margin: 0.75rem 0 0;
-  padding-top: 0.72rem;
-  border-top: 1px solid color-mix(in oklab, var(--marble-border) 75%, transparent);
+  gap: 0.5rem 1.15rem;
+  margin: 0.8rem 0 0;
+  padding-top: 0.78rem;
+  border-top: 1px solid var(--marble-border);
 }
 
 .valueItem {
   display: grid;
   grid-template-columns: 1.25rem auto;
   align-items: baseline;
-  gap: 0.28rem;
+  gap: 0.34rem;
   margin: 0;
 }
 
 .valueItem dt {
   display: inline-grid;
-  width: 1.15rem;
-  height: 1.15rem;
+  width: 1.2rem;
+  height: 1.2rem;
   margin: 0;
   place-items: center;
+  border: 1.5px solid var(--marble-outline);
   border-radius: 50%;
-  background: var(--marble-inner);
-  color: var(--marble-marker-ink);
+  color: var(--marble-text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 0.63rem;
   font-weight: 800;
@@ -314,22 +317,12 @@
 }
 
 @media (max-width: 640px) {
-  .header {
-    display: grid;
-    gap: 0.65rem;
-    padding-inline: 0.9rem;
-  }
-
-  .frameLabel {
-    justify-self: start;
-  }
-
   .mobileScrollHint {
     display: block;
-    padding: 0.45rem 0.9rem 0;
+    padding: 0.55rem 0.85rem 0;
     color: var(--marble-muted);
     font-size: 0.68rem;
-    font-weight: 650;
+    font-weight: 600;
     letter-spacing: 0.015em;
     text-align: right;
   }

@@ -33,11 +33,12 @@ type ParsedRow = MarbleRow & {
   tokens: MarbleToken[];
 };
 
-const LABEL_WIDTH = 132;
-const FRAME_WIDTH = 38;
-const HEADER_HEIGHT = 38;
-const ROW_HEIGHT = 62;
-const RIGHT_PADDING = 28;
+const LABEL_WIDTH = 126;
+const FRAME_WIDTH = 42;
+const TOP_RULER_HEIGHT = 32;
+const ROW_HEIGHT = 70;
+const OPERATOR_HEIGHT = 74;
+const RIGHT_PADDING = 58;
 
 const tokenTypeByCharacter: Record<string, MarbleTokenType> = {
   '|': 'complete',
@@ -121,6 +122,7 @@ function markerForToken(
   token: MarbleToken,
   x: number,
   y: number,
+  colorClass: string,
   description?: string,
 ) {
   const accessibleLabel = `${description ?? token.value ?? syntaxLabels[token.type]}, frame ${token.frame}`;
@@ -129,7 +131,12 @@ function markerForToken(
     return (
       <g className={styles.nextMarker}>
         <title>{accessibleLabel}</title>
-        <circle className={styles.eventCircle} cx={x} cy={y} r="13" />
+        <circle
+          className={`${styles.eventCircle} ${colorClass}`}
+          cx={x}
+          cy={y}
+          r="15"
+        />
         <text
           className={styles.eventText}
           dominantBaseline="central"
@@ -147,8 +154,7 @@ function markerForToken(
     return (
       <g className={styles.terminalMarker}>
         <title>{accessibleLabel}</title>
-        <line x1={x - 3} x2={x - 3} y1={y - 14} y2={y + 14} />
-        <line x1={x + 3} x2={x + 3} y1={y - 14} y2={y + 14} />
+        <line x1={x} x2={x} y1={y - 16} y2={y + 16} />
       </g>
     );
   }
@@ -157,9 +163,9 @@ function markerForToken(
     return (
       <g className={styles.errorMarker}>
         <title>{accessibleLabel}</title>
-        <circle cx={x} cy={y} r="12" />
-        <line x1={x - 5} x2={x + 5} y1={y - 5} y2={y + 5} />
-        <line x1={x + 5} x2={x - 5} y1={y - 5} y2={y + 5} />
+        <circle cx={x} cy={y} r="14" />
+        <line x1={x - 6} x2={x + 6} y1={y - 6} y2={y + 6} />
+        <line x1={x + 6} x2={x - 6} y1={y - 6} y2={y + 6} />
       </g>
     );
   }
@@ -168,29 +174,33 @@ function markerForToken(
     return (
       <g className={styles.lifecycleMarker}>
         <title>{accessibleLabel}</title>
-        <line x1={x} x2={x} y1={y - 13} y2={y + 13} />
-        <path d={`M ${x - 5} ${y - 7} L ${x} ${y - 13} L ${x + 5} ${y - 7}`} />
+        <line x1={x} x2={x} y1={y - 15} y2={y + 15} />
+        <path d={`M ${x - 6} ${y - 8} L ${x} ${y - 15} L ${x + 6} ${y - 8}`} />
       </g>
     );
   }
 
   return (
-    <g className={styles.lifecycleMarker}>
+    <g className={styles.unsubscribeMarker}>
       <title>{accessibleLabel}</title>
-      <line x1={x} x2={x} y1={y - 13} y2={y + 13} />
-      <line x1={x - 5} x2={x + 5} y1={y - 13} y2={y - 5} />
-      <line x1={x + 5} x2={x - 5} y1={y - 13} y2={y - 5} />
+      <line x1={x} x2={x} y1={y - 15} y2={y + 15} />
+      <line x1={x - 6} x2={x + 6} y1={y - 15} y2={y - 3} />
+      <line x1={x + 6} x2={x - 6} y1={y - 15} y2={y - 3} />
     </g>
   );
 }
 
 function SyntaxSymbol({ type }: { type: MarbleTokenType }) {
   if (type === 'next') {
-    return <span className={`${styles.legendSymbol} ${styles.legendNext}`}>a</span>;
+    return (
+      <span className={`${styles.legendSymbol} ${styles.legendNext} ${styles.marbleBlue}`}>
+        a
+      </span>
+    );
   }
 
   const characters: Record<Exclude<MarbleTokenType, 'next'>, string> = {
-    complete: 'Ⅱ',
+    complete: '│',
     error: '×',
     subscribe: '↑',
     unsubscribe: '×',
@@ -207,7 +217,7 @@ export function MarbleDiagram({
   title,
   rows,
   caption,
-  frameLabel = 'Mỗi vạch = 1 frame',
+  frameLabel = '1 khoảng = 1 frame',
   values,
   showLegend = true,
 }: MarbleDiagramProps) {
@@ -216,8 +226,14 @@ export function MarbleDiagram({
     ...parsedRows.map((row) => row.frameCount),
     1,
   );
+  const outputRowIndex = parsedRows.findIndex((row) => row.kind === 'output');
+  const hasOperatorBand = outputRowIndex > 0;
+  const operatorOffset = hasOperatorBand ? OPERATOR_HEIGHT : 0;
   const width = LABEL_WIDTH + (frameCount - 1) * FRAME_WIDTH + RIGHT_PADDING;
-  const height = HEADER_HEIGHT + parsedRows.length * ROW_HEIGHT + 16;
+  const height =
+    TOP_RULER_HEIGHT + parsedRows.length * ROW_HEIGHT + operatorOffset + 18;
+  const axisEnd = width - 22;
+  const operatorY = TOP_RULER_HEIGHT + outputRowIndex * ROW_HEIGHT;
   const usedTokenTypes = new Set(
     parsedRows.flatMap((row) => row.tokens.map((token) => token.type)),
   );
@@ -230,19 +246,43 @@ export function MarbleDiagram({
   ];
   const visibleLegendTypes = legendOrder.filter((type) => usedTokenTypes.has(type));
   const valueEntries = Object.entries(values ?? {});
+  const valueColorIndexes = new Map<string, number>();
+
+  for (const row of parsedRows) {
+    for (const token of row.tokens) {
+      if (
+        token.type === 'next' &&
+        token.value &&
+        !valueColorIndexes.has(token.value)
+      ) {
+        valueColorIndexes.set(token.value, valueColorIndexes.size % 4);
+      }
+    }
+  }
+
+  for (const [value] of valueEntries) {
+    if (!valueColorIndexes.has(value)) {
+      valueColorIndexes.set(value, valueColorIndexes.size % 4);
+    }
+  }
+
+  const colorClasses = [
+    styles.marbleBlue,
+    styles.marbleGreen,
+    styles.marbleYellow,
+    styles.marbleRed,
+  ];
+  const colorClassFor = (value?: string) =>
+    colorClasses[valueColorIndexes.get(value ?? '') ?? 0];
   const accessibleRows = parsedRows
     .map((row) => `${row.label}: ${row.marble}`)
     .join('. ');
 
   return (
     <figure className={styles.figure}>
-      <div className={styles.header}>
-        <div>
-          <div className={styles.eyebrow}>Marble timeline</div>
-          <div className={styles.title}>{title}</div>
-        </div>
-        <div className={styles.frameLabel}>{frameLabel}</div>
-      </div>
+      {!hasOperatorBand ? (
+        <div className={styles.fallbackTitle}>{title}</div>
+      ) : null}
 
       <div className={styles.mobileScrollHint} aria-hidden="true">
         Vuốt ngang để xem tiếp →
@@ -260,70 +300,74 @@ export function MarbleDiagram({
             const x = LABEL_WIDTH + frame * FRAME_WIDTH;
             const showNumber = frame === 0 || frame % 5 === 0;
 
-            return (
+            return showNumber ? (
               <g key={`frame-${frame}`}>
                 <line
-                  className={showNumber ? styles.majorGridLine : styles.gridLine}
+                  className={styles.rulerTick}
                   x1={x}
                   x2={x}
-                  y1={HEADER_HEIGHT - 2}
-                  y2={height - 12}
+                  y1="20"
+                  y2="26"
                 />
-                {showNumber ? (
-                  <text
-                    className={styles.axisText}
-                    textAnchor="middle"
-                    x={x}
-                    y={20}
-                  >
-                    {frame}
-                  </text>
-                ) : null}
+                <text
+                  className={styles.axisText}
+                  textAnchor="middle"
+                  x={x}
+                  y="14"
+                >
+                  {frame}
+                </text>
               </g>
-            );
+            ) : null;
           })}
 
+          <text
+            className={styles.frameText}
+            textAnchor="end"
+            x={width - 16}
+            y="15"
+          >
+            {frameLabel}
+          </text>
+
+          {hasOperatorBand ? (
+            <g className={styles.operatorGroup}>
+              <rect
+                className={styles.operatorBand}
+                height={OPERATOR_HEIGHT}
+                width={width}
+                x="0"
+                y={operatorY}
+              />
+              <text
+                className={styles.operatorTitle}
+                dominantBaseline="central"
+                textAnchor="middle"
+                x={width / 2}
+                y={operatorY + OPERATOR_HEIGHT / 2}
+              >
+                {title}
+              </text>
+            </g>
+          ) : null}
+
           {parsedRows.map((row, rowIndex) => {
-            const y = HEADER_HEIGHT + rowIndex * ROW_HEIGHT + ROW_HEIGHT / 2;
+            const rowOffset =
+              hasOperatorBand && rowIndex >= outputRowIndex
+                ? OPERATOR_HEIGHT
+                : 0;
+            const y =
+              TOP_RULER_HEIGHT +
+              rowIndex * ROW_HEIGHT +
+              ROW_HEIGHT / 2 +
+              rowOffset;
             const kind = row.kind ?? 'inner';
-            const subscribeFrame = row.tokens.find(
-              (token) => token.type === 'subscribe',
-            )?.frame;
-            const terminalFrame = [...row.tokens]
-              .reverse()
-              .find((token) =>
-                ['complete', 'error', 'unsubscribe'].includes(token.type),
-              )?.frame;
-            const lineStart = LABEL_WIDTH + (subscribeFrame ?? 0) * FRAME_WIDTH;
-            const lineEnd =
-              LABEL_WIDTH + (terminalFrame ?? frameCount - 1) * FRAME_WIDTH;
 
             return (
               <g
-                className={`${styles.row} ${styles[kind]}`}
+                className={`${styles.row} ${kind === 'output' ? styles.output : ''}`}
                 key={`${row.label}-${rowIndex}`}
               >
-                {kind === 'output' ? (
-                  <rect
-                    className={styles.outputBand}
-                    height={ROW_HEIGHT - 10}
-                    rx="7"
-                    width={width - 16}
-                    x="8"
-                    y={y - (ROW_HEIGHT - 10) / 2}
-                  />
-                ) : null}
-
-                {rowIndex > 0 ? (
-                  <line
-                    className={styles.rowDivider}
-                    x1="16"
-                    x2={width - 16}
-                    y1={y - ROW_HEIGHT / 2}
-                    y2={y - ROW_HEIGHT / 2}
-                  />
-                ) : null}
-
                 <text
                   className={styles.rowLabel}
                   dominantBaseline="central"
@@ -335,10 +379,14 @@ export function MarbleDiagram({
 
                 <line
                   className={styles.baseline}
-                  x1={lineStart}
-                  x2={Math.max(lineStart, lineEnd)}
+                  x1={LABEL_WIDTH}
+                  x2={axisEnd - 10}
                   y1={y}
                   y2={y}
+                />
+                <path
+                  className={styles.axisArrow}
+                  d={`M ${axisEnd - 11} ${y - 7} L ${axisEnd} ${y} L ${axisEnd - 11} ${y + 7} Z`}
                 />
 
                 {row.tokens.map((token, tokenIndex) => {
@@ -349,7 +397,13 @@ export function MarbleDiagram({
 
                   return (
                     <g key={`${token.frame}-${token.type}-${token.value ?? ''}-${tokenIndex}`}>
-                      {markerForToken(token, x, y, description)}
+                      {markerForToken(
+                        token,
+                        x,
+                        y,
+                        colorClassFor(token.value),
+                        description,
+                      )}
                     </g>
                   );
                 })}
@@ -382,7 +436,7 @@ export function MarbleDiagram({
             <dl className={styles.valueLegend}>
               {valueEntries.map(([value, description]) => (
                 <div className={styles.valueItem} key={value}>
-                  <dt>{value}</dt>
+                  <dt className={colorClassFor(value)}>{value}</dt>
                   <dd>{description}</dd>
                 </div>
               ))}

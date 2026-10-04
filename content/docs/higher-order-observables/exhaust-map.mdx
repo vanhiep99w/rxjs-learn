@@ -110,7 +110,7 @@ Overload `resultSelector` của RxJS 7 đã deprecated; mình chọn inner `map`
 Giả sử outer phát `a`, `b`, `c`, `d`. Mỗi inner được nhận phát `x` sau hai frame và complete sau năm frame. Đây là thời gian minh họa, không phải thời lượng request thực tế.
 
 <MarbleDiagram
-  title="exhaustMap bỏ trigger đến trong lúc đang bận"
+  title="exhaustMap(project)"
   rows={[
     { label: 'outer', marble: 'a-b-c-----d---|', kind: 'source' },
     { label: 'inner a', marble: '^-x--|', kind: 'inner' },

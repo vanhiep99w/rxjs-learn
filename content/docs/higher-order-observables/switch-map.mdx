@@ -55,7 +55,7 @@ Trong RxJS 7.8.2, mỗi lần outer phát value, `switchMap` thực hiện theo 
 Nó **không đợi inner mới phát response rồi mới bỏ inner cũ**. Vì inner cũ bị unsubscribe trước khi projection mới chạy, nếu projection mới ném lỗi thì inner cũ cũng không được giữ lại như một phương án dự phòng.
 
 <MarbleDiagram
-  title="switchMap chuyển subscription sang input mới nhất"
+  title="switchMap(project)"
   rows={[
     { label: 'outer', marble: '-a---b----|', kind: 'source' },
     { label: 'inner A', marble: '-^-x-!', kind: 'inner' },
