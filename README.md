@@ -35,3 +35,7 @@ Project dùng Next.js static export và sinh website vào thư mục `out/`.
 ## Nội dung
 
 Tài liệu đi từ reactive programming, Observable, operators và Subjects đến higher-order streams, testing, integration, production patterns và troubleshooting. Các bài hiện là placeholder để được viết chi tiết từng trang trong bước tiếp theo.
+
+## Brand attribution
+
+Favicon sử dụng [logo chính thức của Angular](https://angular.dev/press-kit), được cung cấp theo giấy phép [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
