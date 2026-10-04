@@ -3,8 +3,483 @@ title: Hiệu năng và bộ nhớ
 description: Giảm subscription thừa, emission dư và memory leak.
 ---
 
-Trang này sẽ trình bày **Hiệu năng và bộ nhớ** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Giả sử bạn mở một dashboard, đổi bộ lọc vài lần rồi chuyển sang trang khác. UI đã biến mất nhưng request vẫn chạy, timer vẫn tick, và mỗi lần quay lại biểu đồ lại render nhiều hơn. Vấn đề không nhất thiết là “RxJS chậm”: có thể bạn đang chạy cùng một công việc nhiều lần, xử lý những emission không cần thiết, hoặc giữ tài nguyên lâu hơn vòng đời của màn hình.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình thường sửa theo thứ tự: **đo công việc thực tế → giảm đầu vào không cần thiết → chia sẻ execution phù hợp → chốt teardown và giới hạn dữ liệu giữ lại**. Thêm operator trước khi biết bottleneck dễ làm pipeline phức tạp hơn mà không giải quyết đúng chỗ.
+
+<Callout type="info" title="Phạm vi">
+  Bài này dùng RxJS 7.8.x, đối chiếu các hành vi lifecycle với implementation 7.8.2. Ví dụ TypeScript dành cho ứng dụng đã có RxJS; ví dụ DOM và `animationFrameScheduler` chạy trong browser. Bạn nên biết `pipe`, cold Observable, flattening operator và subscription teardown trước khi đọc. Đây là hướng dẫn tối ưu có kiểm chứng, không phải benchmark giữa các thư viện.
 </Callout>
+
+## Mục lục
+
+- [Đo bottleneck trước khi sửa pipeline](#đo-bottleneck-trước-khi-sửa-pipeline)
+  - [Phân biệt CPU, execution thừa và retained memory](#phân-biệt-cpu-execution-thừa-và-retained-memory)
+  - [Đếm execution tại đúng vị trí](#đếm-execution-tại-đúng-vị-trí)
+- [Giảm emission trước công việc đắt](#giảm-emission-trước-công-việc-đắt)
+  - [Chọn phần state thực sự cần dùng](#chọn-phần-state-thực-sự-cần-dùng)
+  - [Chọn chính sách thời gian theo ý nghĩa dữ liệu](#chọn-chính-sách-thời-gian-theo-ý-nghĩa-dữ-liệu)
+  - [Đọc timeline của auditTime](#đọc-timeline-của-audittime)
+- [Chia sẻ execution thay vì chỉ chia sẻ tên biến](#chia-sẻ-execution-thay-vì-chỉ-chia-sẻ-tên-biến)
+- [Gắn subscription với chủ sở hữu](#gắn-subscription-với-chủ-sở-hữu)
+  - [Đặt takeUntil sau flattening operator](#đặt-takeuntil-sau-flattening-operator)
+  - [Producer phải có teardown thật](#producer-phải-có-teardown-thật)
+- [Giới hạn dữ liệu được giữ trong RAM](#giới-hạn-dữ-liệu-được-giữ-trong-ram)
+  - [Replay và state giữ cả object graph](#replay-và-state-giữ-cả-object-graph)
+  - [Giới hạn history và buffer](#giới-hạn-history-và-buffer)
+- [Concurrency không phải backpressure](#concurrency-không-phải-backpressure)
+- [Scheduler không biến CPU work thành chạy song song](#scheduler-không-biến-cpu-work-thành-chạy-song-song)
+- [Quy trình tìm memory leak](#quy-trình-tìm-memory-leak)
+- [Kiểm thử emission và teardown](#kiểm-thử-emission-và-teardown)
+  - [Kiểm thử chính sách giảm emission](#kiểm-thử-chính-sách-giảm-emission)
+  - [Kiểm thử hủy cả inner subscription](#kiểm-thử-hủy-cả-inner-subscription)
+- [Checklist trước khi đưa lên production](#checklist-trước-khi-đưa-lên-production)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Đo bottleneck trước khi sửa pipeline
+
+### Phân biệt CPU, execution thừa và retained memory
+
+Một trang chậm và một trang leak có thể cùng làm heap tăng, nhưng cách sửa khác nhau. Allocation là tạo object mới; retained memory là dữ liệu vẫn còn đường tham chiếu từ một GC root nên garbage collector chưa thể thu hồi. Heap tăng trong lúc xử lý rồi giảm sau GC chưa đủ để kết luận leak.
+
+| Triệu chứng | Giả thuyết cần kiểm tra | Cách kiểm tra |
+| --- | --- | --- |
+| Một thao tác tạo nhiều request giống nhau | Nhiều subscription vào cold source hoặc tạo nhiều shared instance | Network panel, đếm subscription upstream |
+| Request chỉ có một nhưng render nhiều lần | Emission dư, selector quá rộng, nhiều consumer | Đếm emission trước/sau selector và callback render |
+| CPU cao dù ít request | Parse, sort, clone, layout hoặc logging đắt | Performance recording, flame chart và long task |
+| Rời trang rồi timer/request vẫn hoạt động | Owner không teardown hoặc sharing giữ upstream | Log lifecycle, theo dõi timer, listener và connection |
+| Heap nền tăng sau nhiều vòng mở/đóng | Closure, replay buffer, registry hoặc queue còn giữ dữ liệu | So sánh heap snapshot và đường retaining reference |
+
+Giữ nguyên kịch bản khi so sánh trước/sau: cùng lượng dữ liệu, cùng thao tác, cùng thiết bị và môi trường. Với UI, nên đo cả thời gian phản hồi và số lần render; với stream xử lý job, đo cả queue depth và tuổi của job đang chờ. Giảm số emission mà làm mất một thao tác nghiệp vụ không phải là tối ưu thành công.
+
+### Đếm execution tại đúng vị trí
+
+`defer` chạy factory mỗi lần có subscription. Đặt nó cùng `finalize` **trước điểm sharing** để đếm execution nguồn, không phải số consumer:
+
+```ts
+import { defer, finalize, shareReplay } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Metric = Readonly<{ id: string; value: number }>;
+let activeExecutions = 0;
+
+// Tạo một lần ở service có scope rõ ràng.
+const metrics$ = defer(() => {
+  activeExecutions += 1;
+  const startedAt = performance.now();
+  console.debug('metrics:start', { activeExecutions });
+
+  return ajax.getJSON<Metric[]>('/api/metrics').pipe(
+    finalize(() => {
+      activeExecutions -= 1;
+      console.debug('metrics:end', {
+        activeExecutions,
+        elapsedMs: performance.now() - startedAt,
+      });
+    }),
+  );
+}).pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+```
+
+`finalize` chạy khi complete, error **hoặc unsubscribe**; log này không chứng minh request thành công. `elapsedMs` cũng là thời gian của execution đến khi kết thúc, có thể kết thúc vì bị hủy. Muốn phân biệt nguyên nhân thì ghi thêm tín hiệu `complete`/`error` và sự kiện dispose của owner, như hướng dẫn ở [Observability](/docs/patterns-production/observability).
+
+Nếu đặt `finalize` sau `shareReplay`, bạn đang đếm lifecycle từng consumer. Cả hai vị trí đều hữu ích, nhưng trả lời hai câu hỏi khác nhau. Chỉ dùng logging chi tiết khi chẩn đoán hoặc có sampling; `console.log` mỗi pointer event có thể trở thành chính bottleneck và console cũng có thể giữ reference đến object được log.
+
+## Giảm emission trước công việc đắt
+
+### Chọn phần state thực sự cần dùng
+
+Một biểu đồ chỉ cần `selectedProjectId` thì không nên chạy lại phép tính khi banner hay trạng thái dialog đổi. Project ra một giá trị nhỏ, ổn định rồi mới `distinctUntilChanged`:
+
+```ts
+import { distinctUntilChanged, map, Observable } from 'rxjs';
+
+type AppState = Readonly<{
+  selectedProjectId: string;
+  dialogOpen: boolean;
+}>;
+
+function selectProjectId(state$: Observable<AppState>) {
+  return state$.pipe(
+    map((state) => state.selectedProjectId),
+    distinctUntilChanged(),
+  );
+}
+```
+
+`distinctUntilChanged()` mặc định so sánh bằng `===` với giá trị **đã phát gần nhất**, không deduplicate toàn bộ lịch sử. Với chuỗi `A, A, B, A`, output là `A, B, A`. Nó vẫn nhận từng emission upstream; phần được tiết kiệm là công việc downstream.
+
+Nếu selector trả object mới mỗi lần, reference khác nhau nên mặc định không lọc được. Hãy chọn primitive hoặc dùng comparator cho đúng những field consumer quan tâm. Mình không mặc định deep-compare cả state: phép so sánh có thể đắt gần bằng phần tính toán bạn muốn tránh, và `JSON.stringify` không phải hợp đồng equality đáng tin cậy cho mọi kiểu dữ liệu.
+
+<Callout type="warn" title="Mutation có thể làm mất cập nhật">
+  Khi bạn sửa object cũ rồi phát lại cùng reference, `distinctUntilChanged` có thể chặn một thay đổi thật. Ngay cả comparator theo field cũng có thể thấy “giá trị trước” đã bị mutate. Giữ state immutable hoặc chọn primitive ngay khi nhận emission; đừng dùng equality để che việc quản lý state sai.
+</Callout>
+
+### Chọn chính sách thời gian theo ý nghĩa dữ liệu
+
+Rate limiting là quyết định bạn chấp nhận bỏ hoặc trì hoãn giá trị nào. Nó không nên được thêm chỉ vì input phát nhanh.
+
+| Operator | Chính sách | Mình chọn khi |
+| --- | --- | --- |
+| `debounceTime(ms)` | Chờ một khoảng im lặng rồi phát giá trị cuối | Search box, bộ lọc cần đợi người dùng ngừng chỉnh |
+| `auditTime(ms)` | Từ emission đầu, mở một cửa sổ rồi phát giá trị mới nhất khi hết cửa sổ | Cập nhật tiến độ hoặc UI đang thay đổi liên tục |
+| `throttleTime(ms)` | Mặc định phát giá trị đầu, bỏ phần còn lại trong cửa sổ | Chặn click lặp với policy cho phép bỏ trigger |
+| `sampleTime(ms)` | Tại các tick định kỳ, phát giá trị mới nhất nếu có giá trị mới từ lần sample trước | Dashboard có cadence cập nhật cố định |
+
+Ví dụ sau chỉ cần vị trí pointer mới nhất để render, không cần vẽ mọi event. Các hàm `layout` và `render` do ứng dụng cung cấp:
+
+```ts
+import {
+  animationFrameScheduler,
+  auditTime,
+  distinctUntilChanged,
+  fromEvent,
+  map,
+} from 'rxjs';
+
+type Point = Readonly<{ x: number; y: number }>;
+
+function mountPointerPreview<View>(
+  target: HTMLElement,
+  layout: (point: Point) => View,
+  render: (view: View) => void,
+  reportError: (error: unknown) => void,
+) {
+  const subscription = fromEvent<PointerEvent>(target, 'pointermove').pipe(
+    // Chỉ giữ dữ liệu cần dùng, không giữ toàn bộ DOM event.
+    map((event): Point => ({ x: event.clientX, y: event.clientY })),
+    auditTime(0, animationFrameScheduler),
+    distinctUntilChanged((a, b) => a.x === b.x && a.y === b.y),
+    // Công việc đắt nằm sau bước giảm emission.
+    map(layout),
+  ).subscribe({ next: render, error: reportError });
+
+  return () => subscription.unsubscribe();
+}
+```
+
+Ở đây `auditTime(0, animationFrameScheduler)` coalesce burst vào callback animation frame tiếp theo. Nó không cam kết một FPS cố định và không phù hợp cho tác vụ nền phải tiếp tục đều khi tab bị ẩn. Với search box, mình sẽ normalize chuỗi → `debounceTime` → `distinctUntilChanged` → `switchMap` request; normalize nhẹ có thể chạy trên mỗi input, request đắt thì không.
+
+Đặt `auditTime` **sau** `map(layout)` chỉ giảm số lần render, không giảm số lần tính layout. Và không dùng chính sách bỏ emission cho dữ liệu phải giữ đầy đủ như giao dịch, mọi điểm nét vẽ hoặc job bắt buộc xử lý; bạn cần batching hay cơ chế điều tiết nguồn thay vì sampling.
+
+### Đọc timeline của auditTime
+
+Đọc theo cột dọc: mỗi giá trị input đều tới operator, nhưng chỉ giá trị cuối trong mỗi cửa sổ được phát xuống. Sơ đồ dùng duration 3 virtual frame, không phải callback animation frame của ví dụ DOM:
+
+<MarbleDiagram
+  title="auditTime(3, scheduler)"
+  rows={[
+    { label: 'source', marble: '-a-b-c----|', kind: 'source' },
+    { label: 'output', marble: '----b---c-|', kind: 'output' },
+  ]}
+  values={{
+    a: 'vị trí đầu tại frame 1',
+    b: 'vị trí mới hơn tại frame 3',
+    c: 'vị trí mới tại frame 5',
+  }}
+  caption="Cửa sổ đầu bắt đầu ở frame 1 và phát b tại frame 4; cửa sổ kế tiếp phát c tại frame 8."
+/>
+
+`a` tới ở frame 1 mở timer kết thúc ở frame 4. `b` tới ở frame 3 thay giá trị đang giữ, nhưng không đẩy deadline sang frame 6 như debounce. `c` tới ở frame 5 mở cửa sổ mới kết thúc ở frame 8. Source và output cùng complete ở frame 10 vì lúc đó không còn cửa sổ chờ; nếu source complete khi còn giá trị chờ thì `auditTime` có thể đợi hết cửa sổ rồi mới phát và complete.
+
+## Chia sẻ execution thay vì chỉ chia sẻ tên biến
+
+Một biến Observable không đồng nghĩa với một execution. Cold source chạy lại cho từng subscription; `share` hoặc `shareReplay` tạo điểm dùng chung, nhưng chỉ khi consumer dùng **cùng Observable instance**.
+
+```ts
+import { map, shareReplay } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Metric = Readonly<{ id: string; value: number }>;
+
+// Giữ ở field của service theo scope màn hình hoặc phiên làm việc.
+const sortedMetrics$ = ajax.getJSON<Metric[]>('/api/metrics').pipe(
+  map((items) => [...items].sort((a, b) => b.value - a.value)),
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+```
+
+Hai consumer dùng instance này chia sẻ cả request và phép sort. Nếu chuyển `map` xuống sau `shareReplay`, request vẫn được chia sẻ nhưng mỗi subscription lại sort riêng. Đặt sharing sau phần tính toán chung; phần tùy biến theo từng consumer nên nằm sau đó.
+
+Hàm `getMetrics()` mỗi lần tạo một pipeline `ajax(...).pipe(shareReplay(...))` không chia sẻ cache giữa các lần gọi. Tương tự, tạo lại shared stream trong mỗi render làm policy sharing gần như mất ý nghĩa.
+
+| Nhu cầu | Lựa chọn mặc định |
+| --- | --- |
+| Chia sẻ event đang chạy, không cần replay cho người đến muộn | `share()` |
+| Consumer đến muộn cần giá trị mới nhất | `shareReplay({ bufferSize: 1, refCount: true })` |
+| Request đã complete cần TTL hoặc invalidation | Cache có policy riêng, không chỉ thêm `refCount` |
+| Connection phải sống dù không còn UI | Owner cấp service quản lý rõ start/stop, không để chạy ngầm vô chủ |
+
+<Callout type="warn" title="refCount không có nghĩa là xóa mọi cache">
+  Trong RxJS 7.8.x, `shareReplay` reset khi error, không reset khi source complete, và `refCount: true` reset kết nối khi subscriber cuối rời đi nếu source chưa complete. Vì vậy source hữu hạn đã complete vẫn có thể giữ payload để replay. Với `shareReplay(1)`, `refCount` mặc định là `false`, nên source vô hạn có thể tiếp tục chạy khi không ai nghe. Luôn ghi cấu hình bằng object để policy dễ review.
+</Callout>
+
+Sharing cũng đổi semantics: teardown của một consumer không nhất thiết dừng source khi còn consumer khác. Nếu shared stream sống ở module hoặc singleton, hãy xác định phạm vi user/tenant và thời điểm bỏ reference. Với TTL, invalidation và trường hợp consumer `take(1)` rời đi trước khi sharing thấy complete, đọc thêm [Cache dữ liệu](/docs/patterns-production/cache-data).
+
+## Gắn subscription với chủ sở hữu
+
+Mỗi subscription cần trả lời được: ai tạo, sống đến khi nào, ai dừng? Owner thường là component, một thao tác người dùng, một request server hoặc service session. Mình ưu tiên một hàm mount/start trả về hàm dispose, hoặc cơ chế lifecycle có sẵn của framework, thay vì một danh sách subscription không ai chịu trách nhiệm.
+
+`unsubscribe()` ngắt subscription và chạy teardown. Nó **không gọi callback `complete` của observer** như source complete bình thường. `finalize` là chỗ phù hợp cho cleanup gắn với mọi đường kết thúc. Cleanup vẫn phải idempotent nếu có thể được gọi qua nhiều đường.
+
+### Đặt takeUntil sau flattening operator
+
+`takeUntil` phải chặn cả chuỗi mà owner sở hữu, không chỉ outer stream. Với `switchMap`, đặt nó sau flattening operator để dispose kéo theo teardown của inner:
+
+```ts
+import { fromEvent, interval, Subject, switchMap, takeUntil } from 'rxjs';
+
+function mountTicker(
+  button: HTMLButtonElement,
+  render: (tick: number) => void,
+  reportError: (error: unknown) => void,
+) {
+  const destroy$ = new Subject<void>();
+  let disposed = false;
+
+  fromEvent(button, 'click').pipe(
+    switchMap(() => interval(1000)),
+    takeUntil(destroy$),
+  ).subscribe({ next: render, error: reportError });
+
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    destroy$.next();
+    destroy$.complete();
+  };
+}
+```
+
+Nếu viết `takeUntil(destroy$)` **trước** `switchMap`, destroy chỉ complete outer; `switchMap` vẫn chờ inner đang chạy complete. Inner `interval` không tự complete, nên timer có thể giữ callback và dữ liệu của màn hình mãi. `mergeMap` và `concatMap` cũng có thể tiếp tục xử lý inner hoặc phần đang chờ sau khi outer complete; đặt lifecycle boundary sau toàn bộ đoạn cần hủy.
+
+`destroy$.complete()` một mình không kích hoạt `takeUntil`; notifier phải **phát một giá trị**. `Subject` thường cũng không replay tín hiệu destroy cho subscriber đến sau. Vì vậy hàm mount không tạo subscription mới sau dispose; nếu có API subscribe động thì phải chặn trạng thái đã disposed hoặc thiết kế notifier phù hợp.
+
+Với Angular, thường dùng AsyncPipe hoặc `takeUntilDestroyed` ở cuối phần cần gắn với component; với React, trả cleanup từ effect. Một effect chạy lại trong chế độ development không tự chứng minh leak: điều cần kiểm tra là lần setup trước đã cleanup, và sau unmount không còn resource mà component sở hữu.
+
+### Producer phải có teardown thật
+
+Đóng subscription chỉ đủ khi producer thực sự giải phóng tài nguyên. Built-in như `fromEvent` và `interval` có teardown; custom Observable phải tự trả cleanup:
+
+```ts
+import { Observable } from 'rxjs';
+
+function heartbeat$(periodMs: number): Observable<number> {
+  return new Observable<number>((subscriber) => {
+    const timerId = setInterval(() => {
+      subscriber.next(Date.now());
+    }, periodMs);
+
+    return () => clearInterval(timerId);
+  });
+}
+
+const subscription = heartbeat$(1000).subscribe(console.log);
+// Khi owner kết thúc: dừng producer, không chỉ ngừng nhận tick.
+subscription.unsubscribe();
+```
+
+Nếu bỏ `return () => clearInterval(...)`, subscriber đã đóng sẽ không nhận `next`, nhưng timer của môi trường vẫn hoạt động. “Không còn log” chưa đủ để chứng minh cleanup đúng.
+
+Tương tự, `from(promise)` không khiến Promise đang chạy tự bị hủy. Với `fetch`, cần nối teardown tới `AbortController`, hoặc dùng adapter Observable hỗ trợ abort như `fromFetch`; với socket, cần policy đóng connection. Abort phía client không hoàn tác một mutation mà server đã xử lý. Đừng dùng cancellation như bảo đảm rằng thao tác ghi chưa xảy ra.
+
+## Giới hạn dữ liệu được giữ trong RAM
+
+### Replay và state giữ cả object graph
+
+Một replay buffer chỉ có một phần tử vẫn có thể giữ payload lớn: phần tử đó tham chiếu tới mảng, cây dữ liệu và những object con. Giới hạn số emission không đồng nghĩa với giới hạn byte.
+
+```text
+Service còn sống
+  └─ shared Observable / Subject
+       └─ giá trị được giữ
+            └─ mảng dữ liệu và toàn bộ object con
+```
+
+`BehaviorSubject` giữ giá trị hiện tại; `ReplaySubject` giữ buffer; shared Observable sau complete có thể giữ kết quả để replay. Gọi `complete()` dừng việc phát, nhưng không phải API xóa giá trị đã lưu. Trong RxJS 7.8.2, `BehaviorSubject` vẫn giữ value và `ReplaySubject` vẫn có thể replay buffer sau complete, chừng nào instance còn reachable.
+
+Vì vậy khi logout hay đóng workspace, cần dọn cache registry, bỏ reference service theo scope, hoặc thay state hiện tại bằng state rỗng có chủ đích. Tránh nhét DOM element, event nguyên bản, response không cần thiết hay callback của component vào state dài hạn. Project ra DTO nhỏ trước khi replay giúp cả footprint lẫn hợp đồng dữ liệu dễ kiểm soát.
+
+`windowTime` của `ReplaySubject` giới hạn tuổi replay, nhưng không phải một timer chủ động dọn RAM đúng deadline: implementation trim buffer khi `next` hoặc khi có subscription mới. Source im lặng và instance vẫn được giữ thì dữ liệu hết tuổi vẫn có thể nằm trong buffer đến lần trim tiếp theo. Với cache cần giải phóng đúng policy, dùng eviction/reset và bỏ reference rõ ràng, không chỉ dựa vào replay window.
+
+### Giới hạn history và buffer
+
+Những chỗ tích lũy cần có bound riêng:
+
+| Chỗ giữ dữ liệu | Bẫy thường gặp | Policy nên có |
+| --- | --- | --- |
+| `new ReplaySubject()` hoặc `shareReplay()` không tham số | Buffer mặc định không giới hạn số value | Khai báo `bufferSize` và scope |
+| `scan` nối lịch sử mãi | Mảng tăng theo mọi event; clone mảng ngày càng đắt | Chỉ giữ state cần thiết hoặc history hữu hạn |
+| `toArray()` | Giữ mọi emission đến complete; nguồn vô hạn không phát kết quả | Chỉ dùng với nguồn hữu hạn có kích thước phù hợp |
+| `bufferTime` | Cửa sổ theo thời gian vẫn có thể nhận rất nhiều event | Thêm `maxBufferSize`, kiểm soát overlap và tốc độ xử lý batch |
+| `Map` cache theo key | Mỗi key nhỏ nhưng số key không giới hạn | Giới hạn entry, TTL, eviction và payload |
+| `delay` / `observeOn` | Scheduled notification tồn đọng khi downstream chậm | Giảm đầu vào và đo lượng việc đang chờ |
+
+Ví dụ history phục vụ UI chỉ cần giữ những event gần nhất:
+
+```ts
+import { Observable, scan } from 'rxjs';
+
+type Activity = Readonly<{ id: string; label: string }>;
+const HISTORY_LIMIT = 100; // Giá trị minh họa; chọn theo nhu cầu và payload thật.
+
+function recentActivity(events$: Observable<Activity>) {
+  return events$.pipe(
+    scan<Activity, readonly Activity[]>(
+      (history, event) => [...history.slice(-(HISTORY_LIMIT - 1)), event],
+      [],
+    ),
+  );
+}
+```
+
+Mảng được giới hạn và immutable nên UI có thể so sánh reference an toàn, nhưng vẫn có allocation mỗi event và copy tối đa theo kích thước history. Nếu throughput lớn, đo lại; có thể dùng ring buffer ở tầng xử lý rồi xuất snapshot theo cadence phù hợp. History UI không thay thế kho lưu trữ nghiệp vụ cần giữ đầy đủ.
+
+Với `bufferTime`, chẳng hạn `bufferTime(1000, undefined, 200)` giới hạn một buffer không overlap tới 200 item và đóng buffer sớm khi đầy. Điều này **không** giới hạn tổng RAM của các batch đang chờ downstream; nếu `concatMap` gửi batch chậm hơn tốc độ tạo batch, queue vẫn tăng.
+
+## Concurrency không phải backpressure
+
+`mergeMap(sendJob, 4)` giới hạn số inner subscription đang chạy là 4, không giới hạn số input đang chờ. Khi đủ slot, RxJS đưa input mới vào queue. `concatMap` cũng xếp hàng để xử lý tuần tự; nếu nguồn không ngừng phát và một inner không complete, phần chờ có thể tăng mãi.
+
+Giả sử minh họa input nhận 100 job/giây, mỗi job mất trung bình 100 ms, concurrency là 4. Trong điều kiện ổn định lý tưởng, throughput khoảng `4 / 0.1 = 40` job/giây, nên queue có thể tăng khoảng 60 job/giây. Đây là phép ước lượng để thấy chênh lệch tốc độ, không phải benchmark hay cam kết throughput; retry, latency biến động và giới hạn server còn làm kết quả khác đi.
+
+Backpressure là khả năng điều tiết producer theo sức xử lý của consumer. Operator trên push stream không tự bắt browser event hay server socket chậm lại. Bạn cần quyết định policy theo ý nghĩa input:
+
+| Input | Policy thường phù hợp | Điều phải chấp nhận |
+| --- | --- | --- |
+| Search hoặc trạng thái UI mới thay thế cũ | `switchMap` và coalescing trước đó | Hủy subscription cũ; producer phải hỗ trợ hủy thật |
+| Trigger khi tác vụ đang chạy có thể bỏ | `exhaustMap` | Trigger mới bị bỏ, không được chạy lại sau đó |
+| Tập job hữu hạn đã nằm trong RAM | `mergeMap` với concurrency hữu hạn | Input còn chờ vẫn giữ trong RAM |
+| Job bắt buộc nhận đủ từ nguồn liên tục | Queue có capacity, admission control hoặc giao thức pause/ack | Phải quy định retry/reject khi hết capacity; có thể cần queue bền vững ngoài RxJS |
+
+Mình không đổi từ `concatMap` sang `switchMap` cho thao tác ghi chỉ để queue ngắn hơn. Cancellation không đảm bảo server bỏ write, và thứ tự nghiệp vụ có thể bị phá. Nếu job phải sống qua process restart, một Observable in-memory cũng không phải durable queue.
+
+Khi vận hành, theo dõi số job đang chạy, số đang chờ, tuổi job cũ nhất và số bị bỏ/reject. Một giới hạn concurrency nhìn an toàn nhưng queue depth tăng đều vẫn là hệ thống đang quá tải.
+
+## Scheduler không biến CPU work thành chạy song song
+
+Phần lớn operator như `map` chạy đồng bộ khi source phát. Đổi scheduler đổi thời điểm và thứ tự callback, không tự chuyển phép sort hay parse sang thread khác.
+
+- `observeOn` schedule notification downstream; nó không tự chuyển producer upstream sang thread khác và có thể tạo thêm scheduled work.
+- `subscribeOn` schedule việc subscribe; producer vẫn có quy tắc phát của riêng nó.
+- `asyncScheduler` giúp đưa việc sang lượt timer khác, nhưng callback nặng vẫn chặn main thread khi chạy.
+- `animationFrameScheduler` phù hợp với render theo nhịp browser, không phải worker cho tính toán CPU nặng.
+
+Nếu parse hoặc biến đổi dataset vẫn là long task sau khi đã giảm emission và chia sẻ execution, cân nhắc Web Worker, chia nhỏ công việc hoặc chuyển phép tính lên server. Đo cả chi phí truyền/copy dữ liệu sang worker; worker không làm chi phí đó biến mất. Ưu tiên giảm khối lượng cần xử lý trước khi đổi scheduler.
+
+## Quy trình tìm memory leak
+
+Memory leak thường là một đường tham chiếu còn sống, không phải một operator “giữ RAM” vô cớ. Với snapshot, câu hỏi hữu ích là: **object này đáng lẽ thuộc màn hình đã đóng, vậy ai còn giữ nó?**
+
+1. **Chốt thao tác tái hiện.** Mở màn hình → kích hoạt stream → đóng màn hình. Lặp lại cùng số vòng trước và sau khi sửa, bỏ dữ liệu thử nghiệm không liên quan.
+2. **Kiểm tra lifecycle trước.** Đếm setup/cleanup của owner và subscription upstream. Sau dispose, resource riêng của màn hình phải trở về baseline; resource shared chỉ dừng khi owner policy cho phép.
+3. **Ghi Performance và Memory.** Dùng allocation instrumentation/sampling để tìm nơi tạo object, heap snapshot để tìm object còn được giữ. Chúng trả lời hai câu hỏi khác nhau.
+4. **So sánh sau giai đoạn yên và GC.** Khi công cụ hỗ trợ, yêu cầu GC trong môi trường chẩn đoán rồi so retained object giữa các snapshot. Đừng kỳ vọng heap bytes khớp tuyệt đối vì runtime có cache và cơ chế cấp phát riêng.
+5. **Đi theo retaining path.** Tìm timer callback, event listener, Subject observer, replay buffer, singleton `Map`, pending queue, detached DOM hoặc console reference đang giữ closure của component.
+6. **Sửa owner hoặc policy giữ dữ liệu.** Dừng producer, remove listener, hủy inner, reset cache đúng scope hay giới hạn queue. Sau đó chạy lại đúng kịch bản, không chỉ nhìn việc log đã ngừng.
+
+<Callout type="warn" title="Công cụ chẩn đoán cũng có thể giữ object">
+  Console, biến global dùng để debug và object đang được inspect có thể giữ reference. Loại chúng khỏi kịch bản trước khi kết luận ứng dụng leak. Trên Node.js, RSS không đồng nghĩa với JS heap; cần tách heap, external memory và Buffer khi chẩn đoán.
+</Callout>
+
+Tiêu chí thành công không phải “GC chạy nhiều hơn”, mà là resource của owner đã dừng, retained object không tăng đều sau mỗi vòng, và queue/cache nằm trong bound đã định. Nếu object vẫn tăng, giữ lại snapshot và retaining path làm bằng chứng cho giả thuyết tiếp theo.
+
+## Kiểm thử emission và teardown
+
+TestScheduler kiểm tra virtual-time semantics và subscription window, không đo tốc độ render hay xác nhận browser GC. Hai lớp kiểm tra cần đi cùng nhau: unit test chứng minh policy, lifecycle/profiling test chứng minh tài nguyên thật được giải phóng.
+
+### Kiểm thử chính sách giảm emission
+
+Test dưới đây là nguồn kiểm chứng cho timeline `auditTime` ở trên. Ví dụ dùng `node:assert/strict` trong môi trường test Node đã có RxJS:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { auditTime } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('-a-b-c----|');
+  const result = source.pipe(auditTime(3, scheduler));
+
+  expectObservable(result).toBe('----b---c-|');
+  expectSubscriptions(source.subscriptions).toBe('^---------!');
+});
+```
+
+Test còn kiểm tra rằng giảm emission không unsubscribe source giữa chừng. Nếu đổi thành debounce, deadline và output sẽ khác; không giữ nguyên expected chỉ vì UI vẫn “có vẻ đúng”.
+
+### Kiểm thử hủy cả inner subscription
+
+Khi owner destroy ở frame 4, output complete tại frame 4 và inner bị unsubscribe cùng thời điểm. Đừng chỉ assert rằng output không còn value: một timer leak có thể không phát xuống nhưng vẫn chạy.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { switchMap, takeUntil } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, hot, expectObservable, expectSubscriptions }) => {
+  const outer = hot('a--------|');
+  const inner = cold('-x-y-z---|');
+  const destroy = hot('----s----|');
+
+  const result = outer.pipe(
+    switchMap(() => inner),
+    takeUntil(destroy),
+  );
+
+  expectObservable(result).toBe('-x-y|');
+  expectSubscriptions(outer.subscriptions).toBe('^---!');
+  expectSubscriptions(inner.subscriptions).toBe('^---!');
+});
+```
+
+Nếu chuyển `takeUntil` lên trước `switchMap`, test output và inner subscription phải fail: outer dừng ở frame 4 nhưng inner tiếp tục tới frame 9. Đây là lỗi lifecycle mà chỉ kiểm tra request cuối cùng thành công sẽ không thấy.
+
+Với custom producer, viết thêm spy/count cho `clearInterval`, `removeEventListener`, `abort` hoặc `close` để assert dispose gọi cleanup đúng một lần. Với shared stream, kiểm tra hai consumer đồng thời chỉ tạo một execution; consumer đầu rời đi không dừng source, consumer cuối rời đi mới teardown nếu policy yêu cầu. Kiểm tra riêng trường hợp source đã complete vì replay cache có lifecycle khác nguồn đang chạy.
+
+## Checklist trước khi đưa lên production
+
+- [ ] Mỗi subscription có owner và đường dispose rõ ràng, kể cả error và unmount.
+- [ ] Đếm riêng execution upstream, emission downstream và render; không dùng một số thay cho cả ba.
+- [ ] Selector và rate limiting đứng trước phần tính toán/request đắt, với policy bỏ dữ liệu đã được chấp nhận.
+- [ ] Shared Observable có instance ổn định; vị trí sharing bao phủ phần công việc thật sự dùng chung.
+- [ ] `shareReplay` ghi rõ `bufferSize`, `refCount`, scope và cách invalidation/eviction sau complete.
+- [ ] Lifecycle boundary hủy được cả inner; notifier có emission, không chỉ complete.
+- [ ] Custom producer trả teardown; Promise, fetch và socket có policy cancellation cụ thể.
+- [ ] History, cache, buffer và queue đều có bound phù hợp; bound theo count được kiểm tra cùng payload size.
+- [ ] Concurrency được chọn cùng capacity/overload policy, không nhầm với backpressure.
+- [ ] Không dùng scheduler thay cho giải pháp CPU nặng; đo lại main-thread work sau tối ưu.
+- [ ] Test assert cả output lẫn subscription window; vòng mở/đóng thực tế trở về baseline resource.
+
+Nếu chưa biết bắt đầu ở đâu, chọn một màn hình có triệu chứng rõ nhất: ghi số execution và resource trước khi mở, sau khi mở, rồi sau khi đóng. Chỉ sửa một giả thuyết mỗi lượt và giữ lại kết quả trước/sau; đó là cách biết thay đổi nào thực sự có tác dụng.
+
+## Nguồn tham khảo
+
+Các chi tiết về default, queue và reset dưới đây được đối chiếu với source RxJS 7.8.2; khi nâng major version, hãy kiểm tra lại thay vì suy rộng policy cũ:
+
+- [shareReplay implementation](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — `refCount`, reset khi error và giữ cache sau complete.
+- [takeUntil implementation](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/takeUntil.ts) — notifier phát giá trị mới dừng output; notifier complete riêng không dừng source.
+- [audit implementation](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/audit.ts) — giữ value mới nhất trong cửa sổ và chờ duration khi source complete còn value pending.
+- [ReplaySubject implementation](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/ReplaySubject.ts) — default buffer và thời điểm trim dữ liệu.
+- [mergeInternals implementation](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/mergeInternals.ts) — queue input khi vượt concurrency.
+- [Chrome DevTools: Memory](https://developer.chrome.com/docs/devtools/memory-problems) — phân biệt leak, memory bloat và GC thường xuyên khi profiling.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Nắm hợp đồng cleanup trước khi viết custom producer." />
+  <Card title="Cache dữ liệu" href="/docs/patterns-production/cache-data" description="Thiết kế TTL, invalidation và giới hạn cache theo scope." />
+  <Card title="Observability" href="/docs/patterns-production/observability" description="Theo dõi execution, lỗi và latency để kiểm chứng tối ưu." />
+  <Card title="Memory leak" href="/docs/troubleshooting/memory-leak" description="Đi từ triệu chứng tới retaining path và resource chưa cleanup." />
+</Cards>

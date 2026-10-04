@@ -31,15 +31,18 @@ Bài này tập trung vào cách đọc và tự phác diagram khi thiết kế 
 
 Hãy coi marble diagram như bản ghi hành trình của **một Observable execution**. Thời gian chạy từ trái sang phải; mỗi “viên bi” là một lần `next(value)`; vạch đứng hoặc dấu lỗi đóng execution. Nếu có operator, các dòng phía trên là input và dòng phía dưới là Observable mới mà operator trả về.
 
-Các timeline cần căn frame chính xác trong bộ tài liệu có thể dùng diagram trực quan. Một số sketch trong bài nhập môn này vẫn giữ dạng text để bạn tập tự phác và đọc ký hiệu mà không phụ thuộc công cụ.
+Các timeline trong bài dùng diagram trực quan để input và output cùng căn trên một trục. Đọc theo cột: ví dụ dưới bỏ `A`, đổi nhãn `B` và `C`, nhưng không trì hoãn những value được giữ lại.
 
-```text
-time ─────────────────────────────────────────►
-
-source$:  ──(A)────(B)────────(C)────│
-                    operator
-output$:  ────────(B')───────(C')────│
-```
+<MarbleDiagram
+  title="filter(value !== 'A'), map(project)"
+  rows={[
+    { label: 'source$', marble: '--a--b--c--|', kind: 'source' },
+    { label: 'output$', marble: '-----x--y--|', kind: 'output' },
+  ]}
+  values={{ a: 'A', b: 'B', c: 'C', x: 'B′', y: 'C′' }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="A bị loại; B′ và C′ căn đúng cột với B và C. Completion được chuyển tiếp cùng cột với source."
+/>
 
 Bạn nên đọc hình theo hai lượt. Lượt đầu đi ngang trên từng dòng để hiểu lifecycle; lượt sau đi dọc tại mỗi thời điểm để hỏi “input này làm output thay đổi thế nào?”. Cách đọc này tránh lỗi phổ biến là chỉ nhìn danh sách giá trị mà bỏ qua khoảng chờ, completion hoặc cancellation.
 
@@ -64,25 +67,39 @@ Ký hiệu       Ý nghĩa trong một Observable execution
 …             nguồn còn có thể tiếp tục, chưa có terminal notification
 ```
 
-Ba timeline cơ bản trông như sau:
+Ba timeline cơ bản trông như sau. Đây là ba execution độc lập, không phải ba bước của một pipeline:
 
-```text
-complete$:  ──(A)────(B)────│
-error$:     ──(A)───────────✕
-open$:      ──(A)────(B)────…
-```
+<MarbleDiagram
+  title="Complete, error và nguồn chưa kết thúc"
+  rows={[
+    { label: 'complete$', marble: '--a--b--|', kind: 'source' },
+    { label: 'error$', marble: '--a-----#', kind: 'source' },
+    { label: 'open$', marble: '--a--b------', kind: 'source' },
+  ]}
+  values={{ a: 'A', b: 'B' }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Complete và error đóng execution. open$ chưa có terminal notification trong cửa sổ đang vẽ; mũi tên cuối trục chỉ hướng thời gian, không phải complete."
+/>
 
 `complete` và `error` đều là **terminal notification**: sau chúng, Observer không nhận thêm `next`. Chúng loại trừ nhau trong cùng một execution. Dòng `open$` không sai; DOM event, WebSocket hoặc `interval()` có thể không tự kết thúc.
 
 `unsubscribe` lại là hành động của consumer, không phải notification do producer gửi. Vì vậy dấu `!` đóng subscription và kích hoạt teardown, nhưng callback `complete` của Observer không chạy. Chi tiết này đặc biệt quan trọng khi diagram có operator như `take`, `switchMap` hoặc `takeUntil`.
 
-```text
-source$:       ──(A)────(B)────(C)────(D)────…
-subscription:  ^───────────────!
-received:      ──(A)────(B)────(C)
-```
+Đọc cửa sổ subscription bên dưới: consumer nhận `A`, `B`, `C` rồi chủ động rời đi trước `D`.
 
-Diagram chỉ mô tả những notification đến trong cửa sổ subscription. Giá trị `(D)` thuộc lịch phát tiềm năng của nguồn nhưng consumer trên đã rời đi trước khi nhận nó.
+<MarbleDiagram
+  title="Consumer unsubscribe"
+  rows={[
+    { label: 'lịch nguồn', marble: '--a--b--c--d---', kind: 'source' },
+    { label: 'subscription', marble: '^--------!', kind: 'subscription' },
+    { label: 'received', marble: '--a--b--c', kind: 'output' },
+  ]}
+  values={{ a: 'A', b: 'B', c: 'C', d: 'D — chỉ nhận nếu còn subscribe' }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Subscribe ở cột 0, unsubscribe ở cột 9, sau C ở cột 8 và trước D ở cột 11. received không có complete vì consumer tự unsubscribe."
+/>
+
+Diagram chỉ mô tả những notification đến trong cửa sổ subscription. Dòng “lịch nguồn” là lịch phát tiềm năng nếu nguồn tiếp tục; `D` không được gửi tới consumer đã rời đi. Với nguồn có teardown dừng producer, công việc phát `D` cũng có thể bị hủy.
 
 ## Quy trình đọc một diagram
 
@@ -100,15 +117,21 @@ Hình dung operator như một trạm kiểm soát trên băng chuyền: mỗi k
 
 Ví dụ đầu tiên kết hợp `filter` và `map`. `filter` loại số lẻ; `map` nhân số chẵn với `10`.
 
-```text
-source$:  ──(1)────(2)────(3)────(4)────│
-                filter số chẵn
-filtered$:────────(2)────────────(4)────│
-                map(value => value * 10)
-output$:  ────────(20)───────────(40)───│
-```
+Đọc các value theo thứ tự từ trái sang phải, rồi đối chiếu cột của số chẵn với output. Ví dụ code bên dưới dùng `of()` đồng bộ: các cột được tách ra cho dễ đọc, **không biểu thị khoảng chờ hay những frame thời gian khác nhau**.
 
-Điểm cần nhìn không chỉ là output có `20` và `40`. Khoảng thời gian nơi `1` và `3` xuất hiện vẫn trôi qua, nhưng không có output tương ứng. Khi source complete, completion đi qua cả hai operator và output cũng complete.
+<MarbleDiagram
+  title="filter(even), map(value => value * 10)"
+  rows={[
+    { label: 'source$', marble: '-1-2-3-4-|', kind: 'source' },
+    { label: 'filtered$', marble: '---2---4-|', kind: 'inner' },
+    { label: 'output$', marble: '---x---y-|', kind: 'output' },
+  ]}
+  values={{ '1': '1', '2': '2', '3': '3', '4': '4', x: '20', y: '40' }}
+  frameLabel="Sync: cột chỉ minh họa thứ tự"
+  caption="2 và 20 ở cột 3; 4 và 40 ở cột 7. Cả ba dòng complete ở cột 9. Toàn bộ notification xảy ra ngay trong cùng lời gọi subscribe()."
+/>
+
+Điểm cần nhìn không chỉ là output có `20` và `40`. Ở các cột nơi `1` và `3` xuất hiện, không có output tương ứng; `filter` không làm những value còn lại đến sớm hơn. Khi source complete, completion đi qua cả hai operator và output cũng complete.
 
 Code TypeScript tương ứng chạy đồng bộ vì `of()` phát các đối số ngay trong lời gọi `subscribe()`:
 
@@ -141,14 +164,22 @@ Marble diagram không buộc Observable phải bất đồng bộ. Với nguồn
 
 `take(3)` minh họa vì sao phải đọc cả output lẫn lifecycle upstream. `interval(500)` có thể phát mãi, nhưng output chỉ lấy ba giá trị rồi complete.
 
-```text
-source interval$:  ──(0)────(1)────(2)────(3)────…
-upstream sub:      ^─────────────────!
-output$:           ──(0)────(1)────(2)│
-                                      └─ complete sau value thứ ba
-```
+Mỗi khoảng trên hình ứng với 500 ms theo lịch timer lý tưởng. Dòng `next` và dòng `complete` cùng mô tả một output; tách chúng ra để thấy value cuối và completion nằm cùng thời điểm mà không chồng marker.
 
-Dấu `!` cho biết `take(3)` unsubscribe khỏi `interval` ngay khi đã chuyển tiếp value thứ ba. Teardown của `interval` dọn timer; value `(3)` không xuất hiện trong execution này. `finalize()` ở output chạy khi subscription kết thúc.
+<MarbleDiagram
+  title="map(...), take(3)"
+  rows={[
+    { label: 'interval$', marble: '-012', kind: 'source' },
+    { label: 'upstream sub', marble: '^--!', kind: 'subscription' },
+    { label: 'output next', marble: '-abc', kind: 'output' },
+    { label: 'output end', marble: '---|', kind: 'output' },
+  ]}
+  values={{ '0': '0', '1': '1', '2': '2', a: 'tick-0', b: 'tick-1', c: 'tick-2' }}
+  frameLabel="1 khoảng = 500 ms"
+  caption="Ở cột 3 (1500 ms), output phát tick-2 rồi complete; take(3) hủy upstream trong cùng lượt xử lý. Nguồn không phát 3 ở 2000 ms."
+/>
+
+Dấu `!` ở cột 3 cho biết `take(3)` unsubscribe khỏi `interval` ngay khi đã chuyển tiếp value thứ ba. Teardown của `interval` dọn timer; value `(3)` không xuất hiện trong execution này. `finalize()` ở output chạy khi subscription kết thúc.
 
 ```ts
 import { finalize, interval, map, take } from 'rxjs';
@@ -181,11 +212,19 @@ Thời gian thực có thể xê dịch theo event loop, nhưng thứ tự lifec
 
 Dấu lỗi không phải một viên bi mang “giá trị lỗi”. Nó đại diện cho error channel và kết thúc execution ngay tại đó.
 
-```text
-source$:  ──('{"id":1}')──('{broken}')──('{"id":3}')──│
-                         map(JSON.parse)
-output$:  ──({ id: 1 })──────✕
-```
+Đọc cột của input thứ hai cùng error ở output và dấu hủy upstream. Giống ví dụ `of()` trước, hình tách các bước đồng bộ thành cột minh họa chứ không thêm độ trễ.
+
+<MarbleDiagram
+  title="map(JSON.parse)"
+  rows={[
+    { label: 'source$', marble: '-a-b', kind: 'source' },
+    { label: 'upstream sub', marble: '^--!', kind: 'subscription' },
+    { label: 'output$', marble: '-x-#', kind: 'output' },
+  ]}
+  values={{ a: '{"id":1}', b: '{broken}', x: '{ id: 1 }' }}
+  frameLabel="Sync: cột chỉ minh họa thứ tự"
+  caption="Input b gây error ở cột 3 và đóng upstream ngay trong lượt xử lý đó. of() dừng phát: input thứ ba và source complete không xảy ra trong execution này."
+/>
 
 Khi `JSON.parse` ném lỗi ở value thứ hai, `map` chuyển exception sang error channel. Observer nhận `error`; value thứ ba không được xử lý và callback `complete` không chạy.
 
@@ -219,15 +258,23 @@ Nội dung message tùy JavaScript runtime, nhưng diagram khẳng định đư�
 
 Hình dung ô tìm kiếm nhận `r`, rồi 100 ms sau nhận `rxjs`. Request đầu cần 400 ms, request sau cần 200 ms. Với `switchMap`, query mới hủy inner subscription cũ để kết quả cũ không ghi đè kết quả mới.
 
-```text
-time:          0 ms        100 ms          300 ms        500 ms
-queries$:      (r)─────────(rxjs)────────────────────────│
-request "r":  ^───────────!········(kết quả bị hủy)
-request "rxjs":            ^────────(kết quả)│
-output$:       ──────────────────────(kết quả)───────────│
-```
+Đọc theo cột với mỗi khoảng bằng 100 ms theo lịch timer lý tưởng. Hai dòng `rxjs next` và `rxjs end` mô tả cùng một inner, tách emission và completion để không chồng marker.
 
-Dấu `!` quan trọng hơn viên bi bị gạch bỏ: nó nói rằng inner Observable cho `r` đã teardown ở 100 ms. `switchMap` không chỉ “bỏ qua kết quả khi nó tới”; nó unsubscribe inner cũ ngay khi outer phát query mới. Producer có thực sự hủy network request hay không còn phụ thuộc Observable bọc API có teardown request hay chỉ ngừng chuyển notification.
+<MarbleDiagram
+  title="switchMap(searchApi)"
+  rows={[
+    { label: 'queries$', marble: 'ab---|', kind: 'source' },
+    { label: 'request r', marble: '^!', kind: 'inner' },
+    { label: 'rxjs next', marble: '-^-x', kind: 'inner' },
+    { label: 'rxjs end', marble: '---|', kind: 'inner' },
+    { label: 'output$', marble: '---x-|', kind: 'output' },
+  ]}
+  values={{ a: 'Query r', b: 'Query rxjs', x: 'Kết quả cho rxjs' }}
+  frameLabel="1 khoảng = 100 ms"
+  caption="r bắt đầu ở 0 ms và bị hủy ở 100 ms. rxjs bắt đầu ở 100 ms, phát kết quả rồi complete ở 300 ms. Outer và output complete ở 500 ms; không có kết quả r ở 400 ms."
+/>
+
+Dấu `!` cho biết inner Observable cho `r` đã teardown ở 100 ms; vì thế hình không có emission từ request này ở 400 ms. `switchMap` không chỉ “bỏ qua kết quả khi nó tới”; nó unsubscribe inner cũ ngay khi outer phát query mới. Producer có thực sự hủy network request hay không còn phụ thuộc Observable bọc API có teardown request hay chỉ ngừng chuyển notification.
 
 Ví dụ sau dùng `timer()` để mô phỏng độ trễ. Các con số là dữ liệu minh họa, không phải benchmark:
 
@@ -327,14 +374,21 @@ Một diagram tốt nên ghi rõ:
 
 Thử đọc diagram này trước khi xem đáp án:
 
-```text
-source$:  ──(1)────(2)────(3)────(4)────…
-                 filter(value > 1)
-after filter:──────(2)────(3)────(4)────…
-                 take(2)
-output$:  ─────────(2)────(3)│
-upstream: ^────────────────!
-```
+Dòng `output next` và `output end` mô tả cùng một output. Đọc theo cột để tìm value làm `take(2)` đủ quota và kiểm tra upstream có còn mở không.
+
+<MarbleDiagram
+  title="filter(value => value > 1), take(2)"
+  rows={[
+    { label: 'source$', marble: '-1-2-3', kind: 'source' },
+    { label: 'after filter', marble: '---2-3', kind: 'inner' },
+    { label: 'upstream sub', marble: '^----!', kind: 'subscription' },
+    { label: 'output next', marble: '---2-3', kind: 'output' },
+    { label: 'output end', marble: '-----|', kind: 'output' },
+  ]}
+  values={{ '1': '1', '2': '2', '3': '3' }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Nguồn có thể phát tiếp nếu không bị hủy; hình chỉ vẽ những value thực sự đi qua execution này. Completion và unsubscribe được tách dòng để đối chiếu với value cuối."
+/>
 
 Bạn nên trả lời được:
 

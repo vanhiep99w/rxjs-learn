@@ -3,8 +3,695 @@ title: Cache dữ liệu
 description: Chia sẻ kết quả, invalidation và tránh stale data.
 ---
 
-Trang này sẽ trình bày **Cache dữ liệu** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Giả sử header, trang hồ sơ và một dialog cùng đọc thông tin người dùng. Bạn muốn chúng dùng chung request, người mở dialog sau nhận ngay kết quả đã có, nhưng sau khi sửa hồ sơ thì không ai đọc lại tên cũ. Ba yêu cầu này khác nhau: **deduplicate request, replay kết quả và invalidation**. Chỉ thêm `shareReplay(1)` chưa giải quyết đủ cả ba.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình thường bắt đầu bằng một cache nhỏ ở tầng service, có scope và chính sách freshness rõ ràng. Bài này đi từ một HTTP Observable đến cache theo key, rồi xử lý refresh, race condition và kiểm thử lifecycle.
+
+<Callout type="info" title="Phạm vi và điều kiện">
+  Ví dụ dùng hành vi của RxJS 7.8.x, đối chiếu implementation 7.8.2. Bạn cần biết cold Observable, `shareReplay`, `share` và `switchMap`. Code TypeScript dành cho ứng dụng đã có RxJS; repository tài liệu không cần cài thêm dependency để đọc bài. Cache trong bài nằm trong RAM của một service instance, không phải HTTP cache, Redis hay cache bền vững qua reload.
 </Callout>
+
+## Mục lục
+
+- [Chốt hợp đồng cache trước khi chọn operator](#chốt-hợp-đồng-cache-trước-khi-chọn-operator)
+  - [Chọn pattern theo nhu cầu](#chọn-pattern-theo-nhu-cầu)
+- [Chia sẻ một request và replay kết quả](#chia-sẻ-một-request-và-replay-kết-quả)
+  - [Giữ cùng một Observable instance](#giữ-cùng-một-observable-instance)
+  - [Lifecycle không đồng nghĩa với freshness](#lifecycle-không-đồng-nghĩa-với-freshness)
+- [TTL thật sự bằng reset sau complete](#ttl-thật-sự-bằng-reset-sau-complete)
+  - [windowTime không tự refetch](#windowtime-không-tự-refetch)
+  - [Tạo cache hữu hạn có TTL](#tạo-cache-hữu-hạn-có-ttl)
+  - [Đọc timeline hết hạn](#đọc-timeline-hết-hạn)
+- [Cache theo key với invalidation rõ ràng](#cache-theo-key-với-invalidation-rõ-ràng)
+  - [Chuẩn hóa key và scope](#chuẩn-hóa-key-và-scope)
+  - [Một implementation có giới hạn bộ nhớ](#một-implementation-có-giới-hạn-bộ-nhớ)
+  - [Dùng cache sau mutation](#dùng-cache-sau-mutation)
+  - [Request cũ không được xóa entry mới](#request-cũ-không-được-xóa-entry-mới)
+- [Refresh một stream đang được UI theo dõi](#refresh-một-stream-đang-được-ui-theo-dõi)
+  - [Giữ trigger và bắt lỗi trong inner](#giữ-trigger-và-bắt-lỗi-trong-inner)
+  - [Stale while revalidate cần state riêng](#stale-while-revalidate-cần-state-riêng)
+- [Tránh cache sai dữ liệu trong production](#tránh-cache-sai-dữ-liệu-trong-production)
+- [Kiểm thử các đường lifecycle](#kiểm-thử-các-đường-lifecycle)
+  - [Replay và refetch sau TTL](#replay-và-refetch-sau-ttl)
+  - [Invalidation khi request cũ còn chạy](#invalidation-khi-request-cũ-còn-chạy)
+  - [Consumer chỉ lấy một value](#consumer-chỉ-lấy-một-value)
+  - [Ma trận kiểm thử bổ sung](#ma-trận-kiểm-thử-bổ-sung)
+- [Checklist đưa cache vào ứng dụng](#checklist-đưa-cache-vào-ứng-dụng)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Chốt hợp đồng cache trước khi chọn operator
+
+Cache giống một bản ghi kết quả để trên bàn: người đến sau đọc lại thay vì nhờ làm lại từ đầu. Nhưng bản ghi không biết server vừa đổi dữ liệu. Bạn phải quyết định khi nào bỏ nó và ai có quyền đọc nó; RxJS chỉ giúp triển khai quyết định đó.
+
+| Câu hỏi | Ví dụ quyết định cụ thể |
+| --- | --- |
+| Cache cái gì? | Kết quả `GET /products/:id`, không cache mọi event của stream |
+| Key gồm gì? | Tenant, user scope, product ID, locale và query đã chuẩn hóa |
+| Cache sống ở đâu? | Một service trong phiên đăng nhập; SSR tạo instance theo request |
+| Khi nào còn mới? | TTL tính từ response thành công; mutation thành công invalidates ngay |
+| Nhiều reader cùng lúc thì sao? | Một execution cho cùng key trong lúc request đang chạy |
+| Khi không ai đọc? | Hủy request đang chạy và bỏ entry chưa complete |
+| Khi lỗi? | Gửi error cho reader, bỏ entry; lần đọc sau được thử lại |
+| Giới hạn RAM? | Giới hạn số entry và có eviction; thêm giới hạn payload nếu cần |
+| Invalidation có cập nhật UI không? | Không mặc định; UI phải đọc lại hoặc có refresh trigger |
+
+TTL là giới hạn tuổi bạn chấp nhận cho dữ liệu, không phải cam kết dữ liệu đúng tại thời điểm hiện tại. Một sản phẩm đổi giá ngay sau response thì cache có thể stale dù vẫn còn TTL. Với giá thanh toán, quyền truy cập hay tồn kho cần xác nhận ngay, server vẫn phải kiểm tra lại ở thao tác quyết định; đừng lấy cache UI làm nguồn sự thật.
+
+Nếu ứng dụng cần persistence, đồng bộ nhiều tab, optimistic updates, retry theo policy và eviction phức tạp, mình ưu tiên thư viện quản lý server state hoặc HTTP cache thay vì tự xây tất cả bằng operator. RxJS phù hợp khi cache gắn với orchestration stream đã có và bạn kiểm soát được scope của nó.
+
+### Chọn pattern theo nhu cầu
+
+Mình chọn pattern nhỏ nhất đáp ứng hợp đồng đã chốt. Không cần một Map và eviction nếu ứng dụng chỉ tải một cấu hình dùng chung; ngược lại, đừng dùng một field `profile$` duy nhất để cache response của nhiều tài khoản.
+
+| Nhu cầu | Điểm bắt đầu | Điều chưa được giải quyết |
+| --- | --- | --- |
+| Chỉ gom các reader đang cùng chờ, không giữ kết quả | `share()` | Reader sau complete sẽ tải lại, không có snapshot để replay |
+| Một snapshot giữ đến khi bỏ service instance | Field ổn định với `shareReplay({ bufferSize: 1, refCount: true })` | Không có TTL hay invalidation tự động |
+| Một snapshot có TTL, đọc lại khi hết hạn | `share` với `ReplaySubject(1)` và reset notifier | Không có key hay cập nhật UI đang subscribe |
+| Nhiều tài nguyên, TTL và invalidation sau mutation | Cache theo key với registry có giới hạn | Cần tự thiết kế policy scope, eviction và race |
+| UI phải nhận dữ liệu mới sau mỗi trigger | Stream refresh với `switchMap`, sharing ở cuối | Cần thêm state để mô tả loading, stale và error |
+
+Các pattern có thể kết hợp, nhưng mỗi tầng phải có trách nhiệm rõ. Một refresh trigger đi vào loader đang cache có thể chỉ đọc lại snapshot cũ, không hề gửi request mới; hãy invalidate trước hoặc dùng loader không cache.
+
+## Chia sẻ một request và replay kết quả
+
+### Giữ cùng một Observable instance
+
+Một HTTP Observable cold thường gửi request cho mỗi subscription. Đặt sharing sau toàn bộ phần tải và chuyển đổi dữ liệu để các consumer đọc cùng một kết quả:
+
+```ts
+import { shareReplay } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Profile = Readonly<{ id: string; displayName: string }>;
+
+// Tạo một lần trong service của phiên đăng nhập, không ở mỗi lần render.
+const profile$ = ajax.getJSON<Profile>('/api/me').pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+const headerSub = profile$.subscribe(console.log);
+const pageSub = profile$.subscribe(console.log);
+
+// Teardown tương ứng khi từng consumer rời UI.
+// headerSub.unsubscribe();
+// pageSub.unsubscribe();
+```
+
+Hai subscriber đồng thời dùng chung execution. Nếu source đã phát response và complete, consumer đến muộn nhận response rồi complete đồng bộ, không gửi thêm request.
+
+Ngược lại, hàm sau tạo **một cache mới mỗi lần gọi**, nên hai component gọi hàm riêng vẫn có thể gửi hai request:
+
+```ts
+// Không phải cache chung giữa các lần gọi.
+function getProfile$() {
+  return ajax.getJSON<Profile>('/api/me').pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+}
+```
+
+Muốn cache theo tham số thì cần registry như `Map<Key, Entry>`; muốn cache một tài nguyên thì giữ Observable ở field ổn định của service. Một `defer` bên ngoài mà mỗi subscription lại tạo một `shareReplay` mới cũng mắc cùng lỗi.
+
+### Lifecycle không đồng nghĩa với freshness
+
+Với RxJS 7.8.x, cấu hình trên có các hành vi cần phân biệt:
+
+| Tình huống | Kết quả |
+| --- | --- |
+| Chưa có subscriber | Request chưa chạy |
+| Có nhiều subscriber đang nghe | Dùng chung subscription upstream |
+| Subscriber cuối rời đi trước khi source complete | Ngắt upstream và reset buffer vì `refCount: true` |
+| Source complete thành công | Giữ buffer và trạng thái complete cho subscriber đến sau |
+| Source error | Reader hiện tại nhận error; lần subscribe sau có thể tạo execution mới |
+
+**`refCount: true` không xóa cache của source đã complete.** Nó quản lý kết nối còn chạy, không phát hiện hồ sơ đã bị chỉnh sửa hay tuổi của response đã vượt TTL.
+
+<Callout type="warn" title="take(1) có thể đổi kết quả cache">
+  Nếu consumer cuối dùng `take(1)` hoặc `firstValueFrom`, nó có thể unsubscribe ngay trong lúc nhận response, trước khi sharing quan sát `complete` từ source. Với `refCount: true`, upstream và buffer có thể reset; lần đọc sau gửi request mới. Đừng giả định một response đã phát nghĩa là cache hoàn tất. Nếu chủ đích là cho request chạy đến complete dù không còn consumer, dùng chính sách không reset khi ref count về 0, nhưng phải có timeout và nguồn hữu hạn.
+</Callout>
+
+Teardown cũng tùy adapter: `ajax` có thể abort request đang chạy; chuyển Promise đã khởi động thành Observable không khiến Promise tự được hủy. Và abort phía client không hoàn tác một mutation mà server đã xử lý.
+
+## TTL thật sự bằng reset sau complete
+
+### windowTime không tự refetch
+
+`shareReplay({ bufferSize: 1, windowTime: 30_000, refCount: true })` chỉ giới hạn tuổi value được replay. Nó không lập lịch request mới và không reset trạng thái complete.
+
+Nếu HTTP đã complete rồi value hết `windowTime`, subscriber mới có thể chỉ nhận `complete`, không có response nào. Tương tự, `ReplaySubject(1, ttl)` không tự trở thành cache có khả năng refetch. Cần một chính sách **reset execution**, không chỉ trim buffer.
+
+### Tạo cache hữu hạn có TTL
+
+Với một tài nguyên và TTL cố định, `share` cùng `ReplaySubject(1)` cho phép reset sau complete. Hàm sau dùng TTL tính từ lúc source **complete**:
+
+```ts
+import {
+  asyncScheduler,
+  defer,
+  ReplaySubject,
+  share,
+  timer,
+} from 'rxjs';
+import type { Observable, SchedulerLike } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+function cacheFor<T>(
+  load: () => Observable<T>,
+  ttlMs: number,
+  scheduler: SchedulerLike = asyncScheduler,
+): Observable<T> {
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+    throw new Error('ttlMs must be finite and positive');
+  }
+
+  return defer(load).pipe(
+    share({
+      connector: () => new ReplaySubject<T>(1),
+      resetOnError: true,
+      resetOnComplete: () => timer(ttlMs, scheduler),
+      resetOnRefCountZero: true,
+    }),
+  );
+}
+
+// Một field ổn định, không gọi cacheFor lại cho mỗi consumer.
+const settings$ = cacheFor(
+  () => ajax.getJSON<Readonly<{ theme: string }>>('/api/settings'),
+  30_000, // TTL minh họa, cần chọn theo yêu cầu freshness của sản phẩm.
+);
+```
+
+Subscriber trước hết hạn nhận kết quả cũ và complete. Khi timer phát, trạng thái sharing bị reset; **chỉ khi có subscriber tiếp theo** mới chạy `load` lần nữa. Timer không polling API, và subscriber đã complete không tự được nối vào execution mới.
+
+Subscriber đến trong khoảng TTL không gia hạn timer complete: đây không phải sliding expiration theo lần truy cập. Cache cũng không có key, không có `invalidate()` và không tự refresh UI. Với nguồn dài hạn không complete, timer TTL này không bao giờ được khởi động; đừng dùng nó cho WebSocket hoặc `interval` rồi mong value hết hạn theo cùng cách.
+
+### Đọc timeline hết hạn
+
+Đọc theo cột dọc: execution đầu phát `a` ở frame 2, complete ở frame 3. Giả sử TTL là 5 virtual frame, cache reset ở frame 8. Diagram dùng nhóm `(a|)` cho replay và complete trong cùng frame; component của dự án hỗ trợ notation này.
+
+<MarbleDiagram
+  title="share + ReplaySubject(1), TTL = 5"
+  rows={[
+    { label: 'HTTP 1', marble: '--a|', kind: 'source' },
+    { label: 'HTTP 2', marble: '-----------a|', kind: 'source' },
+    { label: 'sub A', marble: '^--!', kind: 'subscription' },
+    { label: 'sub B', marble: '-----^', kind: 'subscription' },
+    { label: 'sub C', marble: '---------^--!', kind: 'subscription' },
+    { label: 'A nhận', marble: '--a|', kind: 'output' },
+    { label: 'B nhận', marble: '-----(a|)', kind: 'output' },
+    { label: 'C nhận', marble: '-----------a|', kind: 'output' },
+  ]}
+  values={{ a: 'response của mỗi execution; ví dụ giả sử payload không đổi' }}
+  caption="B đến ở frame 5 nên nhận cache và complete ngay. C đến ở frame 9, sau reset ở frame 8, phải chờ response của execution mới. Subscription của B cũng đóng ngay ở frame 5."
+/>
+
+A kích hoạt request đầu ở frame 0. B đến trước hạn nên không tạo execution thứ hai. Frame 8 chỉ xóa trạng thái cache; tới frame 9 C mới kích hoạt request tiếp theo, nhận response ở frame 11 và complete ở frame 12. Các dấu `!` của A và C ở đây là đóng subscription do complete, không phải hủy request thủ công.
+
+## Cache theo key với invalidation rõ ràng
+
+TTL chưa đủ khi API có tham số hoặc dữ liệu thay đổi do mutation. Ta cần entry theo key và thao tác bỏ entry chủ động. Invalidation trong implementation dưới đây nghĩa là **lần đọc tiếp theo dùng entry mới**, không thu hồi response đã gửi và không chuyển subscriber đang chạy sang request mới.
+
+### Chuẩn hóa key và scope
+
+Hai lần đọc chỉ được dùng chung cache khi chúng có cùng mọi input ảnh hưởng response. Scope cố định của service có thể giữ tenant và user identity bên ngoài key; nếu một instance phục vụ nhiều scope, key phải chứa cả hai. Key là identity của dữ liệu, không phải nơi cất access token.
+
+Ví dụ dưới đây giả sử API tìm sản phẩm coi thứ tự category là không quan trọng và bỏ qua khoảng trắng ở hai đầu từ khóa:
+
+```ts
+type ProductQuery = Readonly<{
+  tenantId: string;
+  userId: string;
+  locale: string;
+  search: string;
+  categoryIds: readonly string[];
+  page: number;
+}>;
+
+function productQueryKey(query: ProductQuery): string {
+  return JSON.stringify([
+    'products',
+    query.tenantId,
+    query.userId,
+    query.locale,
+    query.search.trim(),
+    [...new Set(query.categoryIds)].sort(),
+    query.page,
+  ]);
+}
+```
+
+Tuple có thứ tự cố định và được serialize giúp tránh va chạm do tự nối chuỗi bằng `:`. Đừng sort hoặc trim nếu API phân biệt các input đó; cách chuẩn hóa key và cách tạo request phải dùng cùng quy tắc. Với `Map`, `[id, locale]` hoặc `{ id, locale }` tạo mới mỗi lần vẫn là các key khác nhau dù nội dung giống nhau; serialize hoặc giữ identity ổn định.
+
+Nếu quyền của user đổi nhưng user ID không đổi, key trên vẫn như cũ. Vì vậy đổi quyền, logout hoặc đổi tenant phải invalidate hoặc thay cache instance, không chỉ chờ TTL. Trên SSR, ưu tiên instance theo request thay vì module singleton giữ response cá nhân.
+
+### Một implementation có giới hạn bộ nhớ
+
+Cache này dành cho loader phát **đúng một response rồi complete**, chẳng hạn `ajax.getJSON`. Nó chia sẻ request đang chạy, tính TTL từ response, không cache error hoặc nguồn complete rỗng, và hủy upstream nếu consumer cuối rời đi trước complete.
+
+Entry hết hạn được bỏ khi có lần đọc; đây là lazy expiration, không phải timer chủ động xóa từng key. Giới hạn `maxEntries` ngăn Map tăng vô hạn: khi đầy, cache evict entry đã hoàn tất ít được truy cập gần đây nhất; nếu tất cả entry đều đang chạy, nó báo lỗi thay vì âm thầm tạo thêm request trùng.
+
+```ts
+import {
+  defer,
+  finalize,
+  Observable,
+  shareReplay,
+  tap,
+  timeout,
+} from 'rxjs';
+
+type Entry<T> = {
+  value$: Observable<T>;
+  expiresAt: number;
+  completed: boolean;
+};
+
+class KeyedCache<K, T> {
+  // Thứ tự Map: ít được truy cập gần đây nhất -> mới nhất.
+  private readonly entries = new Map<K, Entry<T>>();
+
+  constructor(
+    private readonly load: (key: K) => Observable<T>,
+    private readonly ttlMs: number,
+    private readonly maxEntries = 100,
+    private readonly now: () => number = () => Date.now(),
+  ) {
+    if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+      throw new Error('ttlMs must be finite and positive');
+    }
+    if (!Number.isInteger(maxEntries) || maxEntries < 1) {
+      throw new Error('maxEntries must be a positive integer');
+    }
+  }
+
+  get(key: K): Observable<T> {
+    // Tra cứu khi subscribe, không khi tạo handle get(key).
+    return defer(() => this.lookup(key));
+  }
+
+  invalidate(key: K): void {
+    this.entries.delete(key);
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  private dropIfCurrent(key: K, entry: Entry<T>): void {
+    if (this.entries.get(key) === entry) {
+      this.entries.delete(key);
+    }
+  }
+
+  private lookup(key: K): Observable<T> {
+    const time = this.now();
+    for (const [cachedKey, entry] of this.entries) {
+      if (entry.completed && entry.expiresAt <= time) {
+        this.entries.delete(cachedKey);
+      }
+    }
+
+    const cached = this.entries.get(key);
+    if (cached) {
+      this.entries.delete(key);
+      this.entries.set(key, cached); // Touch thứ tự LRU.
+      return cached.value$;
+    }
+
+    if (this.entries.size >= this.maxEntries) {
+      let evicted = false;
+      for (const [cachedKey, entry] of this.entries) {
+        if (entry.completed) {
+          this.entries.delete(cachedKey);
+          evicted = true;
+          break;
+        }
+      }
+      if (!evicted) {
+        throw new Error('Cache capacity reached: all entries are in flight');
+      }
+    }
+
+    const entry: Entry<T> = {
+      value$: new Observable<T>(), // Gán pipeline trước khi lưu vào Map.
+      expiresAt: Infinity,
+      completed: false,
+    };
+    let received = false;
+
+    entry.value$ = defer(() => this.load(key)).pipe(
+      timeout({ first: 10_000 }), // Deadline minh họa cho response đầu.
+      tap({
+        next: () => {
+          received = true;
+          entry.expiresAt = this.now() + this.ttlMs;
+        },
+        complete: () => {
+          entry.completed = true;
+          if (!received) this.dropIfCurrent(key, entry);
+        },
+        error: () => this.dropIfCurrent(key, entry),
+      }),
+      finalize(() => {
+        // Bao gồm unsubscribe trước complete và timeout/error.
+        if (!entry.completed) this.dropIfCurrent(key, entry);
+      }),
+      shareReplay({ bufferSize: 1, refCount: true }),
+    );
+
+    this.entries.set(key, entry);
+    return entry.value$;
+  }
+}
+```
+
+`finalize` đặt **trước** sharing nên dọn entry theo lifecycle upstream, không theo từng consumer. Nếu đặt sau sharing và xóa Map mỗi khi một consumer rời đi, consumer còn lại vẫn chờ request cũ trong khi một reader mới lại mở request thứ hai.
+
+`get(key)` trả handle lazy; hai handle khác nhau vẫn tra cùng Map lúc subscribe. Vì vậy một handle được giữ từ trước invalidation vẫn đọc entry mới ở lần subscribe tiếp theo. Nhưng một subscription đã bắt đầu vẫn bám vào execution mà nó đã chọn.
+
+<Callout type="warn" title="Hợp đồng của loader và giới hạn của ví dụ">
+  Loader phải phát một response rồi complete; `timeout({ first: 10_000 })` chỉ bảo vệ thời gian chờ response đầu, không bảo vệ nguồn phát một value rồi treo mãi. Không đưa stream vô hạn vào cache này. Lookup quét tối đa `maxEntries` entry; đây là thiết kế nhỏ, không phải LRU tối ưu cho hàng trăm nghìn key. Giới hạn số entry cũng không giới hạn byte: payload lớn và consumer giữ reference vẫn có thể chiếm RAM. Các giá trị 100 entry, 10 giây và TTL ở ví dụ là policy minh họa, không phải ngưỡng production chung.
+</Callout>
+
+Với chính sách hủy khi không ai đọc, consumer cuối `take(1)` có thể khiến entry bị bỏ trước complete. Cache này chấp nhận refetch trong trường hợp đó để không giữ một entry chưa hoàn tất; hãy kiểm thử cách consumer thực tế subscribe, không chỉ hàm loader.
+
+### Dùng cache sau mutation
+
+Ví dụ sau đặt cache trong service của một tenant và một user session. Nếu scope có thể đổi, tạo instance mới hoặc thêm identity vào key; không dùng chung instance này cho mọi user trên server.
+
+```ts
+import { concatMap, tap } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Product = Readonly<{ id: string; name: string; price: number }>;
+
+const products = new KeyedCache<string, Product>(
+  (id) => ajax.getJSON<Product>(`/api/products/${encodeURIComponent(id)}`),
+  30_000,
+  100,
+);
+
+function renameProduct(id: string, name: string) {
+  return ajax.patch(
+    `/api/products/${encodeURIComponent(id)}`,
+    { name },
+    { 'Content-Type': 'application/json' },
+  ).pipe(
+    // Chỉ invalidate khi mutation thành công.
+    tap(() => products.invalidate(id)),
+    concatMap(() => products.get(id)),
+  );
+}
+
+// Caller phải subscribe; tạo Observable chưa gửi mutation.
+renameProduct('p-42', 'Tên mới').subscribe({
+  next: (product) => console.log('Đã tải lại:', product),
+  error: (error) => console.error('Không thể cập nhật:', error),
+});
+```
+
+Invalidation trước `GET` mới tránh đọc lại buffer cũ. Tuy nhiên, detail cache không phải cache duy nhất: nếu tên sản phẩm xuất hiện ở danh sách tìm kiếm hoặc danh mục, phải invalidate các query liên quan hoặc cập nhật snapshot của chúng bằng response mutation.
+
+Đừng biến mọi lỗi thành dữ liệu “thành công” trước sharing. Chẳng hạn `catchError(() => of([]))` trước `shareReplay` có thể cache danh sách rỗng như response thật; người đến sau không biết API đang lỗi. Thông thường hãy để cache bỏ entry lỗi, rồi UI xử lý error ở downstream, hoặc dùng state có trường error riêng.
+
+### Request cũ không được xóa entry mới
+
+Giả sử A đang tải product, mutation thành công làm invalidate, rồi B bắt đầu request mới. A lỗi hoặc teardown sau đó. Nếu cleanup của A chỉ gọi `entries.delete(key)`, nó sẽ xóa cả entry của B.
+
+`dropIfCurrent` kiểm tra identity nên cleanup của A không đụng B. Response thành công của A cũng chỉ cập nhật object entry của A, không ghi trở lại Map; entry mới vẫn giữ response của B. Đây là cách ngăn request cũ làm hỏng registry, **không phải cách bảo đảm mọi UI không bao giờ nhận response cũ**: subscriber của A vẫn có thể nhận response A.
+
+```text
+A bắt đầu -> invalidate(key) -> B tạo entry mới
+     └── A kết thúc: chỉ dọn nếu Map vẫn trỏ entry A
+                               └── Map đang trỏ B: không xóa
+```
+
+Nếu màn hình chỉ được phép hiển thị request mới nhất, hãy dùng `switchMap` trên trigger của màn hình. Nếu cần hủy mọi reader cũ trên toàn service, bạn phải thiết kế cancellation theo key, đồng thời công bố rõ subscription cũ sẽ complete hay error. `invalidate()` và `clear()` ở ví dụ không có tác dụng cancellation.
+
+Một giới hạn khác: eviction hoặc invalidation không thể thu hồi reference mà consumer đã giữ. Cache Map rỗng không đồng nghĩa các object cũ đã được garbage collect.
+
+## Refresh một stream đang được UI theo dõi
+
+### Giữ trigger và bắt lỗi trong inner
+
+Xóa entry chỉ ảnh hưởng lần đọc sau. Nhưng UI thường subscribe một lần rồi chờ các lần cập nhật tiếp theo. Trong trường hợp đó, mình tách snapshot cache khỏi luồng refresh để không nhầm “bỏ cache” với “UI đã nhận dữ liệu mới”.
+
+Ví dụ này chủ động giữ value cũ trong replay buffer trong lúc refresh; loader bên trong không có cache để mỗi trigger thật sự tải lại:
+
+```ts
+import {
+  catchError,
+  defer,
+  EMPTY,
+  shareReplay,
+  startWith,
+  Subject,
+  switchMap,
+  timeout,
+} from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+// Các field này thuộc service của một phiên đăng nhập.
+const refreshProfile = new Subject<void>();
+const profileErrors = new Subject<unknown>();
+const profileErrors$ = profileErrors.asObservable();
+
+const liveProfile$ = refreshProfile.pipe(
+  startWith(undefined),
+  switchMap(() =>
+    defer(() => ajax.getJSON<Profile>('/api/me')).pipe(
+      timeout({ first: 10_000 }),
+      catchError((error) => {
+        profileErrors.next(error);
+        return EMPTY; // Không giết trigger bên ngoài.
+      }),
+    ),
+  ),
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+// Theo dõi error trước khi subscribe stream có thể khởi động loader.
+const errorSub = profileErrors$.subscribe(console.error);
+const viewSub = liveProfile$.subscribe(console.log);
+
+refreshProfile.next(); // Trigger mới thay request cũ bằng request mới.
+
+// Khi view rời đi:
+// viewSub.unsubscribe();
+// errorSub.unsubscribe();
+```
+
+Đặt sharing sau `switchMap` để nhiều consumer không mở nhiều request cho cùng trigger. Đặt `catchError` trong inner để lỗi một request không kết thúc luôn luồng refresh. Request bị thay bởi `switchMap` sẽ unsubscribe; response muộn không đi vào output của luồng này, dù adapter hoặc server có thể vẫn tiếp tục công việc.
+
+Trong lúc có consumer, subscriber đến muộn nhận profile cũ ngay, rồi nhận profile mới nếu request thành công. Nếu refresh lỗi, profile cũ vẫn là value cuối. `profileErrors$` chỉ là event channel, không replay lỗi cho subscriber đến sau và không mô tả đầy đủ trạng thái loading.
+
+<Callout type="info" title="Refresh khi không có ai nghe">
+  Với `refCount: true`, luồng bên ngoài chưa complete nhưng không còn consumer thì upstream ngắt và buffer reset. `Subject` không giữ trigger phát trong khoảng này; lần subscribe sau có request mới nhờ `startWith`. Ví dụ không tự tải nền khi UI đóng. Nếu cần refresh bền qua khoảng không có consumer, hãy lưu một version trong state hoặc xây lifecycle riêng, đừng chỉ thay `Subject` rồi bỏ qua scope.
+</Callout>
+
+### Stale while revalidate cần state riêng
+
+Replay profile cũ trong khi refresh là một phần của stale-while-revalidate, nhưng UI còn cần biết value đó đang stale và request mới có lỗi không. Mô hình data-only ở trên không trả lời được các câu hỏi này.
+
+Một state rõ ràng có thể là:
+
+```ts
+type ResourceState<T> = {
+  data: T | undefined;
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  stale: boolean;
+  updatedAt: number | undefined;
+  error: unknown | undefined;
+};
+```
+
+Khi refresh bắt đầu, giữ `data`, đổi `status` thành `loading` và `stale` thành `true`. Thành công thay data và cập nhật timestamp; lỗi giữ data nhưng ghi error và vẫn đánh dấu stale. UI có thể hiển thị “đang cập nhật” hoặc cảnh báo “đang dùng dữ liệu cũ” thay vì âm thầm coi cache là mới.
+
+Nếu không được phép hiển thị snapshot cũ, hãy xóa `data` ngay khi invalidation và chờ response mới. Với thông tin quyền truy cập hoặc đổi tài khoản, đây thường là lựa chọn an toàn hơn. Đừng gọi TTL refetch hay refresh trigger là stale-while-revalidate nếu bạn chưa định nghĩa các chuyển trạng thái này.
+
+## Tránh cache sai dữ liệu trong production
+
+| Rủi ro | Cách xử lý cụ thể |
+| --- | --- |
+| Key thiếu tenant, user, locale hoặc filter | Chuẩn hóa key theo mọi input ảnh hưởng response; đổi scope thì tạo service mới |
+| Key object dùng reference identity | Ưu tiên string/tuple được serialize ổn định; hai object cùng nội dung không tự là cùng key trong Map |
+| Module singleton trên SSR | Tạo cache theo request/user scope; không giữ response cá nhân trong singleton dùng chung |
+| Logout nhưng request cũ vẫn chạy | Hủy subscription gắn session và bỏ instance; `clear()` một mình không hủy reader cũ |
+| UI sửa object nhận từ replay | Dùng cập nhật immutable; `Readonly` chỉ kiểm tra TypeScript, không deep-freeze runtime |
+| Response out of order | Identity guard bảo vệ registry; `switchMap` hoặc version guard bảo vệ output UI |
+| Cache chỉ detail nhưng mutation đổi list | Invalidate các query liên quan; nếu có nhiều quan hệ, cân nhắc cache có tags |
+| Dồn nhiều request vào lúc hết hạn | Deduplicate trong một instance; cân nhắc TTL jitter/backoff, HTTP cache hoặc cache server cho nhiều instance |
+| Retry ở mỗi consumer | Nếu cần retry chung, đặt retry giới hạn trước sharing, phân loại lỗi và chỉ retry thao tác phù hợp |
+| Error/fallback bị xem là data thật | Tách error state; không cache fallback như response thành công ngoài ý muốn |
+
+Deduplication ở đây chỉ có hiệu lực trong **cùng một cache instance**. Hai tab, hai worker hoặc hai server process vẫn có thể tải cùng key. Và TTL ở client không thay thế `ETag`, `Cache-Control` hay một tầng cache server; chúng giải quyết các scope khác nhau.
+
+Khi instrument, đo hit, miss, số entry, số request đang chạy, eviction, error và tuổi snapshot lúc hiển thị. Đặt log request trước sharing nếu muốn đếm execution upstream; log sau sharing thường đếm delivery cho consumer, có thể làm bạn tưởng số request tăng theo số component. Không log token, thông tin cá nhân hoặc raw cache key nhạy cảm.
+
+## Kiểm thử các đường lifecycle
+
+### Replay và refetch sau TTL
+
+Test sau dùng `cacheFor` đã định nghĩa ở trên, truyền `TestScheduler` cho timer. Đặt helper và test trong cùng module, hoặc export/import helper ở ứng dụng của bạn; không cần chờ timer thật.
+
+```ts
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  // Thay bằng expect(actual).toEqual(expected) nếu dùng Jest/Vitest.
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Marble assertion failed');
+  }
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('--a|', { a: { theme: 'dark' } });
+  const cached$ = cacheFor(() => source, 5, scheduler);
+
+  expectObservable(cached$).toBe('--a|', { a: { theme: 'dark' } });
+  expectObservable(cached$, '-----^').toBe(
+    '-----(a|)',
+    { a: { theme: 'dark' } },
+  );
+  expectObservable(cached$, '---------^').toBe(
+    '-----------a|',
+    { a: { theme: 'dark' } },
+  );
+
+  expectSubscriptions(source.subscriptions).toBe([
+    '^--!',
+    '---------^--!',
+  ]);
+});
+```
+
+Kiểm tra cả output **và** `source.subscriptions`: ba reader đúng data vẫn chưa chứng minh chỉ có hai request. Test này cũng là nguồn kiểm chứng cho timeline TTL ở trên. Timer reset thứ hai có thể tiếp tục tới frame 17, nhưng không tạo thêm subscription nguồn.
+
+### Invalidation khi request cũ còn chạy
+
+Test này dùng `KeyedCache` đã định nghĩa, với clock `scheduler.now()`. Request A sẽ lỗi muộn, còn B được tạo sau invalidation và thành công trước A. Reader C phải đọc buffer của B, không mở request thứ ba do cleanup của A xóa nhầm entry.
+
+```ts
+const raceScheduler = new TestScheduler((actual, expected) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Race assertion failed');
+  }
+});
+
+raceScheduler.run(({ cold, expectObservable, expectSubscriptions, flush }) => {
+  const oldRequest = cold('----#', {}, 'old request failed');
+  const newRequest = cold('-b|', { b: 'new value' });
+  let loads = 0;
+
+  const cache = new KeyedCache<string, string>(
+    () => (++loads === 1 ? oldRequest : newRequest),
+    100,
+    2,
+    () => raceScheduler.now(),
+  );
+  const handle$ = cache.get('product-42');
+
+  raceScheduler.schedule(() => cache.invalidate('product-42'), 1);
+
+  expectObservable(handle$).toBe('----#', {}, 'old request failed');
+  expectObservable(handle$, '--^').toBe('---b|', { b: 'new value' });
+  expectObservable(handle$, '------^').toBe('------(b|)', { b: 'new value' });
+
+  expectSubscriptions(oldRequest.subscriptions).toBe('^---!');
+  expectSubscriptions(newRequest.subscriptions).toBe('--^-!');
+
+  flush();
+  if (loads !== 2) throw new Error('Old cleanup evicted the new entry');
+});
+```
+
+A bắt đầu ở frame 0; invalidation xảy ra ở frame 1. B subscribe cùng handle ở frame 2 nhưng tra entry mới, nhận `b` ở frame 3 và complete ở frame 4. C đến frame 6 vẫn nhận `b` đồng bộ. Test không mong A tự biến thành B: A nhận error của request mà nó đã bắt đầu.
+
+### Consumer chỉ lấy một value
+
+Đây là test cho policy đã chọn, không phải một lỗi cần che đi: cache theo key bỏ entry nếu consumer cuối rời trước complete. Test dùng `take(1)` để reader A complete ngay tại response đầu; reader B đến sau phải mở request mới dù TTL còn dài.
+
+```ts
+import { take } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const oneValueScheduler = new TestScheduler((actual, expected) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Single-value consumer assertion failed');
+  }
+});
+
+oneValueScheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('--a|', { a: 'snapshot' });
+  const cache = new KeyedCache<string, string>(
+    () => source,
+    100,
+    2,
+    () => oneValueScheduler.now(),
+  );
+  const handle$ = cache.get('profile');
+
+  expectObservable(handle$.pipe(take(1))).toBe('--(a|)', { a: 'snapshot' });
+  expectObservable(handle$, '-----^').toBe('-------a|', { a: 'snapshot' });
+
+  expectSubscriptions(source.subscriptions).toBe([
+    '^-!', // A rời ngay ở frame 2, trước source complete ở frame 3.
+    '-----^--!',
+  ]);
+});
+```
+
+Nếu ứng dụng chủ yếu đọc bằng `firstValueFrom`, hãy quyết định có chấp nhận refetch như test này không. Nếu muốn giữ request đến complete, đổi policy lifecycle có chủ đích và kiểm thử lại timeout, cancellation và cleanup; chỉ thay `refCount: false` trong class trên chưa đủ, vì entry cũng có policy xóa riêng.
+
+### Ma trận kiểm thử bổ sung
+
+| Trường hợp | Điều cần assert |
+| --- | --- |
+| Hai reader đồng thời, cùng key | Một subscription upstream, cùng response |
+| Hai key khác nhau | Hai execution độc lập, không tráo payload |
+| Request lỗi rồi đọc lại | Lần đọc mới gọi loader lại, không replay error cũ |
+| Consumer cuối rời trước response | Teardown upstream, Map không giữ entry đang chờ |
+| Consumer dùng `take(1)` | Xác nhận có chấp nhận refetch do chưa quan sát complete |
+| Đọc đúng lúc `expiresAt` | Keyed cache hết hạn khi `now() >= expiresAt`; kiểm soát thứ tự event tại ranh giới |
+| TTL hết khi không có reader | Lần đọc sau refetch; không tự tạo request nền |
+| Source complete không value | Entry bị bỏ, lần đọc sau không kẹt ở complete rỗng |
+| Capacity đầy với entry hoàn tất | Evict entry LRU, key vừa được touch không bị chọn trước |
+| Capacity đầy với toàn entry đang chạy | Reader mới nhận error capacity, không mở loader mới |
+| Mutation thành công hoặc lỗi | Thành công invalidate; lỗi không xóa cache nếu policy không yêu cầu |
+| Đổi session trong lúc request đang chạy | Reader session cũ được teardown; cache mới không nhận payload user cũ |
+| Refresh lỗi rồi trigger lại | Outer stream còn sống, request sau vẫn chạy |
+
+Với TTL dùng `timer`, đọc đúng frame timer reset là tình huống phụ thuộc thứ tự task trong scheduler. Đừng dựa vào một callback millisecond để làm ranh giới bảo mật; nếu cần điều kiện hết hạn chính xác tại lookup, lưu `expiresAt` và so sánh như cache theo key.
+
+## Checklist đưa cache vào ứng dụng
+
+- [ ] Loader hữu hạn và teardown/timeout đã được kiểm chứng.
+- [ ] Cùng key thực sự trỏ cùng cache instance trong scope đã chọn.
+- [ ] Key chứa đủ identity và input ảnh hưởng response, không lộ dữ liệu qua SSR.
+- [ ] TTL có mốc bắt đầu rõ: response, complete hay lần truy cập.
+- [ ] Invalidation sau mutation bao gồm detail và query liên quan.
+- [ ] UI biết khi nào đang hiển thị stale data, hoặc đã chọn không hiển thị nó.
+- [ ] Race giữa request cũ và entry mới có identity/version guard.
+- [ ] Error không bị cache thành data giả; refresh sau lỗi vẫn hoạt động.
+- [ ] Có giới hạn entry, policy capacity và theo dõi payload lớn.
+- [ ] Test có assert subscription upstream, teardown và cách consumer thực tế dùng `take(1)`.
+
+Bắt đầu với một tài nguyên trong ứng dụng: ghi lại key, scope, TTL, sự kiện invalidation và cách UI nhận refresh. Sau đó viết test hai reader cùng key và mutation lúc request cũ còn chạy. Nếu hai test này chưa rõ kết quả mong đợi, khoan nhân rộng cache sang các endpoint khác.
+
+## Nguồn tham khảo
+
+- [RxJS shareReplay](https://rxjs.dev/api/operators/shareReplay) — API replay và ref count.
+- [Implementation shareReplay 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — `resetOnError: true`, `resetOnComplete: false` và policy ref count.
+- [Implementation share 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/share.ts) — reset bằng notifier, reset khi không còn subscriber và xử lý terminal state.
+- [RxJS TestScheduler](https://rxjs.dev/api/testing/TestScheduler) — kiểm chứng notification và subscription bằng virtual time.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Operator shareReplay" href="/docs/subjects-multicasting/share-replay" description="Đọc sâu về buffer, ref count và vị trí operator." />
+  <Card title="State management" href="/docs/patterns-production/state-management" description="Tách snapshot dữ liệu khỏi loading, stale và error state." />
+  <Card title="Request orchestration" href="/docs/patterns-production/request-orchestration" description="Phối hợp mutation, invalidation và request phụ thuộc." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Kiểm thử lifecycle bằng virtual time thay vì timer thật." />
+</Cards>

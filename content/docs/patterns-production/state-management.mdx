@@ -3,8 +3,747 @@ title: State management
 description: Xây dựng state stream có nguồn sự thật rõ ràng.
 ---
 
-Trang này sẽ trình bày **State management** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn có một màn hình danh sách: ô tìm kiếm giữ query, request giữ kết quả, còn vài component con tự giữ `loading`. Khi request cũ trả về sau request mới, mỗi nơi có thể kể một câu chuyện khác nhau về cùng màn hình. RxJS giúp phối hợp các thay đổi đó, nhưng **một Observable không tự biến thành một store có nguồn sự thật rõ ràng**.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Bài này xây dựng một feature store nhỏ cho danh sách sản phẩm. Mình chọn `BehaviorSubject` làm nơi giữ state, reducer làm nơi quyết định thay đổi và effect làm nơi gọi API. Mục tiêu không phải dựng lại một thư viện state management, mà là biết giới hạn nào cần giữ trước khi đưa pattern này vào production.
+
+<Callout type="info" title="Phạm vi và điều kiện đọc">
+  Các ví dụ dùng API **RxJS 7.8.2** và TypeScript, không phụ thuộc Angular hay React. Bạn nên biết `BehaviorSubject`, `map`, `distinctUntilChanged`, `switchMap` và subscription teardown. Các tên file trong code là cách tổ chức ví dụ cho ứng dụng của bạn, không phải file mới của site này. Query trong ví dụ lọc dữ liệu tại client; chỉ command `reload` mới gọi API.
 </Callout>
+
+## Mục lục
+
+- [Chọn đúng loại state](#chọn-đúng-loại-state)
+- [Nguồn sự thật và luồng cập nhật](#nguồn-sự-thật-và-luồng-cập-nhật)
+- [Mô hình state và reducer](#mô-hình-state-và-reducer)
+  - [State có nghĩa ngay từ đầu](#state-có-nghĩa-ngay-từ-đầu)
+  - [Reducer thuần và cập nhật bất biến](#reducer-thuần-và-cập-nhật-bất-biến)
+- [Store và selector chỉ đọc](#store-và-selector-chỉ-đọc)
+  - [Giữ quyền ghi trong store](#giữ-quyền-ghi-trong-store)
+  - [Selector và snapshot nhất quán](#selector-và-snapshot-nhất-quán)
+- [Đọc timeline cập nhật state](#đọc-timeline-cập-nhật-state)
+- [Effect tải dữ liệu và xử lý lỗi](#effect-tải-dữ-liệu-và-xử-lý-lỗi)
+  - [Một effect cho một feature instance](#một-effect-cho-một-feature-instance)
+  - [Chọn policy concurrency theo command](#chọn-policy-concurrency-theo-command)
+- [Vì sao scan và shareReplay chưa đủ](#vì-sao-scan-và-sharereplay-chưa-đủ)
+- [Lifecycle và các bẫy production](#lifecycle-và-các-bẫy-production)
+  - [Scope của store và teardown](#scope-của-store-và-teardown)
+  - [Mutation và cập nhật lồng nhau](#mutation-và-cập-nhật-lồng-nhau)
+  - [Persistence và optimistic update](#persistence-và-optimistic-update)
+- [Kiểm chứng reducer và stream](#kiểm-chứng-reducer-và-stream)
+  - [Test reducer và structural sharing](#test-reducer-và-structural-sharing)
+  - [Test timeline và subscriber đến muộn](#test-timeline-và-subscriber-đến-muộn)
+  - [Test effect trước khi nối UI](#test-effect-trước-khi-nối-ui)
+  - [Test teardown và contract của API](#test-teardown-và-contract-của-api)
+- [Checklist áp dụng](#checklist-áp-dụng)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Chọn đúng loại state
+
+Trước khi viết store, hỏi dữ liệu đó thuộc về ai. Một checkbox chỉ dùng trong một component thường không cần RxJS store. Ngược lại, query được nhiều component đọc và danh sách nhận cập nhật từ API có thể cần một nơi điều phối chung.
+
+| Loại dữ liệu | Ví dụ | Mặc định mình chọn |
+|---|---|---|
+| Local UI state | Mở dialog, focus, giá trị input chưa submit | State của component hoặc primitive của framework |
+| Feature state | Bộ lọc và kết quả của một màn hình | Store theo feature nếu có nhiều nguồn cập nhật hoặc consumer |
+| Shared client state | Cấu hình giao diện, lựa chọn workspace | Store có scope rõ ràng; reset khi đổi user/workspace |
+| Server state | Danh sách sản phẩm, quyền do server cấp | Cache/query layer nếu cần invalidation, deduplication, retry phức tạp |
+| Derived state | Sản phẩm đang hiển thị, tổng số kết quả | Selector, không giữ bản sao trong store |
+| Event hoặc command | Bấm reload, yêu cầu lưu | Event stream hoặc method; không replay command cũ |
+
+`BehaviorSubject` là bảng trạng thái hiện tại: người đến sau nhìn được trạng thái mới nhất. Nhưng bảng đó không phải sổ lịch sử, không lưu qua reload và không thay server làm nguồn quyết định cuối cùng cho dữ liệu nghiệp vụ.
+
+Mình dùng store RxJS nhỏ khi feature đã có nhiều stream cần phối hợp và team hiểu subscription lifecycle. Nếu bạn cần entity normalization, devtools, action history, query cache hoặc optimistic mutation trên nhiều màn hình, một thư viện chuyên dụng thường giảm code tự bảo trì. Đừng chọn RxJS chỉ vì muốn tránh một dependency rồi tự viết lại tất cả những phần đó.
+
+## Nguồn sự thật và luồng cập nhật
+
+Với feature này, chỉ `ProductsStore` giữ snapshot. UI đọc selector và gửi command; effect trả kết quả về dưới dạng action. Reducer không gọi API và selector không cập nhật state.
+
+```text
+UI command ──► feature API ──► effect gọi API ──► result action
+                    │                                │
+                    └──► action đồng bộ              │
+                                  │                  │
+                                  ▼                  ▼
+                              reducer ◄── state hiện tại
+                                  │
+                                  ▼
+                         BehaviorSubject<State>
+                                  │
+                                  ▼
+                         selector / view model ──► UI
+```
+
+Ba trách nhiệm này tách nhau vì chúng có lifecycle khác nhau. Reducer chạy đồng bộ và có thể test bằng input/output. Effect có cancellation, lỗi và subscription. Selector chỉ mô tả cách nhìn state, nên thêm một subscriber không được tạo thêm request.
+
+Trong ví dụ, dữ liệu API được giữ trong feature state để minh họa luồng đầy đủ. Đây chưa phải một cache dùng chung cho nhiều route: không có TTL, invalidation theo entity hay deduplication giữa các instance.
+
+## Mô hình state và reducer
+
+### State có nghĩa ngay từ đầu
+
+Một `items: []` không nói được “chưa tải” hay “đã tải nhưng rỗng”. Dùng `status` để phân biệt hai trường hợp, đồng thời giữ dữ liệu cũ trong lúc reload. UI có thể tiếp tục hiển thị danh sách kèm chỉ báo đang refresh.
+
+```ts title="products-state.ts"
+export type Product = Readonly<{
+  id: string;
+  name: string;
+}>;
+
+export type ProductsState = Readonly<{
+  items: readonly Product[];
+  query: string;
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  error: string | null;
+}>;
+
+export type ProductsAction =
+  | { type: 'queryChanged'; query: string }
+  | { type: 'loadStarted' }
+  | { type: 'loadSucceeded'; items: readonly Product[] }
+  | { type: 'loadFailed'; message: string };
+
+export function createInitialState(): ProductsState {
+  return {
+    items: [],
+    query: '',
+    status: 'idle',
+    error: null,
+  };
+}
+
+// Seed cho ví dụ reducer và scan; store dùng factory cho mỗi instance.
+export const initialState = createInitialState();
+
+export function productsReducer(
+  state: ProductsState,
+  action: ProductsAction,
+): ProductsState {
+  switch (action.type) {
+    case 'queryChanged':
+      return action.query === state.query
+        ? state
+        : { ...state, query: action.query };
+
+    case 'loadStarted':
+      return state.status === 'loading' && state.error === null
+        ? state
+        : { ...state, status: 'loading', error: null };
+
+    case 'loadSucceeded':
+      return {
+        ...state,
+        // Tách reference khỏi array và object do API caller giữ.
+        items: action.items.map((item) => ({ ...item })),
+        status: 'ready',
+        error: null,
+      };
+
+    case 'loadFailed':
+      return { ...state, status: 'error', error: action.message };
+  }
+}
+```
+
+Ở đây `status: 'error'` đi cùng dữ liệu cũ là chủ ý: reload lỗi không xóa một danh sách vẫn có ích. Nếu domain không cho phép hiển thị dữ liệu cũ, reducer phải xóa `items` và UI phải phản ánh policy đó. Nếu số trạng thái và các ràng buộc tăng lên, cân nhắc discriminated union để loại bỏ tổ hợp không hợp lệ ngay ở type level.
+
+Không có `visibleItems` hoặc `total` trong state. Danh sách hiển thị suy ra từ `items` và `query`; tổng số sản phẩm suy ra từ `items`. Giữ thêm bản sao sẽ buộc bạn cập nhật nhiều chỗ cho một thay đổi.
+
+Factory `createInitialState()` cấp object và array mới cho từng instance. Dùng chung một seed object vẫn hoạt động nếu mọi consumer tuân thủ bất biến, nhưng một mutation ngoài ý muốn có thể làm bẩn cả instance khác. Tách seed giảm rủi ro đó; nó không thay thế quy tắc không mutate snapshot.
+
+### Reducer thuần và cập nhật bất biến
+
+Reducer chỉ nhận state cũ và action rồi trả state mới. Không gọi `subscribe`, ghi storage, đọc đồng hồ hay tạo request ở đây; nếu kết quả phụ thuộc thời gian, đưa timestamp vào action để test vẫn tái lập được.
+
+Khi query không đổi, reducer trả đúng object cũ. Khi query đổi, object state mới vẫn giữ reference của `items`. Đây là **structural sharing**: chỉ thay nhánh có thay đổi để selector dựa vào reference biết phần nào cần phát lại.
+
+<Callout type="warn" title="Readonly không phải runtime protection">
+  TypeScript `readonly` không freeze object trong JavaScript. `asObservable()` cũng chỉ giấu quyền `next`, không giấu quyền mutate object đã nhận. Ví dụ chỉ copy nông sản phẩm vì `Product` có hai field primitive; với dữ liệu lồng nhau, bạn phải quản lý reference của từng nhánh và có thể thêm freeze trong môi trường phát triển.
+</Callout>
+
+## Store và selector chỉ đọc
+
+### Giữ quyền ghi trong store
+
+Store dưới đây gọi reducer ngay trong `dispatch`. Nó tồn tại độc lập với số subscriber của UI: bỏ hết subscription không làm state trở về `initialState`, và dispatch khi chưa có UI vẫn cập nhật snapshot.
+
+```ts title="products-store.ts"
+import {
+  BehaviorSubject,
+  distinctUntilChanged,
+  map,
+  shareReplay,
+} from 'rxjs';
+import {
+  createInitialState,
+  productsReducer,
+  type ProductsAction,
+  type ProductsState,
+} from './products-state';
+
+export class ProductsStore {
+  private readonly subject = new BehaviorSubject<ProductsState>(createInitialState());
+  private disposed = false;
+
+  readonly state$ = this.subject.asObservable();
+
+  readonly query$ = this.state$.pipe(
+    map((state) => state.query),
+    distinctUntilChanged(),
+  );
+
+  readonly items$ = this.state$.pipe(
+    map((state) => state.items),
+    distinctUntilChanged(),
+  );
+
+  readonly visibleItems$ = this.state$.pipe(
+    map(({ items, query }) => ({ items, query })),
+    distinctUntilChanged(
+      (previous, current) =>
+        previous.items === current.items && previous.query === current.query,
+    ),
+    map(({ items, query }) => {
+      const term = query.trim().toLocaleLowerCase('vi');
+      return items.filter((item) =>
+        item.name.toLocaleLowerCase('vi').includes(term),
+      );
+    }),
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+
+  // Các field của một view model đều đến từ cùng một snapshot.
+  readonly vm$ = this.state$.pipe(
+    map((state) => ({
+      query: state.query,
+      status: state.status,
+      error: state.error,
+      total: state.items.length,
+    })),
+  );
+
+  dispatch(action: ProductsAction): void {
+    if (this.disposed) throw new Error('ProductsStore đã bị dispose');
+    const previous = this.subject.getValue();
+    const next = productsReducer(previous, action);
+    if (next !== previous) this.subject.next(next);
+  }
+
+  destroy(): void {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.subject.complete();
+  }
+}
+```
+
+`dispatch` là API nội bộ cho lớp feature và effect, không phải lý do để mọi component tự bịa result action. Ở phần tiếp theo, facade chỉ công khai `setQuery` và `reload`; UI không được tự tuyên bố request thành công.
+
+Seed được phát ngay khi subscribe, không cần thêm `startWith`. Mỗi command đồng bộ nhìn snapshot mới nhất tại lúc gọi `dispatch`, nhưng đây không phải cơ chế locking hay transaction cho nhiều process.
+
+### Selector và snapshot nhất quán
+
+`distinctUntilChanged()` mặc định so sánh bằng `===`. Vì reducer giữ nguyên reference của `items` khi query hoặc status đổi, `items$` không phát lại trong các trường hợp đó. Selector `visibleItems$` cần cả query lẫn items, nên so sánh cặp dependency **trước** khi chạy `filter`.
+
+Nếu đặt `map(state => state.items.filter(...))` rồi mới gọi `distinctUntilChanged()` mặc định, mỗi lần filter tạo array mới; dù nội dung giống nhau, selector vẫn phát. Comparator có thể sửa việc phát thừa nhưng không lấy lại chi phí tính toán đã chạy. Chọn dependency trước là điểm khởi đầu tốt hơn deep-compare toàn bộ state.
+
+`shareReplay` ở `visibleItems$` chỉ chia sẻ phép tính và kết quả selector giữa các consumer đang nghe. Khi không còn ai nghe, nó có thể bỏ kết nối và cache; lần subscribe mới vẫn tính được từ snapshot của `BehaviorSubject`. Nguồn sự thật không nằm trong cache selector nên không bị mất.
+
+Có cần `combineLatest([items$, query$, status$])` để tạo view model không? Nếu các selector xuất phát từ cùng một state stream đồng bộ, `combineLatest` có thể phát một tổ hợp trung gian: selector đầu đã cập nhật, selector còn lại chưa nhận cùng notification. Khi các field cần nhất quán, mình ưu tiên một `map` từ `state$`, như `vm$` ở trên; nếu UI cần cả danh sách đã lọc trong cùng snapshot, tính nó ngay trong phép map đó.
+
+`combineLatest` vẫn phù hợp để phối hợp những nguồn độc lập, chẳng hạn state của feature và cấu hình locale. Nó không tự tạo tính nguyên tử cho các selector chung nguồn.
+
+## Đọc timeline cập nhật state
+
+Đọc theo cột dọc để thấy action nào thật sự tạo snapshot mới. Các hàng dưới đây mô tả một store chưa dispose; dấu gạch phía cuối không có nghĩa stream complete.
+
+<MarbleDiagram
+  title="reducer → state → selector"
+  rows={[
+    { label: 'action', marble: '-a--b--c--d---', kind: 'source' },
+    { label: 'state', marble: 'sA--B-----C---', kind: 'output' },
+    { label: 'query', marble: 'q---r--------', kind: 'output' },
+  ]}
+  values={{
+    a: 'loadStarted',
+    b: 'queryChanged: rx',
+    c: 'queryChanged: rx lần nữa',
+    d: 'loadSucceeded',
+    s: 'initialState',
+    A: 'status loading, query rỗng',
+    B: 'status loading, query rx',
+    C: 'status ready, query rx, items mới',
+    q: 'query rỗng',
+    r: 'query rx',
+  }}
+  caption="Action c ở frame 7 là no-op nên state không phát; query cũng không phát khi request thành công ở frame 10."
+/>
+
+State và query đều phát seed ở frame 0. `loadStarted` tại frame 1 tạo state `A` nhưng không đổi query. Tại frame 4, query đổi thành `rx`, nên state phát `B` và query phát `r`.
+
+Frame 7 không có emission state vì reducer trả object cũ. Ở frame 10, kết quả API tạo `C`; query vẫn là `rx` nên selector không phát thêm. Có hai tầng chặn thay đổi thừa: store bỏ no-op toàn bộ snapshot và selector bỏ thay đổi không liên quan đến field của nó.
+
+## Effect tải dữ liệu và xử lý lỗi
+
+### Một effect cho một feature instance
+
+Effect nhận command reload, gọi API rồi dispatch success hoặc failure. Hàm `loadProducts` dưới đây có contract: trả Observable phát đúng một danh sách rồi complete, hoặc error; unsubscribe phải giải phóng tài nguyên mà API adapter có thể hủy. Response HTTP cần được validate ở adapter trước khi trở thành `Product[]`.
+
+```ts title="products-feature.ts"
+import {
+  Subject,
+  catchError,
+  defer,
+  map,
+  of,
+  switchMap,
+  throwIfEmpty,
+  type Observable,
+} from 'rxjs';
+import { ProductsStore } from './products-store';
+import type { Product, ProductsAction } from './products-state';
+
+export function createProductsFeature(
+  loadProducts: () => Observable<readonly Product[]>,
+) {
+  const store = new ProductsStore();
+  const reloads = new Subject<void>();
+  let disposed = false;
+
+  const effect = reloads.pipe(
+    switchMap(() =>
+      defer(() => {
+        store.dispatch({ type: 'loadStarted' });
+        return loadProducts();
+      }).pipe(
+        map((items): ProductsAction => ({ type: 'loadSucceeded', items })),
+        throwIfEmpty(() => new Error('API kết thúc mà không phát danh sách')),
+        catchError((error: unknown) =>
+          of<ProductsAction>({
+            type: 'loadFailed',
+            message: error instanceof Error ? error.message : 'Không tải được dữ liệu',
+          }),
+        ),
+      ),
+    ),
+  ).subscribe((action) => store.dispatch(action));
+
+  function assertActive(): void {
+    if (disposed) throw new Error('Products feature đã bị dispose');
+  }
+
+  return {
+    state$: store.state$,
+    query$: store.query$,
+    items$: store.items$,
+    visibleItems$: store.visibleItems$,
+    vm$: store.vm$,
+    setQuery(query: string): void {
+      assertActive();
+      store.dispatch({ type: 'queryChanged', query });
+    },
+    reload(): void {
+      assertActive();
+      reloads.next();
+    },
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      // Hủy active inner trước khi kết thúc store.
+      effect.unsubscribe();
+      reloads.complete();
+      store.destroy();
+    },
+  };
+}
+```
+
+`defer` làm hai việc: khởi chạy công việc tại thời điểm subscribe inner và đưa lỗi đồng bộ từ `loadProducts()` vào error channel để `catchError` xử lý. `catchError` nằm **bên trong** `switchMap`, nên lỗi một request trở thành action failure mà không kết thúc stream reload. Nếu đặt catch ở ngoài rồi trả `of(...)`, toàn effect thường complete sau fallback đó; lần reload sau không còn được xử lý.
+
+`throwIfEmpty` chuyển trường hợp API complete mà không phát thành failure. Đừng nhầm `EMPTY` với `of([])`: trường hợp đầu không có response, trường hợp sau là response hợp lệ cho danh sách rỗng. Nếu API không bao giờ phát và cũng không complete, operator này không giúp được; đặt timeout ở adapter theo yêu cầu của ứng dụng.
+
+Không gọi `subject.error(error)` khi API lỗi. Subject đã error không thể nhận các state phục hồi tiếp theo; UI cần một state lỗi có thể chuyển lại sang loading hoặc ready. Đây là khác biệt giữa **lỗi nghiệp vụ được biểu diễn trong state** và lỗi lập trình trong reducer/effect, vốn cần được báo và sửa thay vì che đi bằng message “không tải được”.
+
+Ví dụ giữ `error.message` để dễ quan sát khi học. Trong ứng dụng thật, map lỗi transport sang thông báo an toàn cho UI; raw error có thể chứa URL hoặc chi tiết nội bộ. Gửi thông tin chẩn đoán vào logger/telemetry với policy che dữ liệu nhạy cảm, không đưa toàn bộ raw error vào state để component tự render.
+
+Feature bắt đầu ở `idle`, không tự gọi API khi UI subscribe. Ví dụ sử dụng dưới đây có dữ liệu giả để bạn thấy thứ tự phát; adapter production có thể dùng RxJS `ajax` hoặc Observable bọc fetch với `AbortController`.
+
+```ts
+import { of } from 'rxjs';
+import { createProductsFeature } from './products-feature';
+
+const feature = createProductsFeature(() =>
+  of([{ id: 'p1', name: 'RxJS handbook' }]),
+);
+const view = feature.vm$.subscribe((vm) => console.log(vm.status, vm.total));
+
+feature.setQuery('rx');
+feature.reload();
+// idle 0      — seed
+// idle 0      — query đổi, vm$ hiện phát theo mỗi snapshot
+// loading 0  — request bắt đầu
+// ready 1    — dữ liệu trả về đồng bộ trong ví dụ này
+
+view.unsubscribe(); // Chỉ bỏ consumer, feature vẫn giữ state và effect.
+feature.dispose(); // Owner kết thúc feature và hủy effect.
+```
+
+<Callout type="warn" title="Complete command stream chưa chắc hủy request">
+  Với `switchMap`, outer complete vẫn chờ active inner kết thúc. Vì vậy `reloads.complete()` một mình không đủ để hủy request đang chạy. Ví dụ unsubscribe toàn effect trước; nếu dùng `takeUntil(destroy$)`, đặt nó sau flattening operator để hủy cả inner. Không dựa vào việc component cuối unsubscribe để kết thúc effect: feature owner mới quyết định thời điểm dispose.
+</Callout>
+
+### Chọn policy concurrency theo command
+
+`switchMap` phù hợp cho reload màn hình này: kết quả của lần reload mới nhất thay thế lần trước. Khi reload B đến lúc A đang chạy, subscription của A bị hủy; response của A không đi tiếp qua inner subscriber đã đóng.
+
+Nhưng hủy subscription không đảm bảo server ngừng xử lý, và `from(fetch(...))` không tự abort fetch Promise. Adapter cần teardown thích hợp; với command ghi dữ liệu, còn phải cân nhắc idempotency và kết quả phía server.
+
+| Command | Policy khởi đầu | Cần quyết định thêm |
+|---|---|---|
+| Reload hoặc tìm kiếm theo query mới nhất | `switchMap` | Adapter có hủy transport không; giữ hay xóa dữ liệu cũ |
+| Lưu các thay đổi theo thứ tự | `concatMap` | Queue có thể tăng; có cần gộp thay đổi hoặc giới hạn không |
+| Bỏ click submit khi đang submit | `exhaustMap` | UI phải cho người dùng biết click đã bị bỏ qua |
+| Các tác vụ độc lập | `mergeMap` với concurrency phù hợp | Response có thể đảo thứ tự; state phải gắn kết quả đúng entity/request |
+
+Đừng dùng `finalize(() => setLoading(false))` một cách máy móc. `finalize` chạy cả khi hủy request: nếu bạn bật loading cho B trước khi A bị hủy, finalize của A có thể tắt loading của B. Ví dụ tránh race này bằng action started/succeeded/failed và đặt started trong inner mới, sau teardown inner cũ.
+
+Nếu đổi sang nhiều request song song, một field `status` chung không còn đủ. Gắn `requestId` hoặc version vào action; reducer chỉ nhận kết quả khớp request đang có hiệu lực, hoặc giữ trạng thái theo entity. Với `mergeMap`, việc B trả trước không ngăn A trả sau ghi đè nếu bạn chưa có policy này.
+
+## Vì sao scan và shareReplay chưa đủ
+
+Một pattern khác thường gặp là action stream đi qua `scan`. Về logic reducer, nó rất gọn:
+
+```ts
+import { Subject, scan, shareReplay, startWith } from 'rxjs';
+import {
+  initialState,
+  productsReducer,
+  type ProductsAction,
+} from './products-state';
+
+const actions = new Subject<ProductsAction>();
+const state$ = actions.pipe(
+  scan(productsReducer, initialState),
+  startWith(initialState),
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+```
+
+`scan` có accumulator theo subscription; seed dùng để tính lần action đầu, **không tự phát seed**. Vì vậy ví dụ cần `startWith`. Nếu không có sharing, mỗi consumer có một accumulator riêng, và consumer đến muộn không có các action quá khứ để dựng cùng snapshot.
+
+Sharing xử lý nhiều consumer đang cùng nghe, nhưng chưa xử lý ownership. Với source `Subject` chưa complete/error ở ví dụ này:
+
+1. Không có subscriber thì pipeline chưa kết nối, action bị bỏ qua.
+2. Subscriber cuối unsubscribe thì `refCount: true` ngắt source và reset replay buffer.
+3. Action khi không ai nghe tiếp tục bị bỏ qua.
+4. Subscriber mới tạo subscription `scan` mới, nhận `initialState`, không phải state trước đó.
+
+<Callout type="warn" title="Cache replay không phải lifecycle của store">
+  Trong RxJS 7.8.2, reset khi refCount về 0 áp dụng cho source chưa kết thúc; `shareReplay` giữ cache sau complete bình thường. Đừng khái quát rằng mọi stream có `refCount: true` đều reset sau complete, hoặc rằng `shareReplay(1)` là một store bền vững.
+</Callout>
+
+Đặt `refCount: false` giữ kết nối sau lần subscribe đầu, nhưng vẫn không xử lý action trước lần subscribe đó và có thể giữ pipeline lâu hơn feature. Nếu chọn action stream + `scan`, owner cần thiết lập một subscription chủ động từ lúc tạo store và hủy nó khi dispose; có thể đưa kết quả vào một subject chỉ đọc với seed rõ ràng. Đừng để lifecycle store tình cờ phụ thuộc component nào subscribe đầu tiên.
+
+Mình chọn `BehaviorSubject` cùng reducer đồng bộ cho ví dụ này vì ownership nhìn thấy ngay trong code. `scan` vẫn rất phù hợp để tích lũy trạng thái trong một pipeline có lifecycle hữu hạn hoặc do owner quản lý; khác biệt nằm ở việc ai sở hữu subscription, không phải reducer nào “reactive hơn”.
+
+## Lifecycle và các bẫy production
+
+### Scope của store và teardown
+
+Store theo route/feature nên được tạo khi feature bắt đầu và dispose khi feature kết thúc. Component con bỏ subscription không được dispose store dùng chung; owner của feature chịu trách nhiệm đó. Ngược lại, store cấp ứng dụng không nên bị tạo lại trong mỗi render.
+
+Trong Angular, scope provider quyết định instance được chia sẻ đến đâu; trong React, giữ instance ổn định theo lifecycle và dùng adapter subscribe phù hợp như `useSyncExternalStore`. Phần tích hợp framework có hướng dẫn riêng ở các bài liên quan.
+
+Với SSR, không dùng mutable singleton cấp module cho state riêng của người dùng: một process có thể xử lý nhiều request. Tạo instance theo request/session cần thiết và đồng bộ initial snapshot khi hydrate. Với store sống lâu, logout hoặc đổi workspace phải reset đúng scope và hủy effect cũ trước khi nhận dữ liệu scope mới.
+
+`dispose()` trong ví dụ hoàn tất state stream. Subscriber mới sau dispose chỉ nhận complete, không nhận snapshot cuối từ `BehaviorSubject`; muốn mở feature lại, tạo instance mới. Complete cũng không tự xóa mọi object đã lưu: owner phải bỏ reference tới feature/store và các closure để garbage collector thu hồi chúng.
+
+### Mutation và cập nhật lồng nhau
+
+Tránh mutate snapshot bằng `push`, `sort` tại chỗ hoặc sửa `item.name`. Dữ liệu có thể thay đổi mà reference không đổi, khiến `distinctUntilChanged` không phát; các subscriber còn có thể nhìn cùng object với nội dung thay đổi mà không có notification.
+
+Cũng đừng dispatch trực tiếp trong callback đọc state để “sửa” state vừa nhận. `BehaviorSubject.next` phát đồng bộ: nếu subscriber A dispatch state mới trong lúc state cũ đang được phát, subscriber B có thể thấy state mới rồi mới thấy state cũ. Reducer đúng không tự giải quyết notification reentrancy này.
+
+Mặc định, mình giữ callback selector chỉ để render hoặc đọc; command đến từ event/feature API và business rule nằm trong reducer. Nếu domain thật sự cần action phát sinh lồng nhau, thêm hàng đợi action được owner quản lý, chẳng hạn scheduling bằng `queueScheduler`, và test thứ tự rõ ràng. Scheduling chỉ đổi thứ tự thực thi, không sửa một feedback loop vô hạn.
+
+### Persistence và optimistic update
+
+Một store trong RAM không đồng nghĩa với persistence. Nếu cần lưu bộ lọc qua reload, chọn field nào được lưu, version schema và validate dữ liệu đọc lại. Ghi storage là effect; đừng persist toàn bộ status loading hoặc raw error chỉ vì chúng nằm cùng snapshot. Không lưu token hay dữ liệu nhạy cảm vào browser storage như một mặc định của pattern.
+
+Optimistic update cũng cần policy riêng. Giả sử người dùng sửa tên A rồi sửa tiếp thành B trước khi request đầu lỗi: rollback về snapshot trước A có thể xóa luôn B. Gắn mutation ID/version, rollback đúng phần còn thuộc mutation đó và reconcile response server. Nếu feature có nhiều thao tác như vậy, cân nhắc thư viện state/query có cơ chế mutation thay vì mở rộng store nhỏ bằng nhiều điều kiện khó kiểm chứng.
+
+## Kiểm chứng reducer và stream
+
+### Test reducer và structural sharing
+
+Test reducer trước vì lỗi cập nhật reference thường xuất hiện ở đây. Ví dụ sau dùng `node:assert/strict` và import module từ các snippet trên; chạy bằng test runner TypeScript của ứng dụng có RxJS, không dùng timer thật.
+
+```ts title="products-reducer.test.ts"
+import assert from 'node:assert/strict';
+import { initialState, productsReducer } from './products-state';
+
+const seed = Object.freeze({
+  ...initialState,
+  items: Object.freeze([{ id: 'p1', name: 'RxJS handbook' }]),
+});
+
+const changed = productsReducer(seed, { type: 'queryChanged', query: 'rx' });
+assert.notEqual(changed, seed);
+assert.equal(changed.items, seed.items);
+assert.equal(seed.query, '');
+assert.equal(changed.query, 'rx');
+
+const noOp = productsReducer(changed, { type: 'queryChanged', query: 'rx' });
+assert.equal(noOp, changed);
+
+const failed = productsReducer(changed, { type: 'loadFailed', message: 'offline' });
+assert.equal(failed.items, seed.items);
+assert.equal(failed.status, 'error');
+
+const loading = productsReducer(failed, { type: 'loadStarted' });
+assert.equal(loading.error, null);
+assert.equal(loading.items, seed.items);
+
+const input = [{ id: 'p2', name: 'Original' }];
+const loaded = productsReducer(loading, { type: 'loadSucceeded', items: input });
+input[0].name = 'Changed outside store';
+assert.equal(loaded.items[0].name, 'Original');
+assert.equal(loaded.status, 'ready');
+```
+
+Test kiểm tra cả giá trị và reference: query mới tạo snapshot mới nhưng không copy array không liên quan. Test cuối kiểm tra việc tách payload API khỏi state cho schema nông hiện tại.
+
+### Test timeline và subscriber đến muộn
+
+Test sau là nguồn kiểm chứng cho marble ở trên. Test `state$` kiểm tra cả seed và cập nhật status; test `query$` chỉ mong seed cùng lần query thật sự đổi. Không có dấu complete vì store vẫn hoạt động trong cửa sổ test.
+
+```ts title="products-store.test.ts"
+import assert from 'node:assert/strict';
+import { TestScheduler } from 'rxjs/testing';
+import { ProductsStore } from './products-store';
+import { createInitialState } from './products-state';
+
+const store = new ProductsStore();
+const scheduler = new TestScheduler((actual, expected) => {
+  assert.deepEqual(actual, expected);
+});
+
+scheduler.run(({ expectObservable }) => {
+  scheduler.schedule(() => store.dispatch({ type: 'loadStarted' }), 1);
+  scheduler.schedule(() => store.dispatch({ type: 'queryChanged', query: 'rx' }), 4);
+  scheduler.schedule(() => store.dispatch({ type: 'queryChanged', query: 'rx' }), 7);
+  scheduler.schedule(() => store.dispatch({
+    type: 'loadSucceeded',
+    items: [{ id: 'p1', name: 'RxJS handbook' }],
+  }), 10);
+
+  const s = createInitialState();
+  const A = { ...s, status: 'loading' as const };
+  const B = { ...A, query: 'rx' };
+  const C = {
+    ...B,
+    status: 'ready' as const,
+    items: [{ id: 'p1', name: 'RxJS handbook' }],
+  };
+  expectObservable(store.state$).toBe('sA--B-----C', { s, A, B, C });
+  expectObservable(store.query$).toBe('q---r', { q: '', r: 'rx' });
+  expectObservable(store.query$, '--------^----!').toBe('--------r', { r: 'rx' });
+});
+store.destroy();
+
+// Không có consumer: command vẫn được xử lý.
+const detached = new ProductsStore();
+detached.dispatch({ type: 'queryChanged', query: 'book' });
+const seen: string[] = [];
+const subscription = detached.query$.subscribe((query) => seen.push(query));
+assert.deepEqual(seen, ['book']);
+subscription.unsubscribe();
+
+// Bỏ consumer không làm state reset.
+detached.dispatch({ type: 'queryChanged', query: 'rxjs' });
+const later = detached.query$.subscribe((query) => seen.push(query));
+assert.deepEqual(seen, ['book', 'rxjs']);
+later.unsubscribe();
+detached.destroy();
+```
+
+Subscriber đến ở frame 8 nhận `rx` ngay, dù action đổi query nằm ở frame 4. `destroy()` được gọi sau khi scheduler flush xong để không thêm complete ngoài hợp đồng đang kiểm tra.
+
+### Test effect trước khi nối UI
+
+Test dưới đây dùng cold Observable để kiểm tra hai reload gần nhau. A bị hủy khi B đến; chỉ B có success. Đây là test cho subscription lifecycle của effect, không phải bằng chứng HTTP server đã ngừng xử lý request A.
+
+```ts title="products-feature.test.ts"
+import assert from 'node:assert/strict';
+import { of, throwError } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+import { createProductsFeature } from './products-feature';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  assert.deepEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectSubscriptions }) => {
+  const a = cold('----x|', { x: [{ id: 'a', name: 'Old' }] });
+  const b = cold('--y|', { y: [{ id: 'b', name: 'New' }] });
+  let calls = 0;
+  const feature = createProductsFeature(() => ++calls === 1 ? a : b);
+  const successes: string[] = [];
+  feature.state$.subscribe((state) => {
+    if (state.status === 'ready') successes.push(state.items[0].id);
+  });
+
+  scheduler.schedule(() => feature.reload(), 1);
+  scheduler.schedule(() => feature.reload(), 3);
+  expectSubscriptions(a.subscriptions).toBe('-^-!');
+  expectSubscriptions(b.subscriptions).toBe('---^--!');
+  scheduler.schedule(() => {
+    assert.deepEqual(successes, ['b']);
+    feature.dispose();
+  }, 7);
+});
+
+// Lỗi API không kết thúc effect; reload sau vẫn thành công.
+let attempts = 0;
+const recovery = createProductsFeature(() => ++attempts === 1
+  ? throwError(() => new Error('offline'))
+  : of([{ id: 'ok', name: 'Recovered' }]),
+);
+const statuses: string[] = [];
+recovery.state$.subscribe((state) => statuses.push(state.status));
+recovery.reload();
+recovery.reload();
+assert.deepEqual(statuses, ['idle', 'loading', 'error', 'loading', 'ready']);
+recovery.dispose();
+```
+
+B subscribe ở frame 3, phát kết quả tại frame 5 và complete tại frame 6. A lẽ ra phát tại frame 5 nhưng bị unsubscribe từ frame 3, nên không dispatch success. Vì effect có một subscription do owner tạo, thêm nhiều UI subscriber không nhân số request; test tiếp theo kiểm tra điều đó cùng teardown.
+
+### Test teardown và contract của API
+
+Một test chỉ nhìn response đúng chưa đủ: request cũ có thể vẫn chạy sau khi feature đã đóng. Kiểm tra subscription log để biết dispose có thật sự ngắt inner hay không.
+
+```ts title="products-lifecycle.test.ts"
+import assert from 'node:assert/strict';
+import { EMPTY, of } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+import { createProductsFeature } from './products-feature';
+import { ProductsStore } from './products-store';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  assert.deepEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectSubscriptions }) => {
+  const request = cold('------x|', {
+    x: [{ id: 'late', name: 'Không được xuất hiện' }],
+  });
+  let calls = 0;
+  let completions = 0;
+  const statuses: string[] = [];
+  const feature = createProductsFeature(() => {
+    calls += 1;
+    return request;
+  });
+  const viewA = feature.state$.subscribe({
+    next: (state) => statuses.push(state.status),
+    complete: () => { completions += 1; },
+  });
+  const viewB = feature.vm$.subscribe();
+
+  assert.equal(calls, 0); // Subscribe chỉ đọc, không gọi API.
+  scheduler.schedule(() => feature.reload(), 1);
+  scheduler.schedule(() => viewB.unsubscribe(), 2);
+  scheduler.schedule(() => {
+    feature.dispose();
+    feature.dispose(); // Idempotent.
+    assert.equal(calls, 1);
+    assert.deepEqual(statuses, ['idle', 'loading']);
+    assert.equal(completions, 1);
+    assert.equal(viewA.closed, true);
+    assert.throws(() => feature.reload(), /dispose/);
+    assert.throws(() => feature.setQuery('rx'), /dispose/);
+    const replay: unknown[] = [];
+    feature.state$.subscribe((state) => replay.push(state));
+    assert.deepEqual(replay, []); // Sau complete không replay snapshot cuối.
+  }, 3);
+  expectSubscriptions(request.subscriptions).toBe('-^-!');
+});
+
+// Lỗi đồng bộ, empty response rồi danh sách rỗng hợp lệ.
+let attempts = 0;
+const feature = createProductsFeature(() => {
+  attempts += 1;
+  if (attempts === 1) throw new Error('Adapter ném lỗi đồng bộ');
+  if (attempts === 2) return EMPTY;
+  return of([]);
+});
+const statuses: string[] = [];
+feature.state$.subscribe((state) => statuses.push(state.status));
+feature.reload();
+feature.reload();
+feature.reload();
+assert.deepEqual(statuses, [
+  'idle', 'loading', 'error', 'loading', 'error', 'loading', 'ready',
+]);
+feature.dispose();
+
+// Hai store không chia sẻ seed object hoặc array.
+const left = new ProductsStore();
+const right = new ProductsStore();
+const snapshots: unknown[] = [];
+const arrays: unknown[] = [];
+for (const store of [left, right]) {
+  const stateView = store.state$.subscribe((state) => snapshots.push(state));
+  const itemsView = store.items$.subscribe((items) => arrays.push(items));
+  stateView.unsubscribe();
+  itemsView.unsubscribe();
+}
+assert.notEqual(snapshots[0], snapshots[1]);
+assert.notEqual(arrays[0], arrays[1]);
+left.destroy();
+right.destroy();
+```
+
+Request subscribe ở frame 1 và bị hủy tại frame 3, trước khi có response ở frame 7. Bỏ `viewB` tại frame 2 không hủy request vì feature vẫn còn sống. Test dùng cold Observable nên chứng minh teardown của subscription; để kiểm chứng abort network, cần test riêng API adapter.
+
+Nếu ứng dụng có logout hoặc workspace switch, thêm test chuyển scope khi request cũ đang chạy và khẳng định dữ liệu user/workspace cũ không xuất hiện trong instance mới. Đây là ràng buộc nghiệp vụ mà store nhỏ không thể tự suy ra.
+
+## Checklist áp dụng
+
+Trước khi nối feature vào UI, bạn nên trả lời được:
+
+- [ ] Một snapshot có một owner; không public Subject có quyền `next`.
+- [ ] Seed phân biệt được chưa tải, đang tải, rỗng và lỗi.
+- [ ] Derived state nằm ở selector; reducer không gọi API hoặc storage.
+- [ ] No-op giữ reference cũ; thay đổi một nhánh không mutate nhánh khác.
+- [ ] Lỗi API thành state có thể phục hồi, không gọi error trên state subject.
+- [ ] Concurrency policy đã được chọn theo command, không theo thói quen.
+- [ ] UI unsubscribe không vô tình mất state hoặc tạo lại request.
+- [ ] Owner hủy effect khi dispose; outer complete không bị nhầm với cancellation.
+- [ ] Subscriber đến muộn, reload lỗi rồi thử lại và response đảo thứ tự đều có test.
+- [ ] Scope SSR, logout, persistence và dữ liệu nhạy cảm có policy rõ ràng nếu áp dụng.
+
+Một bước thực hành hữu ích: thay dữ liệu giả bằng adapter API của bạn, rồi làm cho test “A bị hủy khi B đến” và test “error rồi reload” chạy qua adapter đó. Bạn sẽ biết teardown và recovery có thật, thay vì chỉ đúng ở sơ đồ.
+
+## Học tiếp
+
+<Cards>
+  <Card title="BehaviorSubject" href="/docs/subjects-multicasting/behavior-subject" description="Seed, snapshot và lifecycle của nơi giữ state." />
+  <Card title="shareReplay" href="/docs/subjects-multicasting/share-replay" description="Phân biệt chia sẻ selector, cache và ownership." />
+  <Card title="Request orchestration" href="/docs/patterns-production/request-orchestration" description="Chọn cancellation, queue hoặc concurrency cho request." />
+  <Card title="Cache dữ liệu" href="/docs/patterns-production/cache-data" description="Khi server state cần invalidation và cache riêng." />
+  <Card title="Tích hợp React" href="/docs/tich-hop/react" description="Gắn subscription và external store với lifecycle của React." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Kiểm chứng emission và subscription bằng virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS BehaviorSubject](https://rxjs.dev/api/index/class/BehaviorSubject) — seed, current value và giao diện chỉ đọc qua Observable.
+- [RxJS scan](https://rxjs.dev/api/operators/scan) — accumulator theo subscription và cách dùng seed.
+- [RxJS distinctUntilChanged](https://rxjs.dev/api/operators/distinctUntilChanged) — so sánh với giá trị đã phát trước đó, mặc định bằng `===`.
+- [RxJS shareReplay](https://rxjs.dev/api/operators/shareReplay) — sharing, replay và refCount.
+- [Implementation shareReplay tại tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — `resetOnComplete: false` và `resetOnRefCountZero: refCount`.
+- [RxJS switchMap](https://rxjs.dev/api/operators/switchMap) — thay active inner khi command mới đến.
+- [RxJS throwIfEmpty](https://rxjs.dev/api/operators/throwIfEmpty) — phân biệt Observable không phát với giá trị danh sách rỗng.

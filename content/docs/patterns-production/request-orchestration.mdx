@@ -3,8 +3,675 @@ title: Request orchestration
 description: Phối hợp request nối tiếp, song song và phụ thuộc.
 ---
 
-Trang này sẽ trình bày **Request orchestration** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn mở trang chi tiết khách hàng: cần tải profile trước, rồi dùng ID trong profile để tải đơn hàng và quyền truy cập. Trong lúc đó, người dùng chuyển sang khách hàng khác; response cũ vẫn có thể về sau. Nếu mỗi request có một `subscribe` riêng, rất khó biết request nào còn hợp lệ, lỗi ở đâu thì dừng và rời màn hình phải hủy những gì.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Request orchestration là cách bạn đặt các quyết định ấy vào một pipeline. Mình sẽ bắt đầu từ quan hệ giữa request, sau đó thêm policy cho trigger mới, lỗi và lifecycle — thay vì chọn `switchMap` chỉ vì đang gọi HTTP.
+
+<Callout type="info" title="Phạm vi và điều kiện chạy">
+  Bài dùng **RxJS 7.8.2**, TypeScript và HTTP trong browser qua `rxjs/ajax`. Các endpoint `/api/...` là API minh họa cần do ứng dụng cung cấp, không có sẵn trong site này. Bạn nên biết [higher-order Observable](/docs/higher-order-observables/higher-order-stream), `catchError` và subscription teardown. Các ví dụ HTTP bên dưới dùng lại helper và type đã khai báo trong bài; các marble test chạy độc lập, không cần server.
 </Callout>
+
+## Mục lục
+
+- [Chốt contract trước khi chọn operator](#chốt-contract-trước-khi-chọn-operator)
+  - [Quan hệ giữa các request](#quan-hệ-giữa-các-request)
+  - [Policy khi trigger mới đến](#policy-khi-trigger-mới-đến)
+- [Chuẩn bị nguồn HTTP hữu hạn](#chuẩn-bị-nguồn-http-hữu-hạn)
+- [Chạy song song và chờ kết quả](#chạy-song-song-và-chờ-kết-quả)
+  - [Dùng forkJoin cho snapshot](#dùng-forkjoin-cho-snapshot)
+  - [Chọn fail fast hay partial success](#chọn-fail-fast-hay-partial-success)
+- [Nối request phụ thuộc thành một pipeline](#nối-request-phụ-thuộc-thành-một-pipeline)
+- [Chỉ giữ workflow của lựa chọn mới nhất](#chỉ-giữ-workflow-của-lựa-chọn-mới-nhất)
+  - [Cancellation của cả cây request](#cancellation-của-cả-cây-request)
+  - [State và lifecycle của màn hình](#state-và-lifecycle-của-màn-hình)
+- [Phối hợp mutation và tải lại dữ liệu](#phối-hợp-mutation-và-tải-lại-dữ-liệu)
+  - [Xếp hàng lệnh ghi bằng concatMap](#xếp-hàng-lệnh-ghi-bằng-concatmap)
+  - [Bỏ click lặp bằng exhaustMap](#bỏ-click-lặp-bằng-exhaustmap)
+- [Batch với concurrency có giới hạn](#batch-với-concurrency-có-giới-hạn)
+- [Đặt timeout và retry đúng phạm vi](#đặt-timeout-và-retry-đúng-phạm-vi)
+  - [Timeout từng bước và deadline toàn workflow](#timeout-từng-bước-và-deadline-toàn-workflow)
+  - [Retry một request đọc thay vì cả chuỗi](#retry-một-request-đọc-thay-vì-cả-chuỗi)
+- [Những bẫy khi đưa vào production](#những-bẫy-khi-đưa-vào-production)
+- [Kiểm thử output và subscription](#kiểm-thử-output-và-subscription)
+  - [Latest hủy inner cũ](#latest-hủy-inner-cũ)
+  - [Queue đợi request trước complete](#queue-đợi-request-trước-complete)
+  - [Ma trận kiểm thử bổ sung](#ma-trận-kiểm-thử-bổ-sung)
+- [Checklist thiết kế workflow](#checklist-thiết-kế-workflow)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Chốt contract trước khi chọn operator
+
+Giả sử mỗi lần đổi khách hàng phải tải một dashboard. Có hai câu hỏi độc lập: **bên trong một lần tải, các request phối hợp thế nào; giữa nhiều lần tải, workflow nào được phép tiếp tục?** `forkJoin` trả lời câu đầu, còn các flattening operator trả lời câu sau. Bạn thường cần cả hai, không phải chọn một trong hai.
+
+### Quan hệ giữa các request
+
+| Yêu cầu | Cách phối hợp | Điều phải xác nhận |
+| --- | --- | --- |
+| B cần ID từ response A | `concatMap` từ A sang B | A phát một response; không khởi chạy B trước khi có ID |
+| A và B độc lập, UI cần một snapshot đầy đủ | `forkJoin({ a: a$, b: b$ })` | Mỗi nguồn phải phát ít nhất một value và complete |
+| UI cần cập nhật mỗi khi một nguồn state đổi | `combineLatest({ a: a$, b: b$ })` | Mỗi nguồn phải có value đầu; không phải cơ chế tự refetch |
+| Trigger cần đọc state hiện tại | `withLatestFrom(state$)` | Chỉ trigger phát mới tạo output; state phải có value trước |
+| Nhiều item độc lập, cần giới hạn số đang chạy | `mergeMap(loadItem, concurrency)` | Giới hạn active inner, không giới hạn kích thước queue |
+
+Mình chọn `forkJoin` cho một lần tải HTTP hữu hạn. Không dùng nó để chờ `BehaviorSubject`, WebSocket hoặc stream polling không complete. Nếu chỉ cần snapshot đầu của một nguồn state, có thể dùng `take(1)`, nhưng phải chắc value đầu không phải placeholder như `null` hoặc state `loading`.
+
+### Policy khi trigger mới đến
+
+| Operator | Khi request trước còn chạy | Phù hợp với | Không nên dùng khi |
+| --- | --- | --- | --- |
+| `switchMap` | Unsubscribe inner cũ, chạy inner mới | Đổi route, filter, tài nguyên đang xem | Mọi lệnh ghi đều phải được quan sát đến kết quả |
+| `concatMap` | Xếp trigger vào queue, chạy theo thứ tự | Các lệnh ghi cần tuần tự | Input có thể tăng vô hạn nhanh hơn tốc độ xử lý |
+| `mergeMap` | Chạy thêm inner nếu còn slot | Task độc lập, batch hữu hạn | Thứ tự hoàn tất phải giống thứ tự input |
+| `exhaustMap` | Bỏ trigger đến khi đang bận | Submit chỉ nhận một lần trong lúc chờ | Trigger bị bỏ phải được chạy lại sau đó |
+
+Đừng dùng `concatMap` chỉ vì “request B chạy sau A” rồi vô tình queue mọi thay đổi route. Trong một workflow, B có thể nối sau A bằng `concatMap`; ở lớp trigger bên ngoài, bạn vẫn dùng `switchMap` để thay **toàn bộ workflow** khi người dùng chọn khách hàng khác.
+
+Nếu chỉ có một request độc lập, không có stream trigger hay cancellation liên quan, `async/await` thường dễ đọc hơn. RxJS hữu ích ở đây vì bạn đang quản lý quan hệ và lifecycle, không chỉ vì API trả về dữ liệu bất đồng bộ.
+
+## Chuẩn bị nguồn HTTP hữu hạn
+
+Helper sau trả về một body JSON rồi complete. `ajax.getJSON` là cold Observable: mỗi subscription tạo request riêng; gọi helper chưa gửi request.
+
+```ts
+import { type Observable, timeout } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+function getJson<T>(url: string): Observable<T> {
+  return ajax.getJSON<T>(url).pipe(
+    timeout({ first: 8_000 }),
+  );
+}
+
+type User = { id: string; name: string };
+type Order = { id: string; total: number };
+type Permissions = { canEdit: boolean };
+type Dashboard = {
+  user: User;
+  orders: Order[];
+  permissions: Permissions;
+};
+```
+
+Mốc `8_000` ms là cấu hình minh họa, không phải khuyến nghị cho mọi API. Vì helper này chỉ phát body sau khi nhận response, `timeout({ first: ... })` giới hạn thời gian chờ body đầu tiên. Generic `T` chỉ hỗ trợ TypeScript; nếu response không đáng tin, cần validate schema ở runtime trước khi coi nó là `User`.
+
+Unsubscribe một `ajax` đang pending sẽ abort XHR. Nếu dùng Fetch, hãy dùng `fromFetch` với `selector` đọc body khi cần giữ cancellation trong suốt quá trình nhận JSON. `from(fetch(url))` không tự abort request, còn `defer(() => fetch(url))` chỉ làm request lazy, không thêm teardown. Xem [HTTP và Ajax](/docs/tich-hop/http-ajax) nếu bạn cần chọn adapter khác.
+
+## Chạy song song và chờ kết quả
+
+### Dùng forkJoin cho snapshot
+
+Khi đã biết ID khách hàng, đơn hàng và quyền truy cập không phụ thuộc nhau:
+
+```ts
+import { forkJoin } from 'rxjs';
+
+function loadPanels(userId: string) {
+  const id = encodeURIComponent(userId);
+  return forkJoin({
+    orders: getJson<Order[]>(`/api/users/${id}/orders`),
+    permissions: getJson<Permissions>(`/api/users/${id}/permissions`),
+  });
+}
+
+const panelsSub = loadPanels('u-42').subscribe({
+  next: (panels) => console.log('Snapshot:', panels),
+  error: (error) => console.error('Không tải đủ các panel:', error),
+});
+
+// Khi consumer không còn cần kết quả: panelsSub.unsubscribe();
+```
+
+`forkJoin` subscribe các nguồn khi chính nó được subscribe. Các request có thể chồng lấp thời gian chờ; đây không phải cam kết chạy trên các JavaScript thread khác nhau. Object input giúp giữ tên field, dễ đọc hơn nhớ `result[0]` là endpoint nào.
+
+Đọc sơ đồ theo cột: nhận response của A chưa đủ, output chỉ xuất hiện khi B cũng complete.
+
+<MarbleDiagram
+  title="forkJoin({ a, b })"
+  rows={[
+    { label: 'request A', marble: '--a-|', kind: 'source' },
+    { label: 'request B', marble: '----b--|', kind: 'source' },
+    { label: 'output', marble: '-------(r|)', kind: 'output' },
+  ]}
+  values={{
+    a: 'body từ request A',
+    b: 'body từ request B',
+    r: 'snapshot { a, b }',
+  }}
+  caption="A complete ở frame 4; B complete ở frame 7. Snapshot r phát và complete cùng frame 7."
+/>
+
+Ở đây A phát `a` tại frame 2, B phát `b` tại frame 4. `forkJoin` giữ value cuối của từng nguồn và chờ complete cuối cùng ở frame 7. Nhóm `(r|)` biểu thị phát snapshot rồi complete trong cùng frame; nếu một nguồn phát nhiều value, snapshot chỉ chứa value cuối của nguồn đó.
+
+<Callout type="warn" title="Không có value thì không có snapshot">
+  Trong RxJS 7.8.2, nếu một nguồn complete mà chưa phát value, `forkJoin` complete không output và unsubscribe các nguồn còn lại. `forkJoin([])` cũng complete không value. Vì vậy `catchError(() => EMPTY)` ở một nhánh không phải cách giữ các panel thành công: nó có thể làm mất luôn snapshot. Nếu danh sách request có thể rỗng, xử lý rõ, chẳng hạn `ids.length === 0 ? of([]) : forkJoin(...)`.
+</Callout>
+
+### Chọn fail fast hay partial success
+
+Mặc định, một nhánh error khiến `forkJoin` error ngay và unsubscribe các nhánh còn lại. Mình giữ policy này khi thiếu một phần khiến cả màn hình không còn hợp lệ — chẳng hạn quyền truy cập chưa xác định thì không được bật nút chỉnh sửa.
+
+Với panel độc lập có thể lỗi riêng, chuyển lỗi của **từng nhánh** thành một kết quả có nhãn. Helper dưới đây tương tự ý tưởng all-settled, nhưng chỉ dùng cho nguồn HTTP phát một body rồi complete:
+
+```ts
+import { catchError, map, type Observable, of } from 'rxjs';
+
+type Outcome<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: unknown };
+
+function settle<T>(request$: Observable<T>): Observable<Outcome<T>> {
+  return request$.pipe(
+    map((value): Outcome<T> => ({ ok: true, value })),
+    catchError((error: unknown) =>
+      of<Outcome<T>>({ ok: false, error }),
+    ),
+  );
+}
+
+function loadOptionalPanels(userId: string) {
+  const id = encodeURIComponent(userId);
+  return forkJoin({
+    orders: settle(getJson<Order[]>(`/api/users/${id}/orders`)),
+    permissions: settle(
+      getJson<Permissions>(`/api/users/${id}/permissions`),
+    ),
+  });
+}
+```
+
+Consumer kiểm tra `result.orders.ok` trước khi đọc `value`. Như vậy “API trả danh sách rỗng” khác “không tải được danh sách”; đừng dùng `of([])` để che lỗi nếu hai trạng thái có ý nghĩa khác nhau với UI.
+
+`settle` không tự tạo value cho một source complete rỗng và cũng không chữa nguồn không complete. Nó phù hợp với `getJson` vì helper đó trả một body hoặc error/timeout. Nếu cần áp dụng cho nguồn khác, hãy định nghĩa thêm contract cho empty và nguồn dài hạn.
+
+Bắt lỗi sau toàn bộ `forkJoin` chỉ tạo một fallback chung; lúc ấy sibling đã bị unsubscribe và bạn không nhận được object partial. Ngược lại, khi từng nhánh đều dùng `settle`, nhóm sẽ đợi tất cả nhánh thành công hoặc lỗi/timeout. Chọn policy dựa trên trải nghiệm UI, không chỉ để console hết báo đỏ.
+
+## Nối request phụ thuộc thành một pipeline
+
+Giả sử `/api/users/:selectedId` trả về ID chuẩn hóa cần dùng cho các endpoint con. Tải user trước, rồi mở hai request panel song song:
+
+```ts
+import { concatMap, map, type Observable } from 'rxjs';
+
+function loadDashboard(selectedId: string): Observable<Dashboard> {
+  return getJson<User>(
+    `/api/users/${encodeURIComponent(selectedId)}`,
+  ).pipe(
+    concatMap((user) =>
+      loadPanels(user.id).pipe(
+        map((panels): Dashboard => ({ user, ...panels })),
+      ),
+    ),
+  );
+}
+```
+
+```text
+selectedId → GET user → user.id ─┬→ GET orders ──────┐
+                               └→ GET permissions ─┤
+                                                   └→ dashboard
+```
+
+Hai panel chỉ bắt đầu sau khi user phát response, nhưng không phải chờ nhau. `map` giữ lại user trong closure để output cuối đủ context, thay vì gán vào một biến `currentUser` bên ngoài có thể bị workflow khác ghi đè.
+
+`concatMap` ở đây nhận đúng một user nên không có queue dài. Nếu nguồn A là stream state phát liên tục, operator có thể queue nhiều lượt tải panel; khi mỗi state mới thay thế state cũ, dùng `switchMap` ở vị trí đó phù hợp hơn.
+
+Không `subscribe` trong callback `subscribe` của user. Một Observable trả về toàn workflow cho phép caller hủy cả cây bằng một subscription và nhận lỗi ở một nơi. Nếu tải user lỗi, panel chưa được mở; nếu một panel lỗi, `forkJoin` hủy panel sibling và lỗi đi tới caller.
+
+## Chỉ giữ workflow của lựa chọn mới nhất
+
+### Cancellation của cả cây request
+
+Bây giờ đặt workflow trên vào stream ID đang chọn. Mình dùng `switchMap` ở **ngoài** `loadDashboard`, vì đổi khách hàng làm cả user lẫn các panel cũ hết giá trị với màn hình này.
+
+Đọc cột frame 4 để thấy B thay A trước khi A phát response:
+
+<MarbleDiagram
+  title="switchMap(loadDashboard)"
+  rows={[
+    { label: 'selected ID', marble: '-a--b--|', kind: 'source' },
+    { label: 'workflow A', marble: '-^--!', kind: 'inner' },
+    { label: 'workflow B', marble: '----^---y|', kind: 'inner' },
+    { label: 'output', marble: '--------y|', kind: 'output' },
+  ]}
+  values={{
+    a: 'chọn khách hàng A',
+    b: 'chọn khách hàng B',
+    y: 'dashboard của B',
+  }}
+  caption="B đến ở frame 4 nên workflow A bị unsubscribe. Outer complete ở frame 7, nhưng output đợi B complete ở frame 9."
+/>
+
+A bắt đầu tại frame 1; khi B đến frame 4, A kết thúc bằng `!`, không phải `|` hay `#`. Nếu các panel của A đang pending, teardown truyền xuống các subscription HTTP đó. Nếu A còn ở bước tải user, panel của A chưa từng được tạo.
+
+Outer complete không tương đương hủy workflow đang chạy: hình trên vẫn nhận `y` ở frame 8. Muốn rời màn hình là hủy ngay, bạn cần unsubscribe hoặc đặt `takeUntil` sau flattening operator.
+
+<Callout type="warn" title="Cancellation không phải rollback">
+  `switchMap` ngăn notification tiếp theo của workflow cũ đi tới consumer này. Producer có teardown mới dừng công việc phía client; server có thể đã xử lý request. Đặc biệt, hủy theo dõi POST không chứng minh mutation chưa commit. Không dùng latest làm cơ chế bảo đảm an toàn cho lệnh ghi.
+</Callout>
+
+### State và lifecycle của màn hình
+
+Thay vì bật/tắt một biến `loading` chung bằng `finalize`, phát state từ chính workflow hiện tại:
+
+```ts
+import {
+  catchError,
+  distinctUntilChanged,
+  map,
+  of,
+  startWith,
+  Subject,
+  switchMap,
+  takeUntil,
+} from 'rxjs';
+
+type DashboardState =
+  | { status: 'loading'; id: string }
+  | { status: 'ready'; id: string; data: Dashboard }
+  | { status: 'error'; id: string; error: unknown };
+
+const selectedId = new Subject<string>();
+const destroy = new Subject<void>();
+
+const dashboardState$ = selectedId.pipe(
+  distinctUntilChanged(),
+  switchMap((id) =>
+    loadDashboard(id).pipe(
+      map((data): DashboardState => ({ status: 'ready', id, data })),
+      startWith<DashboardState>({ status: 'loading', id }),
+      catchError((error: unknown) =>
+        of<DashboardState>({ status: 'error', id, error }),
+      ),
+    ),
+  ),
+  takeUntil(destroy),
+);
+
+// Một subscription tại boundary của view.
+const viewSub = dashboardState$.subscribe((state) => {
+  console.log('Render:', state);
+});
+
+selectedId.next('u-42');
+selectedId.next('u-73'); // Thay toàn workflow u-42 bằng u-73.
+
+function disposeView() {
+  destroy.next(); // complete() một mình không kích hoạt takeUntil.
+  destroy.complete();
+  selectedId.complete();
+  viewSub.unsubscribe();
+}
+```
+
+`catchError` nằm trong inner nên lỗi của một khách hàng chỉ phát state `error`; lần chọn ID khác vẫn chạy. Nếu đặt nó sau `switchMap` rồi trả `of(errorState)`, outer subscription sẽ kết thúc sau fallback và không nghe ID tiếp theo.
+
+`distinctUntilChanged` bỏ ID lặp liên tiếp. Muốn refresh cùng ID, hãy thiết kế trigger refresh riêng hoặc thêm version vào trigger; đừng mong gọi `.next('u-73')` lần nữa sẽ tải lại trong ví dụ này. `Subject` cũng không giữ lựa chọn phát trước lúc có subscriber: nếu route đã có ID, dùng nguồn có snapshot hiện tại hoặc `startWith(initialId)`.
+
+State `loading` mới thay data cũ ngay trong mô hình này. Muốn giữ snapshot cũ khi refresh, bạn cần state có `data`, `stale` và lỗi riêng như bài [State management](/docs/patterns-production/state-management), không chỉ bỏ dòng `startWith`.
+
+`finalize` vẫn hữu ích cho cleanup hoặc đếm execution, nhưng nó chạy cả khi complete, error và unsubscribe. Nếu callback của request cũ đặt `loading = false`, nó có thể làm sai state của workflow mới. Phát state có ID từ inner giúp ownership rõ hơn và không coi cancellation là thành công.
+
+## Phối hợp mutation và tải lại dữ liệu
+
+### Xếp hàng lệnh ghi bằng concatMap
+
+Giả sử bạn cho phép gửi nhiều thay đổi tên, nhưng muốn xử lý theo thứ tự. Trigger cần mang snapshot payload, không giữ reference tới form object còn bị sửa sau đó.
+
+Ví dụ sau queue các command và đọc lại user sau mỗi mutation thành công. Helper `settle` chỉ bọc bước đọc lại để **lỗi refresh không bị báo thành lỗi ghi**:
+
+```ts
+import {
+  catchError,
+  concatMap,
+  map,
+  of,
+  Subject,
+  takeUntil,
+  timeout,
+} from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type RenameCommand = Readonly<{ userId: string; name: string }>;
+type RenameResult =
+  | { saved: true; command: RenameCommand; refresh: Outcome<User> }
+  | { saved: false; command: RenameCommand; error: unknown };
+
+const renameCommands = new Subject<RenameCommand>();
+const stopRenames = new Subject<void>();
+
+const renameResults$ = renameCommands.pipe(
+  concatMap((command) => {
+    const url = `/api/users/${encodeURIComponent(command.userId)}`;
+    return ajax.patch<User>(
+      url,
+      { name: command.name },
+      { 'Content-Type': 'application/json' },
+    ).pipe(
+      timeout({ first: 8_000 }),
+      concatMap(() =>
+        settle(getJson<User>(url)).pipe(
+          map((refresh): RenameResult => ({ saved: true, command, refresh })),
+        ),
+      ),
+      catchError((error: unknown) =>
+        of<RenameResult>({ saved: false, command, error }),
+      ),
+    );
+  }),
+  takeUntil(stopRenames),
+);
+
+const renameSub = renameResults$.subscribe(console.log);
+renameCommands.next({ userId: 'u-42', name: 'An' });
+renameCommands.next({ userId: 'u-42', name: 'An Nguyễn' });
+
+// Khi chủ sở hữu workflow dừng:
+// stopRenames.next(); stopRenames.complete(); renameSub.unsubscribe();
+```
+
+Command thứ hai chỉ bắt đầu sau khi **cả mutation và refresh** của command đầu kết thúc. Nếu chỉ cần thứ tự ghi, không muốn việc refresh chậm giữ queue, hãy thiết kế bước đọc riêng và quyết định response nào được phép cập nhật UI. Đó là một contract khác, không phải chỉ đổi vị trí operator.
+
+Trong ví dụ, lỗi mutation được chuyển thành result để queue tiếp tục. Nếu một lệnh sau phụ thuộc thành công của lệnh trước, mình chọn fail fast hoặc dừng để xử lý conflict thay vì dùng `catchError` này. Với version/ETag và response `409` hoặc `412`, cần đọc state mới rồi quyết định lại command, không retry nguyên payload mù quáng.
+
+<Callout type="warn" title="Không nhận được thành công chưa chắc là chưa ghi">
+  `saved: false` ở ví dụ có nghĩa client không xác nhận được thành công. Timeout hoặc mất kết nối có thể xảy ra sau khi server đã commit; UI cần thông báo trạng thái chưa xác định và có đường kiểm tra lại. Nếu mutation thành công nhưng refresh lỗi, `saved: true` vẫn giữ nguyên. Không tự gửi mutation lần nữa chỉ để sửa lỗi refresh.
+</Callout>
+
+`concatMap` chỉ giữ thứ tự trong subscription này, không tạo transaction cho nhiều endpoint và không ngăn một tab khác ghi xen vào. Nếu cần thao tác atomic, hãy dùng một API/backend transaction thích hợp. Khi có cache, invalidate sau mutation thành công trước khi refetch; reader dùng cache cũ không tự được cập nhật chỉ vì server đã ghi.
+
+GET sau mutation cũng không tự bảo đảm đọc được version vừa ghi: endpoint đọc có thể qua replica hoặc cache chưa cập nhật. Nếu UI cần read-your-writes, ưu tiên body/version từ response mutation hoặc contract đọc nhất quán do backend cung cấp. RxJS bảo đảm thứ tự subscribe, không thay đổi consistency của hệ thống phía server.
+
+### Bỏ click lặp bằng exhaustMap
+
+Với nút tạo đơn, queue mỗi click thường không đúng: người dùng click lần hai vì lần đầu chưa phản hồi. `exhaustMap` chỉ nhận một command trong thời gian đang chờ và bỏ các command khác, không chạy bù sau đó.
+
+```ts
+import {
+  catchError,
+  exhaustMap,
+  map,
+  of,
+  Subject,
+  takeUntil,
+  timeout,
+} from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type CheckoutCommand = Readonly<{
+  cartId: string;
+  idempotencyKey: string;
+}>;
+type CheckoutResult =
+  | { ok: true; order: Order; command: CheckoutCommand }
+  | { ok: false; error: unknown; command: CheckoutCommand };
+
+const checkoutCommands = new Subject<CheckoutCommand>();
+const stopCheckout = new Subject<void>();
+
+const checkoutSub = checkoutCommands.pipe(
+  exhaustMap((command) =>
+    ajax.post<Order>(
+      '/api/orders',
+      { cartId: command.cartId },
+      {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': command.idempotencyKey,
+      },
+    ).pipe(
+      timeout({ first: 10_000 }),
+      map(({ response }): CheckoutResult => ({ ok: true, order: response, command })),
+      catchError((error: unknown) =>
+        of<CheckoutResult>({ ok: false, error, command }),
+      ),
+    ),
+  ),
+  takeUntil(stopCheckout),
+).subscribe(console.log);
+
+// Tạo một lần cho một ý định tạo đơn, giữ lại nếu kết quả chưa xác định.
+const intent: CheckoutCommand = {
+  cartId: 'cart-42',
+  idempotencyKey: crypto.randomUUID(),
+};
+checkoutCommands.next(intent);
+checkoutCommands.next(intent); // Bị bỏ nếu command trước vẫn pending.
+
+// Khi dừng scope: stopCheckout.next(); checkoutSub.unsubscribe();
+```
+
+`exhaustMap` chỉ chống trigger lặp trong cùng subscription khi inner còn active. Sau khi response về, click mới vẫn được nhận. Chặn duplicate giữa tab, thiết bị hoặc lần retry cần contract idempotency phía server; gửi header mà backend không hỗ trợ không có tác dụng ấy.
+
+Server cần quy định scope của key, thời gian lưu, cách trả lại kết quả và cách xử lý cùng key nhưng payload khác. Giữ cùng key cho lần thử lại của **cùng một ý định**, tạo key mới cho ý định khác. Với timeout chưa rõ kết quả, ưu tiên kiểm tra trạng thái đơn hoặc retry cùng key theo contract, không tự tạo key mới.
+
+## Batch với concurrency có giới hạn
+
+Bạn có một danh sách hữu hạn ID và muốn tải từng user, nhưng không mở mọi request cùng lúc. Dùng `mergeMap` với số slot minh họa là `4`:
+
+```ts
+import { from, map, mergeMap, toArray } from 'rxjs';
+
+function loadUsers(ids: readonly string[]) {
+  return from(ids.map((id, index) => ({ id, index }))).pipe(
+    mergeMap(
+      ({ id, index }) =>
+        settle(getJson<User>(`/api/users/${encodeURIComponent(id)}`)).pipe(
+          map((result) => ({ id, index, result })),
+        ),
+      4,
+    ),
+    toArray(),
+    // mergeMap phát theo thứ tự hoàn tất, không phải thứ tự input.
+    map((results) => results.sort((a, b) => a.index - b.index)),
+  );
+}
+
+const batchSub = loadUsers(['u-1', 'u-2', 'u-3']).subscribe({
+  next: (results) => console.log('Batch theo thứ tự input:', results),
+  error: (error) => console.error('Lỗi toàn batch:', error),
+});
+
+// batchSub.unsubscribe() hủy active request và bỏ phần đang chờ.
+```
+
+Mỗi item được chuyển thành `Outcome`, nên một request lỗi không hủy cả batch. Nếu muốn fail fast, bỏ `settle` và để lỗi truyền ra; khi đó active sibling bị unsubscribe, item trong queue chưa bắt đầu sẽ không được chạy. `toArray()` đợi toàn stream complete mới phát; danh sách rỗng vẫn cho output `[]`.
+
+Giữ `index` vì có thể có ID trùng nhau, và sort theo ID không khôi phục được thứ tự input. Nếu UI cần tiến độ, phát từng result rồi tích lũy bằng `scan` thay vì chờ `toArray`; nhớ định nghĩa state pending, success và error cho từng vị trí.
+
+<Callout type="warn" title="Concurrency không phải backpressure hay rate limit">
+  `mergeMap(..., 4)` giới hạn số inner đang active trong một subscription. `from(ids)` vẫn phát danh sách đồng bộ, phần vượt slot nằm trong buffer. Với input liên tục nhanh hơn tốc độ xử lý, buffer có thể tăng không giới hạn. Concurrency cũng không cam kết số request mỗi giây: request nhanh có thể tạo nhiều lượt mới. Danh sách lớn cần phân trang/chunk; nguồn liên tục cần policy bounded queue, bỏ/coalesce trigger hoặc flow control riêng.
+</Callout>
+
+Đừng tạo sẵn `ids.map((id) => fetch(url))` rồi mới đưa Promise vào `mergeMap`: các request đã bắt đầu ngoài slot. Tạo cold Observable hoặc tạo công việc trong callback projection để giới hạn concurrency thực sự chi phối thời điểm bắt đầu.
+
+## Đặt timeout và retry đúng phạm vi
+
+### Timeout từng bước và deadline toàn workflow
+
+Helper HTTP đã có timeout riêng. Nhưng user, rồi hai panel có thể lần lượt tiêu hết các ngân sách đó. Nếu màn hình chỉ cho phép chờ một tổng thời gian, thêm timeout quanh workflow **data-only**:
+
+```ts
+const boundedDashboard$ = loadDashboard('u-42').pipe(
+  timeout({ first: 12_000 }),
+);
+```
+
+Vì `loadDashboard` chỉ phát một snapshot cuối, mốc này tính từ lúc subscribe tới snapshot. Đây là cấu hình minh họa: chọn theo latency và yêu cầu UI của ứng dụng. Khi timeout, downstream unsubscribe cây request, rồi nhận `TimeoutError`; adapter HTTP có teardown sẽ abort các request còn pending.
+
+Đừng đặt `timeout({ first: ... })` sau `startWith({ status: 'loading' })` rồi gọi đó là deadline: state loading đã đáp ứng “first” ngay lập tức. Với workflow phát progress hoặc nhiều state, phải thiết kế timer deadline độc lập và quyết định timeout là error hay state riêng. `timeout({ each: ... })` là giới hạn khoảng chờ giữa các emission, không phải tổng ngân sách toàn workflow.
+
+`takeUntil(timer(...))` chỉ complete khi hết giờ, không tự phát lỗi timeout. Nó có thể phù hợp với policy “ngừng theo dõi”, nhưng không tương đương thất bại có nhãn cho UI. Cũng cần xác định timeout tính từ lúc enqueue hay lúc request thực sự bắt đầu: timeout bên trong `concatMap` không tính thời gian command nằm trong queue.
+
+### Retry một request đọc thay vì cả chuỗi
+
+Retry là subscribe lại source, nên phạm vi đặt nó quyết định bước nào bị gửi lại. Mình đặt retry vào request GET có thể thử lại, không mặc định đặt sau toàn workflow — đặc biệt nếu bên trong có mutation.
+
+```ts
+import { retry, throwError, timer, timeout } from 'rxjs';
+import { ajax, AjaxError } from 'rxjs/ajax';
+
+function getJsonWithRetry<T>(url: string) {
+  return ajax.getJSON<T>(url).pipe(
+    timeout({ first: 5_000 }),
+    retry({
+      count: 2, // Tối đa 3 attempt gồm lần đầu.
+      delay: (error: unknown, retryIndex) => {
+        const transient = error instanceof AjaxError &&
+          [502, 503, 504].includes(error.status);
+        if (!transient) return throwError(() => error);
+
+        // Backoff minh họa: 500 ms rồi 1.000 ms.
+        return timer(500 * 2 ** (retryIndex - 1));
+      },
+    }),
+  );
+}
+```
+
+Policy này cố ý không retry `400`, `401`, `403`, lỗi validation, lỗi mạng status `0` hoặc `TimeoutError`. Không phải các lỗi ấy không bao giờ retry được; cần contract rõ hơn trước khi tự động thử lại. Với `429`, hãy xem `Retry-After` và policy rate limit của API; khi nhiều client cùng retry, cân nhắc jitter để tránh cùng thức dậy một lúc.
+
+Timeout nằm trước retry nên mỗi attempt có ngân sách riêng; thời gian chờ backoff làm tổng thời gian dài hơn. Nếu thay helper GET trong dashboard bằng helper này, vẫn giữ một deadline bên ngoài `loadDashboard` để chặn tổng thời gian.
+
+Nếu đặt `retry` sau chuỗi `POST → GET`, lỗi GET có thể làm POST chạy lại. Idempotency vẫn cần ngay cả khi endpoint ghi có vẻ đơn giản; đừng coi việc hủy hoặc retry subscription là transaction hay cơ chế chống duplicate.
+
+## Những bẫy khi đưa vào production
+
+| Bẫy | Hậu quả | Cách xử lý |
+| --- | --- | --- |
+| `subscribe` lồng nhau | Subscription ngoài không sở hữu request trong, error khó gom | Trả Observable từ projection; subscribe ở boundary |
+| Hai consumer subscribe pipeline HTTP | Hai execution/request; với mutation có thể ghi hai lần | Một owner; nếu cần sharing, đặt sau orchestration và chốt lifecycle |
+| `shareReplay` trước `switchMap` | Chỉ share trigger, mỗi consumer vẫn có inner riêng | Share output sau flattening nếu muốn share cả workflow |
+| `catchError(() => EMPTY)` trong `forkJoin` | Nhóm complete không snapshot trong RxJS 7.8.2 | Trả value có nhãn lỗi hoặc để fail fast |
+| `takeUntil` trước flattening | Outer complete nhưng active inner/queue có thể tiếp tục | Đặt sau `switchMap`/`concatMap`/`mergeMap` để hủy cả cây |
+| Dùng `finalize` như callback thành công | Cancellation cũng bị tính là thành công hoặc tắt loading sai | Thành công ở `next`; cleanup ở `finalize`; state gắn với trigger |
+| Tạo Promise/request trước slot concurrency | Tất cả đã chạy dù `mergeMap` có giới hạn | Tạo source cold trong projection |
+| Catch mọi lỗi thành `[]` hoặc `null` | UI nhầm lỗi thành dữ liệu hợp lệ | Dùng discriminated union hoặc error state |
+| Timeout mutation rồi gửi lại với key mới | Có thể tạo duplicate sau commit đầu | Kiểm tra trạng thái; cùng intent dùng cùng idempotency key |
+| Payload mutable được queue | Command chạy với dữ liệu khác lúc click | Snapshot payload; `Readonly` không tự clone/deep-freeze |
+
+Sharing cần thiết khi nhiều component cùng đọc dashboard, nhưng không nên bật vô điều kiện cho mutation. `shareReplay({ bufferSize: 1, refCount: true })` sau orchestration có thể tránh execution trùng trong cùng instance; nó không tự tạo TTL hay invalidation. Source complete thành công vẫn có thể giữ replay buffer trong RxJS 7.8.2. Khi đổi session, bỏ instance/state gắn user cũ và hủy owner của workflow; đừng giữ cache cá nhân trong singleton SSR dùng chung.
+
+UI có thể cần rời màn hình mà mutation vẫn phải được theo dõi tới kết quả. Khi đó workflow phải thuộc service/queue có lifecycle riêng; view chỉ subscribe state của service. Các ví dụ mutation ở trên chọn owner có thể dừng bằng notifier, nên không phải durable queue, không sống qua reload và không bảo đảm xử lý đủ mọi command sau teardown.
+
+Log theo workflow ID và request ID để phân biệt cancellation, producer error, timeout và retry. Đếm request tại execution HTTP, không đếm số callback nhận replay. Với partial success, ghi rõ bước nào lỗi; tránh log token, body nhạy cảm hoặc raw thông tin khách hàng. Nếu cần workflow bền qua crash hay đảm bảo nghiệp vụ nhiều bước, dùng orchestration phía backend và cơ chế lưu trạng thái, không chỉ một stream trong browser.
+
+## Kiểm thử output và subscription
+
+Đúng output chưa chứng minh request cũ đã ngừng được theo dõi. Hãy assert subscription window để bắt các lỗi lifecycle mà UI happy path không thể hiện.
+
+### Latest hủy inner cũ
+
+Test này là nguồn kiểm chứng cho sơ đồ latest ở trên. Source A dự định phát `x` ở frame 6 nhưng bị unsubscribe ở frame 4; chỉ B được phát `y` ở frame 8.
+
+```ts
+import { switchMap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  // Có thể thay bằng expect(actual).toEqual(expected) trong Jest/Vitest.
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Marble assertion failed');
+  }
+});
+
+scheduler.run(({ hot, cold, expectObservable, expectSubscriptions }) => {
+  const selected = hot('-a--b--|');
+  const requestA = cold('-----x|');
+  const requestB = cold('----y|');
+
+  const result = selected.pipe(
+    switchMap((id) => id === 'a' ? requestA : requestB),
+  );
+
+  expectObservable(result).toBe('--------y|');
+  expectSubscriptions(requestA.subscriptions).toBe('-^--!');
+  expectSubscriptions(requestB.subscriptions).toBe('----^----!');
+});
+```
+
+Test mô phỏng Observable có teardown, chưa chứng minh XHR thật được abort. Integration test của adapter cần xác nhận abort khi đổi lựa chọn và khi destroy view. Nếu source là Promise không cancel được, subscription test vẫn cho thấy output bị chặn, còn công việc thật có thể tiếp tục.
+
+### Queue đợi request trước complete
+
+Test tiếp theo chứng minh trigger B đến frame 3 không khởi chạy B ngay. Nó phải đợi A complete ở frame 4, rồi mới subscribe B:
+
+```ts
+import { concatMap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const queueScheduler = new TestScheduler((actual, expected) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Queue assertion failed');
+  }
+});
+
+queueScheduler.run(({ hot, cold, expectObservable, expectSubscriptions }) => {
+  const commands = hot('-a-b-|');
+  const requestA = cold('--x|');
+  const requestB = cold('--y|');
+
+  const result = commands.pipe(
+    concatMap((id) => id === 'a' ? requestA : requestB),
+  );
+
+  expectObservable(result).toBe('---x--y|');
+  expectSubscriptions(requestA.subscriptions).toBe('-^--!');
+  expectSubscriptions(requestB.subscriptions).toBe('----^--!');
+});
+```
+
+Outer complete ở frame 5 không bỏ B đang chạy; output complete ở frame 7. Thêm một notifier destroy sau `concatMap` nếu contract yêu cầu hủy active request và bỏ queue lúc owner dừng.
+
+### Ma trận kiểm thử bổ sung
+
+| Tình huống | Điều cần assert |
+| --- | --- |
+| User lỗi ở bước đầu | Không subscribe orders/permissions |
+| Hai panel thành công ở thời điểm khác nhau | `forkJoin` phát đúng một snapshot khi cả hai complete |
+| Một panel lỗi với fail fast | Output error; sibling bị unsubscribe |
+| Một panel lỗi với partial success | Nhánh lỗi có `ok: false`; giữ value của nhánh thành công |
+| Nguồn panel complete rỗng | Nhóm complete không output theo contract 7.8.2 |
+| Lỗi inner rồi trigger mới | Trigger mới vẫn tạo request khi catch ở inner |
+| Click lặp khi checkout pending | Không có subscription cho command bị bỏ; sau complete nhận command mới |
+| Batch nhiều hơn số slot | Active subscription không vượt concurrency; thứ tự result khôi phục đúng |
+| Destroy khi có active inner và queue | Active inner bị unsubscribe; queued item chưa từng subscribe |
+| Retry GET | Số attempt đúng; không retry status ngoài policy |
+| Mutation thành công, refresh lỗi | Kết quả vẫn xác nhận ghi thành công; không POST/PATCH lại |
+| Timeout mutation sau commit | UI xử lý kết quả chưa xác định; retry cùng intent không tạo duplicate ở backend |
+| Workflow vượt deadline | Nhận timeout, teardown mọi request còn pending |
+| Hai consumer cùng workflow | Số execution đúng theo contract sharing đã chọn |
+
+Marble test không dùng timer thật và không chạy native Promise bằng virtual time như cold Observable. Dùng cold source để kiểm thử policy của pipeline; dùng integration test cho HTTP, idempotency và hành vi backend. Chuỗi notification visual có `^` hoặc `!` không đưa trực tiếp vào `cold()`; notification và subscription được assert riêng như hai test trên.
+
+## Checklist thiết kế workflow
+
+- [ ] Vẽ rõ bước phụ thuộc và nhóm request có thể chạy song song.
+- [ ] Mỗi trigger có policy latest, queue, concurrent hoặc ignore rõ ràng.
+- [ ] Mỗi nguồn HTTP phát một body hoặc error, có timeout và teardown đã kiểm chứng.
+- [ ] Chọn fail fast hay partial success theo từng nhóm, không dùng fallback giả thành công.
+- [ ] Catch trong inner nếu trigger cần tiếp tục sống sau lỗi.
+- [ ] Mutation có contract idempotency/conflict; phân biệt lỗi ghi và lỗi refresh.
+- [ ] Concurrency, queue capacity và rate limit được xem là các giới hạn khác nhau.
+- [ ] Payload là snapshot; state gắn với workflow/trigger còn hợp lệ.
+- [ ] Timeout/retry nằm đúng bước; deadline không bị loading/progress thỏa mãn sớm.
+- [ ] Owner subscription và hành vi khi rời view, đổi session hoặc reload đã được quyết định.
+- [ ] Test cả output, subscription, lỗi từng bước và teardown toàn cây.
+
+Chọn một màn hình đang có nhiều `subscribe` lồng nhau. Viết ra ba contract trước khi refactor: input mới xử lý thế nào, lỗi một endpoint ảnh hưởng phần còn lại ra sao và ai sở hữu workflow. Sau đó gom thành một Observable và viết test cancellation hoặc queue trước khi thêm retry hay sharing.
+
+## Nguồn tham khảo
+
+- [RxJS forkJoin 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/forkJoin.ts) — chờ last value và complete, empty source và fail fast.
+- [RxJS fromFetch 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/dom/fetch.ts) — teardown với AbortController và phạm vi đọc body qua `selector`.
+- [RxJS mergeInternals 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/mergeInternals.ts) — active inner, buffer và chờ queue khi outer complete.
+- [RxJS switchMap](https://rxjs.dev/api/operators/switchMap), [concatMap](https://rxjs.dev/api/operators/concatMap), [exhaustMap](https://rxjs.dev/api/operators/exhaustMap) — policy giữa các inner.
+- [RxJS timeout](https://rxjs.dev/api/operators/timeout), [retry](https://rxjs.dev/api/operators/retry) và [TestScheduler](https://rxjs.dev/api/testing/TestScheduler) — ngân sách chờ, resubscription và virtual time.
+
+## Học tiếp
+
+<Cards>
+  <Card title="HTTP và Ajax" href="/docs/tich-hop/http-ajax" description="Chọn adapter, kiểm tra status và cancellation của request thật." />
+  <Card title="Cache dữ liệu" href="/docs/patterns-production/cache-data" description="Deduplicate read, invalidate sau mutation và tránh snapshot cũ." />
+  <Card title="State management" href="/docs/patterns-production/state-management" description="Mô hình hóa loading, ready, error và stale data." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Assert notification và subscription bằng virtual time." />
+</Cards>

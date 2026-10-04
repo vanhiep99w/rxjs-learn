@@ -3,8 +3,431 @@ title: Câu hỏi thường gặp
 description: Giải đáp nhanh các nhầm lẫn và lỗi cấu hình phổ biến.
 ---
 
-Trang này sẽ trình bày **Câu hỏi thường gặp** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn đã nối các operator đúng cú pháp nhưng request vẫn chạy hai lần, stream im lặng hoặc ngừng nhận input sau một lỗi? Thường vấn đề không nằm ở tên operator, mà ở **thời điểm subscribe, nơi đặt operator và ai sở hữu subscription**. Trang này trả lời nhanh những câu hỏi đó, kèm cách kiểm tra trước khi đổi code.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi và cách đọc">
+  Ví dụ dùng TypeScript và RxJS 7.8.x; các chi tiết reset của `shareReplay` được đối chiếu với 7.8.2. Chạy ví dụ trong ứng dụng hoặc playground đã có RxJS, không cần cài RxJS vào site tài liệu. Tìm triệu chứng ở bảng bên dưới rồi đọc câu trả lời tương ứng; các liên kết cuối mỗi phần dẫn đến bài chuyên sâu.
 </Callout>
+
+## Mục lục
+
+- [Tìm nhanh theo triệu chứng](#tìm-nhanh-theo-triệu-chứng)
+- [Execution và giá trị](#execution-và-giá-trị)
+  - [Vì sao pipe không chạy và request chưa được gửi?](#vì-sao-pipe-không-chạy-và-request-chưa-được-gửi)
+  - [Observable có luôn lazy và bất đồng bộ không?](#observable-có-luôn-lazy-và-bất-đồng-bộ-không)
+  - [Vì sao subscribe hai lần lại gửi hai request?](#vì-sao-subscribe-hai-lần-lại-gửi-hai-request)
+  - [Vì sao tap không đổi giá trị và async trong subscribe gây lỗi?](#vì-sao-tap-không-đổi-giá-trị-và-async-trong-subscribe-gây-lỗi)
+- [Subscription và cleanup](#subscription-và-cleanup)
+  - [Unsubscribe có gọi complete không?](#unsubscribe-có-gọi-complete-không)
+  - [Vì sao takeUntil không dừng stream?](#vì-sao-takeuntil-không-dừng-stream)
+  - [SwitchMap có hủy request và tác vụ trên server không?](#switchmap-có-hủy-request-và-tác-vụ-trên-server-không)
+- [Lỗi và kết thúc](#lỗi-và-kết-thúc)
+  - [Vì sao catchError rồi mà input tiếp theo không chạy?](#vì-sao-catcherror-rồi-mà-input-tiếp-theo-không-chạy)
+  - [Nên trả EMPTY hay of trong catchError?](#nên-trả-empty-hay-of-trong-catcherror)
+  - [Vì sao retry chạy lại side effect?](#vì-sao-retry-chạy-lại-side-effect)
+- [Kết hợp và chờ dữ liệu](#kết-hợp-và-chờ-dữ-liệu)
+  - [Vì sao combineLatest và withLatestFrom không phát?](#vì-sao-combinelatest-và-withlatestfrom-không-phát)
+  - [Vì sao forkJoin chờ mãi hoặc complete không có kết quả?](#vì-sao-forkjoin-chờ-mãi-hoặc-complete-không-có-kết-quả)
+  - [Vì sao firstValueFrom hoặc lastValueFrom không resolve?](#vì-sao-firstvaluefrom-hoặc-lastvaluefrom-không-resolve)
+- [Subject và replay cache](#subject-và-replay-cache)
+  - [Vì sao Subject làm mất giá trị còn BehaviorSubject phát ngay?](#vì-sao-subject-làm-mất-giá-trị-còn-behaviorsubject-phát-ngay)
+  - [ShareReplay có tự refresh và giải phóng cache không?](#sharereplay-có-tự-refresh-và-giải-phóng-cache-không)
+  - [Vì sao distinctUntilChanged bỏ qua hoặc không chặn object?](#vì-sao-distinctuntilchanged-bỏ-qua-hoặc-không-chặn-object)
+- [Checklist trước khi đổi operator](#checklist-trước-khi-đổi-operator)
+- [Đọc tiếp](#đọc-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Tìm nhanh theo triệu chứng
+
+| Triệu chứng | Câu hỏi nên đọc trước | Kiểm tra đầu tiên |
+| --- | --- | --- |
+| Không có request, không thấy log | [Execution chưa chạy](#vì-sao-pipe-không-chạy-và-request-chưa-được-gửi) | Consumer có subscribe đúng instance không? |
+| Có hai request cho cùng dữ liệu | [Hai subscription](#vì-sao-subscribe-hai-lần-lại-gửi-hai-request) | Đếm execution upstream, không chỉ đếm `next` |
+| Rời màn hình nhưng timer còn chạy | [takeUntil](#vì-sao-takeuntil-không-dừng-stream) | Notifier có `next` và cleanup có bao phủ inner không? |
+| Sau lỗi đầu tiên, nút bấm không phản ứng | [Vị trí catchError](#vì-sao-catcherror-rồi-mà-input-tiếp-theo-không-chạy) | Bắt lỗi ở inner hay cả outer stream? |
+| Stream ghép không phát gì | [Điều kiện kết hợp](#vì-sao-combinelatest-và-withlatestfrom-không-phát) | Mỗi input đã phát ít nhất một value chưa? |
+| Promise chờ vô hạn | [Chuyển Observable sang Promise](#vì-sao-firstvaluefrom-hoặc-lastvaluefrom-không-resolve) | Nguồn có phát, complete hoặc deadline không? |
+| Mở lại màn hình vẫn thấy dữ liệu cũ | [Replay cache](#sharereplay-có-tự-refresh-và-giải-phóng-cache-không) | Instance có giữ snapshot của lần tải trước không? |
+
+Đặt `tap` trước và sau operator nghi ngờ trong pipeline hiện có. Đừng subscribe thêm chỉ để log: với nguồn cold, subscription debug có thể tạo request mới; với sharing, nó có thể giữ connection sống và làm triệu chứng biến mất.
+
+## Execution và giá trị
+
+### Vì sao pipe không chạy và request chưa được gửi?
+
+`pipe(...)` tạo Observable mới từ các operator, không tự subscribe. Với một nguồn cold lazy như `ajax.getJSON`, producer chỉ bắt đầu khi có consumer. Giá trị trả về từ `subscribe` là `Subscription` dùng để quản lý lifecycle, không phải response.
+
+```ts
+import { defer, of, tap } from 'rxjs';
+
+const value$ = defer(() => {
+  console.log('producer');
+  return of(42);
+}).pipe(tap((value) => console.log('value', value)));
+
+console.log('pipeline ready');
+value$.subscribe();
+// pipeline ready
+// producer
+// value 42
+```
+
+Nếu framework đã subscribe hộ, chẳng hạn Angular AsyncPipe, bạn không cần thêm một subscription thủ công. Kiểm tra consumer thật trước; thêm `subscribe()` vô điều kiện có thể sửa sự im lặng nhưng tạo request trùng và thiếu cleanup.
+
+### Observable có luôn lazy và bất đồng bộ không?
+
+Không. `of(1, 2)` phát đồng bộ trong lúc `subscribe`; `interval` phát theo timer. Observable không mặc định tạo thread hoặc chuyển công việc CPU sang background.
+
+Lazy cũng phụ thuộc cách tạo producer. `from(fetch(url))` nhận một Promise của request đã bắt đầu khi gọi `fetch`, còn `defer` trì hoãn việc gọi hàm đến lúc subscribe:
+
+```ts
+import { defer, from } from 'rxjs';
+
+// Ví dụ trong browser; endpoint cần tồn tại để chạy.
+const eager$ = from(fetch('/api/profile')); // fetch chạy ngay ở đây.
+const lazy$ = defer(() => fetch('/api/profile')); // Chưa gọi fetch.
+
+// Mỗi subscription lazy$ gọi fetch một lần mới.
+// Unsubscribe không tự abort fetch trong cả hai cách này.
+```
+
+Mình chọn `defer` khi mỗi execution cần đọc input mới hoặc tạo producer mới. Nhưng nó không biến Promise thành tác vụ có cancellation; muốn abort `fetch`, bạn cần nối teardown với `AbortController` hoặc dùng adapter có hỗ trợ.
+
+### Vì sao subscribe hai lần lại gửi hai request?
+
+Một biến Observable cold giữ cùng công thức tạo execution, không mặc định giữ cùng execution. Hai consumer subscribe vào HTTP Observable cold thường mở hai request, dù reference Observable giống nhau.
+
+Nếu nhiều consumer cần dùng chung một snapshot, giữ một instance ổn định và đặt sharing **sau phần tải dữ liệu**:
+
+```ts
+import { shareReplay } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Profile = { id: string; displayName: string };
+
+// Tạo một lần trong scope của session hoặc resource.
+const profile$ = ajax.getJSON<Profile>('/api/profile').pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+const headerSub = profile$.subscribe({ next: console.log, error: console.error });
+const pageSub = profile$.subscribe({ next: console.log, error: console.error });
+// Khi từng consumer rời đi, unsubscribe subscription tương ứng.
+```
+
+Hai reader chồng thời gian dùng chung upstream. Nếu tạo lại pipeline này trong mỗi lần gọi hàm, mỗi render hoặc getter, mỗi instance vẫn có connection riêng. `shareReplay` cũng không gom request giữa hai tab hoặc hai service instance.
+
+Đừng áp dụng sharing cho mutation chỉ để giảm số request. Với tạo đơn hoặc thanh toán, bạn cần policy trigger và idempotency phía server. Xem [Request trùng lặp](/docs/troubleshooting/request-trung-lap) để phân biệt trùng execution với nhiều trigger hợp lệ.
+
+### Vì sao tap không đổi giá trị và async trong subscribe gây lỗi?
+
+`tap` dành cho side effect và chuyển tiếp value gốc; giá trị `return` trong callback bị bỏ qua. Dùng `map` để biến đổi value. Nếu `tap` mutate object, downstream có thể thấy mutation vì cùng reference, không phải vì `tap` dùng giá trị trả về.
+
+Với thao tác async, `subscribe(async value => ...)` tạo Promise nhưng RxJS không chờ Promise đó. Các callback có thể chạy chồng nhau, và rejection của Promise không đi vào `catchError` upstream. Hãy đưa tác vụ async vào pipeline bằng flattening operator:
+
+```ts
+import { catchError, concatMap, defer, EMPTY, map, of } from 'rxjs';
+
+async function save(value: number): Promise<number> {
+  return value * 10; // Tác vụ async minh họa; thay bằng API thật.
+}
+
+of(1, 2).pipe(
+  map((value) => value + 1),
+  concatMap((value) => defer(() => save(value)).pipe(
+    catchError((error) => {
+      console.error('Không lưu được', error);
+      return EMPTY;
+    }),
+  )),
+).subscribe(console.log); // 20 rồi 30.
+```
+
+Ở đây `concatMap` chờ lần lưu trước kết thúc rồi mới bắt đầu lần sau; `catchError` chỉ kết thúc lần lưu bị lỗi. Nếu output chỉ cần tác vụ mới nhất, cân nhắc `switchMap`; nếu tác vụ ghi phải chạy hết, không dùng cancellation để bỏ chúng. Lỗi ném trực tiếp trong callback consumer cũng không được `catchError` upstream xử lý: hãy giữ logic có thể lỗi trong pipeline hoặc xử lý riêng tại consumer.
+
+## Subscription và cleanup
+
+### Unsubscribe có gọi complete không?
+
+Không. `unsubscribe()` đóng subscription và chạy teardown, nhưng không gửi notification `complete` cho observer. Nguồn complete hoặc error cũng đóng subscription, vì thế `finalize` chạy trong cả ba trường hợp. Nó là nơi cleanup, không phải tín hiệu request thành công.
+
+```ts
+import { finalize, interval } from 'rxjs';
+
+const subscription = interval(1000).pipe(
+  finalize(() => console.log('cleanup')),
+).subscribe({
+  complete: () => console.log('complete'),
+});
+
+subscription.unsubscribe(); // In cleanup, không in complete.
+```
+
+`takeUntil` khác với việc gọi `unsubscribe` trực tiếp: khi notifier phát, operator complete output và unsubscribe upstream. Đọc theo cột dọc để thấy hai sự kiện lifecycle này xảy ra cùng frame:
+
+<MarbleDiagram
+  title="takeUntil(stop$)"
+  rows={[
+    { label: 'source', marble: '-a-b---c-|', kind: 'source' },
+    { label: 'stop$', marble: '------s|', kind: 'source' },
+    { label: 'upstream', marble: '^-----!', kind: 'subscription' },
+    { label: 'output', marble: '-a-b--|', kind: 'output' },
+  ]}
+  values={{ a: 'Value đầu', b: 'Value thứ hai', c: 'Value dự kiến nếu còn nghe', s: 'Tín hiệu dừng' }}
+  caption="stop$ phát ở frame 6: output complete, subscription nguồn bị đóng; c ở frame 7 không đến consumer."
+/>
+
+Consumer nhận `a` ở frame 1, `b` ở frame 3 và complete ở frame 6. Dòng source mô tả lịch phát nếu vẫn được nghe; nguồn cold có teardown đúng sẽ ngừng công việc khi upstream bị unsubscribe, còn hot producer độc lập có thể tiếp tục cho các consumer khác.
+
+Xem [Subscription và teardown](/docs/observable-subscription/subscription-teardown) và [finalize](/docs/loi-hoan-tat/finalize) khi cần tách cleanup của từng execution khỏi trạng thái thành công trên UI.
+
+### Vì sao takeUntil không dừng stream?
+
+`takeUntil(stop$)` dừng khi `stop$` **phát một value**. Chỉ gọi `stop$.complete()` không dừng source. Ngược lại, `BehaviorSubject(false)` phát ngay khi subscribe, nên nếu dùng trực tiếp làm notifier thì `false` vẫn khiến pipeline dừng: `takeUntil` không kiểm tra truthiness.
+
+Với lifecycle notifier, dùng `Subject<void>` và gọi `next()` lúc cleanup. Đặt `takeUntil` sau flattening operator nếu bạn muốn đóng cả outer lẫn inner đang hoạt động:
+
+```ts
+import { interval, Subject, switchMap, takeUntil } from 'rxjs';
+
+const trigger$ = new Subject<void>();
+const destroy$ = new Subject<void>();
+
+const subscription = trigger$.pipe(
+  switchMap(() => interval(1000)),
+  takeUntil(destroy$),
+).subscribe(console.log);
+
+trigger$.next();
+// Mô phỏng teardown ngay lập tức, trước tick đầu tiên.
+destroy$.next();
+destroy$.complete();
+console.log(subscription.closed); // true
+```
+
+Nếu đặt `takeUntil` trước `switchMap`, notifier chỉ complete outer; `switchMap` có thể vẫn chờ inner hiện tại complete. Với inner là `interval` vô hạn, bạn sẽ thấy timer còn chạy. Quy tắc “đặt ở cuối” không thay thế việc hiểu sharing: cleanup của một consumer không nhất thiết đóng connection được dùng chung hoặc nguồn cố ý chạy nền.
+
+Một `Subject` đã phát tín hiệu dừng cũng không replay tín hiệu ấy cho subscription tạo muộn. Đừng tạo công việc mới sau khi owner đã bị hủy. Với Angular, ưu tiên API lifecycle phù hợp của framework thay vì tự chia sẻ một notifier giữa các component; xem [Tích hợp Angular](/docs/tich-hop/angular).
+
+### SwitchMap có hủy request và tác vụ trên server không?
+
+`switchMap` unsubscribe inner cũ khi nhận input mới. Vì vậy response cũ không tiếp tục đi xuống output, nhưng việc dừng transport phụ thuộc producer và teardown.
+
+| Nguồn inner | Unsubscribe thường làm gì? |
+| --- | --- |
+| RxJS `ajax` hoặc Angular HttpClient | Abort request phía client nếu còn đang chạy |
+| `from(promise)` | Ngừng delivery cho subscriber; Promise vẫn chạy |
+| `fetch` không nối AbortController vào teardown | Không tự abort request |
+| Custom Observable | Chạy teardown bạn đã viết; không tự đóng tài nguyên bị bỏ quên |
+
+Ngay cả khi client abort, server có thể đã nhận và xử lý request. Cancellation không rollback mutation. Mình chọn `switchMap` cho search hoặc tải chi tiết khi UI chỉ cần input mới nhất; với thao tác ghi, chọn policy rõ ràng như xếp hàng bằng `concatMap` hoặc bỏ trigger mới khi đang bận bằng `exhaustMap`, cùng bảo vệ phía server nếu cần. Xem [Race condition](/docs/higher-order-observables/race-condition).
+
+## Lỗi và kết thúc
+
+### Vì sao catchError rồi mà input tiếp theo không chạy?
+
+`catchError` không hồi sinh execution đã error. Nó thay execution lỗi bằng Observable bạn trả về. Nếu đặt sau `switchMap` và trả `EMPTY`, cả chuỗi kết quả complete, không còn nghe input tiếp theo.
+
+Với thao tác độc lập theo từng input, bắt lỗi **bên trong inner** để outer còn sống:
+
+```ts
+import { catchError, EMPTY, of, Subject, switchMap, throwError } from 'rxjs';
+
+const input$ = new Subject<string>();
+const subscription = input$.pipe(
+  switchMap((query) => {
+    const request$ = query === 'bad'
+      ? throwError(() => new Error('Request thất bại'))
+      : of(`result: ${query}`);
+
+    return request$.pipe(
+      catchError((error) => {
+        console.error(error.message);
+        return EMPTY; // Chỉ complete inner lỗi.
+      }),
+    );
+  }),
+).subscribe(console.log);
+
+input$.next('bad'); // Log lỗi.
+input$.next('rxjs'); // Vẫn in result: rxjs.
+subscription.unsubscribe();
+```
+
+Bắt lỗi ngoài toàn pipeline vẫn đúng nếu lỗi phải kết thúc workflow. Chọn vị trí theo phạm vi cần tiếp tục, không theo thói quen “đặt catchError cuối cùng”. Xem [catchError](/docs/loi-hoan-tat/catch-error).
+
+### Nên trả EMPTY hay of trong catchError?
+
+Hai lựa chọn có ý nghĩa khác nhau. `EMPTY` complete mà không phát value; `of(fallback)` phát một value rồi complete. `of([])` phát một mảng rỗng, còn `of()` không có đối số thì không phát gì.
+
+| Ý định | Chọn | Hệ quả cần tính |
+| --- | --- | --- |
+| Bỏ kết quả của lần thao tác lỗi | `EMPTY` trong inner | UI có thể giữ dữ liệu cũ vì không nhận value mới |
+| Hiển thị fallback hoặc error state | `of(fallback)` | Downstream nhận một value, phải phân biệt lỗi với dữ liệu thật |
+| Để tầng phía trên xử lý lỗi | `throwError(() => error)` | Execution vẫn kết thúc bằng error |
+
+Mình ưu tiên error state tường minh cho UI, chẳng hạn `{ status: 'error', message: 'Không tải được' }`, thay vì trả `[]` khiến người đọc hiểu nhầm là “không có dữ liệu”. Đừng trả `undefined` hoặc một object thường từ `catchError`: callback cần trả một `ObservableInput`. Một mảng trần như `[]` được hiểu là iterable không có phần tử, không phải một emission chứa mảng rỗng; bọc bằng `of([])` nếu muốn phát mảng.
+
+### Vì sao retry chạy lại side effect?
+
+`retry` subscribe lại nguồn upstream, không tiếp tục từ vị trí lỗi. Với producer cold, request và side effect nằm trước `retry` có thể chạy lại. Các value đã nhận trước lỗi không bị thu hồi và có thể xuất hiện lần nữa ở attempt mới.
+
+`retry({ count: 2 })` cho tối đa hai lần retry sau lần chạy đầu, tức tối đa ba attempt. Chỉ retry lỗi có khả năng tạm thời, có giới hạn và delay phù hợp; retry không sửa lỗi validation hay sai quyền truy cập.
+
+Với thao tác ghi, request timeout không chứng minh server chưa ghi. Dùng idempotency key cho cùng thao tác logic qua các attempt nếu backend hỗ trợ. Ngoài ra, `catchError(() => of(fallback))` đặt trước `retry` đã chuyển lỗi thành kết quả bình thường nên `retry` không thấy lỗi ấy. Xem [retry và retryWhen](/docs/loi-hoan-tat/retry-retry-when).
+
+## Kết hợp và chờ dữ liệu
+
+### Vì sao combineLatest và withLatestFrom không phát?
+
+`combineLatest` cần mỗi input phát ít nhất một value trước khi phát tổ hợp đầu tiên. Sau đó, input nào phát cũng có thể tạo output mới. `withLatestFrom` cũng cần value từ các input phụ, nhưng chỉ emission của source chính mới kích hoạt output.
+
+```ts
+import { combineLatest, Subject, withLatestFrom } from 'rxjs';
+
+const query$ = new Subject<string>();
+const locale$ = new Subject<string>();
+
+const combinedSub = combineLatest([query$, locale$]).subscribe(
+  (value) => console.log('combined', value),
+);
+const sampledSub = query$.pipe(withLatestFrom(locale$)).subscribe(
+  (value) => console.log('sampled', value),
+);
+
+query$.next('rxjs'); // Chưa có locale: chưa có output.
+locale$.next('vi');  // combined ['rxjs', 'vi']; sampled chưa phát.
+query$.next('docs'); // Cả hai phát ['docs', 'vi'].
+
+combinedSub.unsubscribe();
+sampledSub.unsubscribe();
+```
+
+`withLatestFrom` không xếp hàng các query đến trước locale để phát bù. Nếu locale cần một giá trị khởi đầu hợp lệ, dùng state có initial value hoặc `startWith` đúng với nghiệp vụ. Đừng thêm `startWith(null)` chỉ để ép stream phát, rồi để request downstream chạy với input chưa hợp lệ. Xem [Combination operators](/docs/operators/combination-operators).
+
+### Vì sao forkJoin chờ mãi hoặc complete không có kết quả?
+
+`forkJoin` chỉ phát một tổ hợp các **value cuối** khi mọi input đã complete và mỗi input đã phát ít nhất một value. Nó hợp với nhóm request hữu hạn, không hợp với state stream sống suốt ứng dụng.
+
+| Input có vấn đề | Hành vi trong RxJS 7.8.x |
+| --- | --- |
+| `interval` không giới hạn hoặc Subject không complete | Không có kết quả cuối; có thể chờ mãi |
+| `EMPTY`, hoặc `catchError(() => EMPTY)` trên một input | `forkJoin` complete mà không phát tổ hợp |
+| Một input error chưa xử lý | Output error và unsubscribe các input còn lại |
+| Danh sách input rỗng | Complete mà không phát |
+
+Nếu bạn chỉ cần một snapshot từ state stream, cân nhắc `take(1)` trên input đó và deadline nếu nó có thể không phát. Nếu cần cập nhật liên tục khi state thay đổi, dùng `combineLatest`. Việc thay `EMPTY` bằng `of(fallback)` giúp input có value, nhưng fallback phải mang đúng ý nghĩa nghiệp vụ, không che mất lỗi.
+
+### Vì sao firstValueFrom hoặc lastValueFrom không resolve?
+
+`firstValueFrom` resolve khi có value đầu và unsubscribe ngay; `lastValueFrom` chờ complete để lấy value cuối. Cả hai reject bằng `EmptyError` nếu nguồn complete mà chưa phát value, trừ khi bạn cung cấp `defaultValue`. Nếu nguồn error, Promise reject với lỗi đó.
+
+Với nguồn không phát cũng không complete, cả hai có thể chờ vô hạn. Với nguồn phát liên tục nhưng không complete, `lastValueFrom` vẫn chờ. Dùng giới hạn phù hợp thay vì chỉ thêm `await`:
+
+```ts
+import { firstValueFrom, NEVER, timeout } from 'rxjs';
+
+async function readOnce() {
+  try {
+    return await firstValueFrom(
+      NEVER.pipe(timeout({ first: 2000 })), // Deadline minh họa: 2 giây.
+    );
+  } catch {
+    console.error('Nguồn lỗi, không có value hoặc quá deadline');
+    return null;
+  }
+}
+
+void readOnce(); // Sau deadline, timeout gây rejection và được xử lý.
+```
+
+`take(1)` chỉ giới hạn số emission, không giới hạn thời gian chờ emission đầu. `defaultValue` cũng chỉ xử lý complete rỗng, không xử lý nguồn im lặng mãi. Nếu chỉ cần một kết quả, mình chọn `firstValueFrom`; chỉ chọn `lastValueFrom` khi complete là một phần rõ ràng của contract. `toPromise()` đã deprecated trong RxJS 7, không nên dùng cho code mới.
+
+## Subject và replay cache
+
+### Vì sao Subject làm mất giá trị còn BehaviorSubject phát ngay?
+
+`Subject` không giữ lịch sử; subscriber chỉ nhận `next` sau khi đã subscribe. `BehaviorSubject` cần initial value và gửi value hiện tại ngay khi subscriber đang được đăng ký vào Subject còn hoạt động. `ReplaySubject(1)` giữ tối đa một value đã phát mà không bắt bạn tạo initial value giả.
+
+Mình chọn `Subject` cho event không cần phát lại, `BehaviorSubject` cho state có initial value hợp lệ và `ReplaySubject(1)` khi cần snapshot nhưng chưa có dữ liệu ban đầu. Đổi mọi event sang replay có thể khiến consumer mới xử lý lại click hoặc lệnh ghi cũ.
+
+Phân biệt thêm lifecycle: subscriber đến sau khi `BehaviorSubject` đã complete chỉ nhận complete, không nhận value cuối; `ReplaySubject` có thể replay buffer rồi gửi terminal notification. Sau error hoặc complete, gọi `next` không khởi động lại Subject; cần instance hoặc workflow mới nếu muốn tiếp tục.
+
+Nếu bạn bỏ lỡ emission trước subscription, thêm `shareReplay` sau một hot source cũng không lấy lại quá khứ mà nó chưa quan sát. Xem [Mất emission](/docs/troubleshooting/mat-emission) để xác định giá trị mất trước subscribe hay bị operator bỏ qua.
+
+### ShareReplay có tự refresh và giải phóng cache không?
+
+Không. `shareReplay` chia sẻ subscription và replay value đã quan sát, không tự hiểu TTL nghiệp vụ, logout hoặc dữ liệu server đã thay đổi. Trong RxJS 7.8.2, policy của nó là:
+
+| Tình huống | Hành vi |
+| --- | --- |
+| Nguồn error | Reset replay state; subscriber mới có thể tạo execution mới |
+| Nguồn complete thành công | Không reset; instance có thể replay snapshot đã buffer cho reader mới |
+| Reader cuối rời khi nguồn chưa kết thúc, `refCount: true` | Unsubscribe upstream và reset replay state |
+| Reader cuối rời, `refCount: false` | Không ngắt nguồn chỉ vì ref count về zero |
+
+`shareReplay(1)` mặc định dùng `refCount: false`, không tương đương với `shareReplay({ bufferSize: 1, refCount: true })`. Với nguồn vô hạn, kiểu shorthand có thể giữ timer hoặc connection chạy dù không còn consumer. Với nguồn hữu hạn đã complete, `refCount: true` cũng không tự xóa snapshot đã cache.
+
+`windowTime` giới hạn tuổi của value được replay; nó không lên lịch refetch. Khi buffer của nguồn đã complete hết hạn, subscriber mới có thể chỉ nhận complete rỗng thay vì một request mới. Muốn refresh, bạn cần trigger tải lại, invalidation hoặc cơ chế tạo execution mới có chủ đích.
+
+<Callout type="warn" title="Một value chưa đồng nghĩa với nguồn đã complete">
+  `take(1)` và `firstValueFrom` rời ngay sau value đầu. Nếu đó là consumer cuối và nguồn chưa complete tới `shareReplay`, `refCount: true` có thể reset connection và buffer. Lần đọc kế tiếp có thể tải lại. Test đúng loại consumer thực tế, không suy ra cache chỉ từ việc bạn đã nhìn thấy response.
+</Callout>
+
+Chọn `bufferSize`, `refCount`, scope và invalidation tường minh. Không giữ dữ liệu user trong singleton chung trên SSR; logout hoặc đổi tài khoản phải bỏ scope cũ. Xem [shareReplay và stale cache](/docs/troubleshooting/share-replay-stale-cache) và [Cache dữ liệu](/docs/patterns-production/cache-data).
+
+### Vì sao distinctUntilChanged bỏ qua hoặc không chặn object?
+
+Mặc định, `distinctUntilChanged` so sánh value liên tiếp bằng `===`, không so sánh sâu. Hai object mới có cùng field vẫn khác reference nên đều đi qua; mutate rồi phát lại cùng object có thể bị chặn dù field đã đổi.
+
+```ts
+import { distinctUntilChanged, of } from 'rxjs';
+
+of(
+  { id: 1, name: 'A' },
+  { id: 1, name: 'A' },
+  { id: 1, name: 'B' },
+).pipe(
+  distinctUntilChanged((previous, current) =>
+    previous.id === current.id && previous.name === current.name,
+  ),
+).subscribe(console.log); // Chỉ object A đầu và object B.
+```
+
+Giữ state immutable và so sánh những field thực sự ảnh hưởng downstream. Nếu cả value trước và sau trỏ đến một object bị mutate, comparator đọc field cũng không khôi phục được snapshot cũ. Khi cần key primitive, hãy `map` sang key trước khi deduplicate.
+
+Operator này chỉ nhớ value được phát gần nhất, không lưu tập hợp mọi value từng thấy: `A → B → A` vẫn phát cả ba. Với nút refresh, cùng ID vẫn có thể là yêu cầu tải mới; đừng chặn nó chỉ vì key tài nguyên không đổi.
+
+## Checklist trước khi đổi operator
+
+- [ ] Đã xác định cold hay hot, đồng bộ hay bất đồng bộ, và thời điểm subscribe.
+- [ ] Đã đếm subscription upstream, không nhầm số consumer nhận value với số request.
+- [ ] Đã tìm ranh giới đầu tiên làm mất value bằng `tap` trong pipeline hiện có.
+- [ ] Đã ghi nhận `next`, `error`, `complete` và `finalize` để phân biệt lỗi với cancellation.
+- [ ] Đã kiểm tra notifier thực sự phát và teardown bao phủ inner đang chạy.
+- [ ] Đã xác định error nên kết thúc một request hay toàn workflow.
+- [ ] Đã kiểm tra điều kiện phát và complete của từng input khi ghép stream.
+- [ ] Đã có deadline cho thao tác chờ có khả năng im lặng mãi.
+- [ ] Đã test reader đến muộn, reader rời sớm và invalidation của cache.
+
+Chọn một tình huống đang lỗi, viết ra số execution và notifications bạn mong đợi, rồi khóa hành vi bằng test. Với lỗi timing, dùng `TestScheduler` để assert cả output lẫn subscription; với HTTP cancellation, bổ sung kiểm tra adapter thật vì marble test không chứng minh server đã dừng xử lý.
+
+## Đọc tiếp
+
+<Cards>
+  <Card title="Mất emission" href="/docs/troubleshooting/mat-emission" description="Tìm giá trị mất trước subscribe, sau operator hay sau teardown." />
+  <Card title="Memory leak" href="/docs/troubleshooting/memory-leak" description="Xác định owner và cleanup của subscription cùng tài nguyên." />
+  <Card title="Request trùng lặp" href="/docs/troubleshooting/request-trung-lap" description="Phân biệt nhiều execution, nhiều trigger và lifecycle framework." />
+  <Card title="shareReplay và stale cache" href="/docs/troubleshooting/share-replay-stale-cache" description="Điều tra snapshot cũ và reset policy." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm chứng timing và subscription bằng virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [Observable](https://rxjs.dev/guide/observable) và [Subscription](https://rxjs.dev/guide/subscription) — execution, notifications và unsubscribe.
+- [takeUntil](https://rxjs.dev/api/operators/takeUntil) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/takeUntil.ts) — notifier phát value khác với notifier complete.
+- [catchError](https://rxjs.dev/api/operators/catchError) và [retry](https://rxjs.dev/api/operators/retry) — thay execution lỗi và resubscribe upstream.
+- [combineLatest](https://rxjs.dev/api/index/function/combineLatest), [withLatestFrom](https://rxjs.dev/api/operators/withLatestFrom) và [forkJoin](https://rxjs.dev/api/index/function/forkJoin) — điều kiện phát của stream kết hợp.
+- [firstValueFrom](https://rxjs.dev/api/index/function/firstValueFrom) và [lastValueFrom](https://rxjs.dev/api/index/function/lastValueFrom) — value đầu, value cuối và nguy cơ Promise không kết thúc.
+- [shareReplay implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — cấu hình `refCount` và reset policy.
+- [distinctUntilChanged](https://rxjs.dev/api/operators/distinctUntilChanged) — comparator và so sánh các value liên tiếp.

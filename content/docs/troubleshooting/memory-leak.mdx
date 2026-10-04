@@ -3,8 +3,504 @@ title: Memory leak
 description: Tìm subscription hoặc resource không được giải phóng.
 ---
 
-Trang này sẽ trình bày **Memory leak** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn rời dashboard nhưng timer vẫn tick, request vẫn chạy, hoặc mỗi lần quay lại một thao tác lại kích hoạt thêm một callback. Nếu heap cũng tăng sau mỗi vòng mở và đóng màn hình, đừng vội thêm `unsubscribe()` vào mọi chỗ: trước hết cần biết **ai đang giữ tài nguyên sống lâu hơn chủ sở hữu của nó**.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Trang này đi từ triệu chứng đến bằng chứng, rồi sửa đúng đường cleanup. Một subscription chưa đóng là đầu mối đáng kiểm tra, nhưng không phải mọi memory leak đều đến từ subscription; cache, closure và queue cũng có thể giữ dữ liệu dù stream đã complete.
+
+<Callout type="info" title="Phạm vi và điều kiện đọc">
+  Ví dụ dùng TypeScript và hành vi RxJS 7.8.2; các đoạn DOM và `fetch` chạy trong browser của ứng dụng đã có RxJS. Bạn cần biết `subscribe`, `Subject`, `switchMap` và teardown. Các ví dụ độc lập, không phải mã chạy trực tiếp trong site tài liệu. Khi đổi major version, kiểm tra lại policy của `shareReplay`.
 </Callout>
+
+## Mục lục
+
+- [Phân biệt leak với heap tăng tạm thời](#phân-biệt-leak-với-heap-tăng-tạm-thời)
+- [Ai còn giữ màn hình đã đóng](#ai-còn-giữ-màn-hình-đã-đóng)
+- [Quy trình chẩn đoán](#quy-trình-chẩn-đoán)
+  - [Chốt kịch bản và baseline](#chốt-kịch-bản-và-baseline)
+  - [Đếm subscription và resource](#đếm-subscription-và-resource)
+  - [Tìm retaining path trong heap snapshot](#tìm-retaining-path-trong-heap-snapshot)
+- [Gắn subscription với owner](#gắn-subscription-với-owner)
+  - [Trả hàm dispose từ nơi tạo subscription](#trả-hàm-dispose-từ-nơi-tạo-subscription)
+  - [Notifier phải phát giá trị](#notifier-phải-phát-giá-trị)
+  - [Đặt lifecycle boundary sau flattening](#đặt-lifecycle-boundary-sau-flattening)
+  - [Không để nested subscribe tách khỏi cleanup](#không-để-nested-subscribe-tách-khỏi-cleanup)
+- [Producer phải giải phóng resource thật](#producer-phải-giải-phóng-resource-thật)
+  - [Timer và event listener cần teardown](#timer-và-event-listener-cần-teardown)
+  - [Unsubscribe không tự hủy Promise](#unsubscribe-không-tự-hủy-promise)
+- [Stream đã đóng nhưng dữ liệu vẫn bị giữ](#stream-đã-đóng-nhưng-dữ-liệu-vẫn-bị-giữ)
+  - [Kiểm tra sharing và replay cache](#kiểm-tra-sharing-và-replay-cache)
+  - [Giới hạn history và queue](#giới-hạn-history-và-queue)
+- [Kiểm thử cleanup thay vì chỉ kiểm thử output](#kiểm-thử-cleanup-thay-vì-chỉ-kiểm-thử-output)
+  - [Assert subscription window của inner](#assert-subscription-window-của-inner)
+  - [Assert teardown của producer](#assert-teardown-của-producer)
+- [Checklist xác nhận đã sửa](#checklist-xác-nhận-đã-sửa)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Phân biệt leak với heap tăng tạm thời
+
+Heap tăng khi tải dữ liệu chưa đủ để kết luận leak. JavaScript tạo object mới trong lúc xử lý; garbage collector thu hồi object khi chúng không còn reachable, chứ không nhất thiết thu hồi ngay khi bạn rời trang. Điều đáng kiểm tra là số object hoặc retained memory còn lại sau nhiều vòng tương đương và sau GC trong môi trường chẩn đoán.
+
+| Triệu chứng | Giả thuyết | Bằng chứng cần lấy |
+| --- | --- | --- |
+| Heap tăng lúc render rồi giảm lại | Allocation bình thường hoặc allocation quá nhiều | Performance recording và allocation profile |
+| Sau mỗi vòng mở/đóng, object của màn hình cũ tăng | Reference không được giải phóng | Heap snapshot và retaining path |
+| Rời trang vẫn có timer, listener hoặc connection | Resource sống quá vòng đời owner | Số resource trước/sau dispose và log teardown |
+| Callback chạy lặp nhiều lần sau mỗi lần mount | Subscription/listener bị đăng ký thêm mà không gỡ | Đếm setup/cleanup; một thao tác phải có số callback đúng dự kiến |
+| Subscription đã đóng nhưng payload lớn vẫn tồn tại | Replay buffer, state, `Map` hoặc closure còn giữ dữ liệu | Snapshot đi về cache/service/registry |
+| Heap tăng khi input nhanh hơn xử lý | Queue/history không có bound | Queue depth, số item giữ lại và tuổi item chờ |
+
+Resource leak và memory leak có thể đi cùng nhau nhưng không đồng nghĩa. Một timer chạy mãi có thể giữ rất ít RAM mà vẫn lãng phí CPU; một cache không chạy công việc gì vẫn có thể giữ cả dataset lớn. Vì thế cần kiểm tra cả tài nguyên đang hoạt động lẫn dữ liệu còn được giữ.
+
+<Callout type="warn" title="Không dùng một con số heap làm kết luận">
+  Heap có thể dao động vì GC, warm-up và cache hợp lệ. So sánh cùng kịch bản sau giai đoạn yên; không yêu cầu số byte khớp tuyệt đối. Với Node.js, RSS còn bao gồm bộ nhớ ngoài JS heap, nên cần xem riêng heap, external memory và Buffer.
+</Callout>
+
+## Ai còn giữ màn hình đã đóng
+
+Giả sử một service sống suốt ứng dụng có `Subject`. Mỗi lần mở màn hình, bạn subscribe bằng callback truy cập DOM hoặc state của màn hình đó. Nếu không đóng subscription, service vẫn giữ observer; observer giữ callback; callback giữ state và DOM.
+
+```text
+Service sống lâu / GC root
+  └─ Subject
+      └─ observer đang đăng ký
+          └─ callback và closure
+              └─ state / DOM của màn hình đã đóng
+```
+
+Đường này là một **retaining path**: chuỗi reference khiến object còn reachable. `unsubscribe()` gỡ subscription này khỏi Subject và chạy teardown liên quan. Nhưng nếu một registry khác vẫn giữ callback hoặc DOM, bạn còn phải cắt đường đó nữa.
+
+Garbage collector xử lý được vòng tham chiếu không còn reachable. Một Subject và observer chỉ tham chiếu lẫn nhau, không có đường từ GC root tới chúng, không tự trở thành leak chỉ vì subscription chưa đóng. Ngược lại, timer và listener trên `window` thường có nguồn giữ reference sống lâu.
+
+Mình mặc định đặt owner rõ ràng cho mỗi subscription/resource: màn hình, component, request hay service. Owner sống đến đâu thì cleanup của resource riêng thuộc owner phải chạy đến đó. Resource shared có thể sống lâu hơn một màn hình, nhưng cần policy riêng, không phải ngoại lệ không có cleanup.
+
+## Quy trình chẩn đoán
+
+### Chốt kịch bản và baseline
+
+1. Chọn một màn hình có triệu chứng rõ. Ghi thao tác tái hiện: mở màn hình → kích hoạt polling/listener → rời màn hình → chờ công việc kết thúc hoặc bị hủy.
+2. Warm-up bằng cùng kịch bản để giảm nhiễu từ tải module và cache khởi tạo. Sau đó lấy baseline khi màn hình chưa mở.
+3. Lặp lại một số vòng cố định, chẳng hạn 10 vòng minh họa. Giữ lượng dữ liệu, thao tác và thời gian chờ giống nhau khi so sánh trước/sau sửa.
+4. Ghi số callback, execution upstream, timer/listener/connection đang hoạt động và object còn lại sau mỗi đợt. Resource shared hợp lệ phải được ghi riêng với scope của nó.
+
+Nếu lỗi xuất hiện trong development, kiểm tra cả chế độ chạy tương đương production khi có thể. React Strict Mode có thể chạy thêm chu kỳ setup/cleanup của Effect trong development; hai lần setup không tự chứng minh leak. Sau cleanup, số resource còn sống mới là tín hiệu cần xem.
+
+### Đếm subscription và resource
+
+Bọc source bằng `defer` để đếm mỗi execution, dùng `finalize` để trừ khi execution kết thúc. Ví dụ browser dưới đây tạo listener riêng theo vòng đời màn hình:
+
+```ts
+import { defer, finalize, fromEvent } from 'rxjs';
+
+let activeResizeExecutions = 0;
+
+const resize$ = defer(() => {
+  activeResizeExecutions += 1;
+  console.debug('resize:start', activeResizeExecutions);
+
+  return fromEvent(window, 'resize').pipe(
+    finalize(() => {
+      activeResizeExecutions -= 1;
+      console.debug('resize:end', activeResizeExecutions);
+    }),
+  );
+});
+
+function mountResizeLabel(label: HTMLElement): () => void {
+  const subscription = resize$.subscribe(() => {
+    label.textContent = String(window.innerWidth);
+  });
+
+  return () => subscription.unsubscribe();
+}
+```
+
+Caller phải gọi hàm dispose khi unmount. Nếu không có consumer khác, số execution trở về baseline sau dispose. Với `fromEvent`, teardown gỡ listener đã đăng ký; với producer tự viết, bạn phải kiểm tra cleanup của chính producer.
+
+`finalize` chạy khi complete, error **hoặc unsubscribe**, nên log `end` không chứng minh công việc thành công. Nếu có `shareReplay`, đặt bộ đếm **trước sharing** để đếm upstream, và bộ đếm sau sharing nếu cần đếm từng consumer. Một consumer kết thúc không có nghĩa upstream shared đã dừng.
+
+Chỉ log số lượng hoặc ID nhỏ khi chẩn đoán. Log cả component, DOM hoặc payload lớn có thể khiến DevTools giữ reference và làm nhiễu kết quả.
+
+### Tìm retaining path trong heap snapshot
+
+Trong Chrome DevTools, dùng **Memory → Heap snapshot** để tìm object còn bị giữ. Tên mục có thể khác đôi chút giữa các phiên bản Chrome, nhưng quy trình giữ nguyên:
+
+1. Khi ứng dụng đã warm-up và về trạng thái yên, dùng **Collect garbage** trong môi trường chẩn đoán rồi lấy snapshot A.
+2. Chạy các vòng mở/đóng đã chốt, chờ teardown và công việc hữu hạn kết thúc; thu gom rác rồi lấy snapshot B.
+3. Dùng chế độ Comparison để tìm loại object tăng. Tìm `Detached` nếu nghi DOM đã bị gỡ khỏi document nhưng còn reference JavaScript.
+4. Chọn một object đáng lẽ thuộc màn hình đã đóng. Xem **Retainers** và lần theo reference về timer, event target, Subject, replay buffer, singleton `Map` hay registry.
+5. Ghi lại đường giữ object và vị trí code tạo reference. Sửa một giả thuyết rồi chạy lại cùng kịch bản, lấy snapshot mới.
+
+Shallow size là phần bộ nhớ của chính object; retained size bao gồm phần có thể được giải phóng nếu object đó không còn giữ các object phía sau. Một closure nhỏ có thể giữ dataset lớn, nên đừng chỉ lọc object có shallow size cao. Dùng allocation sampling/instrumentation khi cần biết code **tạo** object ở đâu; retaining path trả lời câu hỏi khác: ai **còn giữ** nó.
+
+<Callout type="warn" title="Loại reference do công cụ debug tạo ra">
+  Bỏ biến global dùng để debug, object đang inspect và log object không cần thiết khỏi kịch bản. Một detached node không tự chứng minh leak: nó có thể là cache DOM có chủ đích. Hãy kiểm tra số node tăng qua các vòng và policy giữ nó.
+</Callout>
+
+## Gắn subscription với owner
+
+### Trả hàm dispose từ nơi tạo subscription
+
+Với một nhóm subscription của màn hình, `Subscription` cha giúp gom cleanup vào một chỗ. Ví dụ này không dùng framework; lifecycle hook của ứng dụng chỉ cần gọi hàm được trả về:
+
+```ts
+import { fromEvent, interval, Subscription } from 'rxjs';
+
+function mountPanel(panel: HTMLElement): () => void {
+  const owner = new Subscription();
+
+  owner.add(
+    interval(1000).subscribe((tick) => {
+      panel.textContent = `Tick ${tick}`;
+    }),
+  );
+
+  owner.add(
+    fromEvent(window, 'resize').subscribe(() => {
+      panel.style.width = `${window.innerWidth}px`;
+    }),
+  );
+
+  return () => owner.unsubscribe();
+}
+```
+
+`unsubscribe()` trên cha đóng các subscription được thêm vào. Tạo owner mới cho mỗi lần mount, không tái dùng owner đã đóng. Cách này phù hợp khi caller sở hữu toàn bộ scope; nếu framework có primitive gắn subscription với lifecycle, ưu tiên primitive đó và hiểu phạm vi nó quản lý.
+
+Một stream hữu hạn như `of(...)` tự teardown khi complete; không cần giữ subscription chỉ để unsubscribe sau khi nó đã đóng. Nhưng “request cuối cùng sẽ xong” không đủ cho callback giữ DOM của màn hình đã rời đi hoặc producer có thể không kết thúc. Với công việc thuộc màn hình, cleanup sớm vẫn có ý nghĩa.
+
+### Notifier phải phát giá trị
+
+Nếu nhiều pipeline cùng dừng khi owner bị dispose, dùng `takeUntil`. Điểm hay bị bỏ sót: notifier phải **emit**, không chỉ complete.
+
+```ts
+import { fromEvent, Subject, takeUntil } from 'rxjs';
+
+function mountPointerLabel(label: HTMLElement): () => void {
+  const destroy$ = new Subject<void>();
+
+  fromEvent<PointerEvent>(window, 'pointermove').pipe(
+    takeUntil(destroy$),
+  ).subscribe((event) => {
+    label.textContent = `${event.clientX}, ${event.clientY}`;
+  });
+
+  return () => {
+    destroy$.next(); // Phát tín hiệu để takeUntil đóng pipeline.
+    destroy$.complete(); // Kết thúc chính notifier sau khi đã phát.
+  };
+}
+```
+
+Chỉ gọi `destroy$.complete()` không dừng source. `Subject` cũng không replay tín hiệu destroy: nếu tạo subscription mới sau dispose, subscription đó có thể vẫn chạy. Mẫu trên chỉ subscribe trong lúc mount; nếu có đường tạo subscription muộn, chặn nó bằng trạng thái owner hoặc dùng lifecycle primitive có hợp đồng phù hợp.
+
+Đừng thay bằng `takeWhile(() => alive)` chỉ để tránh notifier. Predicate chỉ được kiểm tra khi source emit; đổi `alive = false` không lập tức đóng một source đang im lặng nhưng vẫn giữ listener/resource.
+
+`Subject.complete()` kết thúc observer của chính Subject đó, không tự đóng mọi subscription được tạo bên ngoài nó. Chủ sở hữu vẫn phải dispose các resource riêng.
+
+### Đặt lifecycle boundary sau flattening
+
+Hai pipeline dưới đây khác nhau ở một vị trí nhưng có lifecycle khác nhau:
+
+```ts
+// Sai nếu mục tiêu là hủy cả inner khi owner bị dispose:
+outer$.pipe(
+  takeUntil(destroy$),
+  switchMap(() => inner$),
+);
+
+// Đúng cho mục tiêu đó:
+outer$.pipe(
+  switchMap(() => inner$),
+  takeUntil(destroy$),
+);
+```
+
+Ở bản đầu, `takeUntil` complete đầu vào của `switchMap`. Nhưng `switchMap` chờ inner hiện tại complete; outer complete không phải lệnh hủy inner. Nếu inner là polling vô hạn, output có thể không bao giờ complete.
+
+Đọc hai sơ đồ theo cột dọc. Outer phát `a` ở frame 0, inner phát `x`, `y`, `z` ở frame 1, 3, 5 và complete ở frame 9; destroy phát `d` ở frame 4. Hàng `inner sub` là cửa sổ subscription, không phải emission.
+
+<MarbleDiagram
+  title="takeUntil(destroy$) → switchMap"
+  rows={[
+    { label: 'outer', marble: 'a--------|', kind: 'source' },
+    { label: 'destroy', marble: '----d----|', kind: 'source' },
+    { label: 'inner', marble: '-x-y-z---|', kind: 'inner' },
+    { label: 'inner sub', marble: '^--------!', kind: 'subscription' },
+    { label: 'output', marble: '-x-y-z---|', kind: 'output' },
+  ]}
+  values={{ a: 'trigger mở inner', d: 'owner dispose', x: 'value đầu', y: 'value thứ hai', z: 'value sau dispose' }}
+  caption="Outer subscription dừng ở frame 4 nhưng inner vẫn chạy tới frame 9; output còn nhận z sau dispose."
+/>
+
+<MarbleDiagram
+  title="switchMap → takeUntil(destroy$)"
+  rows={[
+    { label: 'outer', marble: 'a--------|', kind: 'source' },
+    { label: 'destroy', marble: '----d----|', kind: 'source' },
+    { label: 'inner', marble: '-x-y!', kind: 'inner' },
+    { label: 'inner sub', marble: '^---!', kind: 'subscription' },
+    { label: 'output', marble: '-x-y|', kind: 'output' },
+  ]}
+  values={{ a: 'trigger mở inner', d: 'owner dispose', x: 'value đầu', y: 'value thứ hai' }}
+  caption="Output complete ở frame 4, teardown hủy inner ở cùng frame nên z không được phát xuống."
+/>
+
+Hàng outer biểu diễn source có sẵn, không có nghĩa pipeline tiếp tục subscribe tới frame 9. Cả hai bản đều unsubscribe outer ở frame 4; khác biệt nằm ở inner. Ở bản đúng, inner kết thúc bằng `!` vì bị hủy; output kết thúc bằng `|` vì `takeUntil` gửi complete xuống consumer. Gọi trực tiếp `subscription.unsubscribe()` thì không gửi callback `complete` cho consumer.
+
+Mình đặt boundary hủy của owner sau các operator tạo inner hoặc resubscribe, như `switchMap`, `mergeMap`, `concatMap`, `exhaustMap`, `retry` và `repeat`, để chúng không tạo công việc sống qua owner. Đây không phải luật “mọi `takeUntil` phải là operator cuối”: `tap`/`finalize` có thể ở sau, và mỗi inner vẫn có thể có timeout/boundary riêng. Nếu inner trả về stream shared, việc đóng subscription này cũng không bảo đảm dừng producer shared; cần kiểm tra policy sharing.
+
+### Không để nested subscribe tách khỏi cleanup
+
+Subscription được tạo thủ công bên trong callback không tự thuộc subscription bên ngoài:
+
+```ts
+// Unsubscribe outer không tự unsubscribe subscription của interval.
+const outerSubscription = fromEvent(button, 'click').subscribe(() => {
+  interval(1000).subscribe(renderTick);
+});
+```
+
+Mỗi click ở đây tạo thêm một timer. Nếu ý nghĩa là “click mới thay timer cũ”, compose bằng `switchMap` và trả cleanup của subscription cuối:
+
+```ts
+import { fromEvent, interval, switchMap } from 'rxjs';
+
+function mountTicker(
+  button: HTMLButtonElement,
+  renderTick: (tick: number) => void,
+): () => void {
+  const subscription = fromEvent(button, 'click').pipe(
+    switchMap(() => interval(1000)),
+  ).subscribe(renderTick);
+
+  return () => subscription.unsubscribe();
+}
+```
+
+Nếu nghiệp vụ cần các công việc chạy đồng thời hoặc theo thứ tự, chọn `mergeMap`/`concatMap` thay vì đổi nghĩa thành “mới thay cũ”. Composition gắn inner với cây subscription; policy concurrency và queue vẫn cần được thiết kế riêng.
+
+## Producer phải giải phóng resource thật
+
+### Timer và event listener cần teardown
+
+Dừng notification chưa chắc dừng công việc. Một custom Observable có thể vẫn gọi timer sau unsubscribe nếu không trả teardown:
+
+```ts
+import { Observable } from 'rxjs';
+
+const clock$ = new Observable<number>((subscriber) => {
+  const timer = setInterval(() => {
+    subscriber.next(Date.now());
+  }, 1000);
+
+  // Nếu bỏ return này, timer vẫn chạy khi subscriber đã closed.
+  return () => clearInterval(timer);
+});
+```
+
+RxJS chạy teardown khi subscription đóng do complete, error hoặc unsubscribe. Với `fromEvent`, thư viện đã quản lý add/remove listener. Nếu tự bọc API khác, resource nào được acquire thì phải có đường release tương ứng:
+
+| Resource được tạo | Cleanup cần có |
+| --- | --- |
+| `setInterval` / `setTimeout` | `clearInterval` / `clearTimeout` |
+| `addEventListener` | `removeEventListener` với đúng callback và capture |
+| `MutationObserver` / `ResizeObserver` | `disconnect()` |
+| Fetch thuộc riêng execution | `AbortController.abort()` |
+| Socket/worker thuộc riêng owner | `close()` / `terminate()` theo API |
+| Callback đăng ký trong registry | Unregister/xóa entry và reference không cần nữa |
+
+Nếu socket hoặc worker dùng chung, consumer chỉ nên gỡ phần subscription/listener của mình. Việc đóng resource shared phải do owner của resource quyết định; cleanup một màn hình không được làm hỏng màn hình còn lại.
+
+`finalize(() => log())` chỉ thêm log, không tự gọi `clearInterval` hay `close`. Tốt nhất đặt cleanup ngay trong producer, nơi biết resource nào được tạo, thay vì bắt mọi consumer nhớ chi tiết đó.
+
+### Unsubscribe không tự hủy Promise
+
+`from(fetch(url))` nhận một Promise đã bắt đầu chạy. Unsubscribe có thể ngăn value đi xuống subscriber đã đóng, nhưng không tự abort fetch. Nếu request thuộc owner và cần hủy thật, gắn abort vào teardown:
+
+```ts
+import { Observable } from 'rxjs';
+
+function fetchJson<T>(url: string): Observable<T> {
+  return new Observable<T>((subscriber) => {
+    const controller = new AbortController();
+
+    void fetch(url, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return response.json() as Promise<T>;
+      })
+      .then((data) => {
+        if (subscriber.closed) return;
+        subscriber.next(data);
+        subscriber.complete();
+      })
+      .catch((error: unknown) => {
+        if (!subscriber.closed) subscriber.error(error);
+      });
+
+    return () => controller.abort();
+  });
+}
+```
+
+Mỗi subscription tạo một controller/request mới. Cleanup abort cả khi body đang được đọc; catch xử lý rejection do abort nhưng không báo error xuống subscriber đã đóng. `T` ở đây chỉ là kiểu TypeScript, không validate JSON runtime.
+
+Producer vẫn cần xử lý rejection sau cancellation để tránh unhandled rejection. Ngoài ra, abort phía client không bảo đảm server chưa xử lý write; đừng dùng cancellation thay cho idempotency hoặc kiểm tra trạng thái nghiệp vụ.
+
+## Stream đã đóng nhưng dữ liệu vẫn bị giữ
+
+### Kiểm tra sharing và replay cache
+
+Với RxJS 7.8.2, `shareReplay(1)` mặc định `refCount: false`. Một source vô hạn có thể tiếp tục chạy dù consumer cuối đã unsubscribe. Với stream chỉ cần sống trong lúc có consumer, ghi policy rõ ràng:
+
+```ts
+import { interval, shareReplay } from 'rxjs';
+
+const sharedClock$ = interval(1000).pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+```
+
+Khi consumer cuối rời đi và source **chưa complete**, `refCount: true` teardown upstream và reset replay state. Nếu vẫn còn consumer khác, upstream tiếp tục chạy là đúng policy, không phải bằng chứng leak.
+
+<Callout type="warn" title="refCount không phải nút xóa mọi cache">
+  `shareReplay` trong RxJS 7.8.2 giữ replay state sau khi source complete thành công (`resetOnComplete: false`). Khi shared Observable còn reachable từ service hoặc registry, payload đã cache có thể vẫn còn đó dù không có consumer. `refCount: true` không tự xóa cache đã complete.
+</Callout>
+
+Cần kiểm tra hai câu hỏi riêng: upstream còn hoạt động không, và buffer còn giữ dữ liệu không. Với completed request cache, định nghĩa scope, invalidation và eviction; nếu dùng `share` với `ReplaySubject` cùng policy reset tùy chỉnh, kiểm thử cả consumer đến muộn và trường hợp refCount về zero.
+
+`ReplaySubject()` không truyền bound và `shareReplay()` không truyền buffer size mặc định có thể giữ lịch sử không giới hạn. Mình mặc định ghi `bufferSize` cụ thể và cache payload nhỏ nhất mà consumer cần. `bufferSize: 1` chỉ giới hạn **một value**, không giới hạn số byte: một value vẫn có thể là array rất lớn hoặc object giữ DOM.
+
+`BehaviorSubject` cũng giữ value hiện tại; complete không tự xóa value đó khi Subject vẫn reachable. Đừng dùng Subject làm nơi giữ component/DOM nếu state chỉ cần một ID hoặc dữ liệu nhỏ.
+
+`windowTime` giới hạn tính hợp lệ của value replay, không phải timer chủ động refresh request hay cam kết payload được thu hồi ngay khi hết hạn. Việc trim replay buffer diễn ra khi có hoạt động liên quan như next/subscribe; cache cần TTL/eviction thật phải có policy riêng.
+
+### Giới hạn history và queue
+
+Một history kiểu `scan((items, item) => [...items, item], [])` tăng mãi dù mọi subscription đều được cleanup đúng. Chỉ giữ lượng dữ liệu cần cho UI, hoặc chuyển history đầy đủ sang nơi lưu trữ phù hợp.
+
+| Nơi giữ dữ liệu | Câu hỏi cần trả lời | Hướng sửa |
+| --- | --- | --- |
+| `scan`, replay buffer, array history | Giữ tối đa bao nhiêu item, mỗi item lớn tới đâu? | Bound theo count/size hoặc chỉ giữ phần state cần dùng |
+| Cache `Map` trong singleton | Key nào bị xóa khi rời scope/đổi user? | Eviction, invalidation, TTL và giới hạn entry |
+| `concatMap` hoặc `mergeMap` có concurrency | Input có nhanh hơn tốc độ inner complete không? | Admission control, queue capacity hoặc policy bỏ input phù hợp |
+| Scheduled work/batch đang chờ | Có tạo task/batch nhanh hơn xử lý không? | Giảm tốc đầu vào và giới hạn lượng công việc pending |
+| Registry giữ disposer/callback | Entry có bị gỡ sau dispose không? | Unregister và xóa reference khỏi registry |
+
+`mergeMap(project, 4)` chỉ giới hạn số inner chạy đồng thời, không giới hạn queue input. `concatMap` cũng không tự tạo backpressure cho nguồn push; một inner không complete có thể khiến input phía sau tích lũy. Đổi sang `switchMap` chỉ đúng khi input mới thực sự thay thế input cũ, không phải để âm thầm bỏ job nghiệp vụ cần xử lý đủ.
+
+Nếu heap snapshot đi về queue thay vì observer đã bỏ quên, thêm `unsubscribe` khi rời màn hình chỉ chữa một phần. Bạn còn phải chọn chính sách quá tải trong thời gian owner đang sống.
+
+## Kiểm thử cleanup thay vì chỉ kiểm thử output
+
+### Assert subscription window của inner
+
+TestScheduler chứng minh cửa sổ subscription, không đo GC hay kiểm tra timer thật của browser. Test dưới đây đối chiếu trực tiếp hai marble ở trên; chạy trong môi trường test Node đã có RxJS:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { switchMap, takeUntil } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+function verifyLifecycle(boundaryAfterFlattening: boolean): void {
+  const scheduler = new TestScheduler((actual, expected) => {
+    deepStrictEqual(actual, expected);
+  });
+
+  scheduler.run(({ hot, cold, expectObservable, expectSubscriptions }) => {
+    const outer = hot('a--------|');
+    const inner = cold('-x-y-z---|');
+    const destroy = hot('----d----|');
+
+    const result = boundaryAfterFlattening
+      ? outer.pipe(switchMap(() => inner), takeUntil(destroy))
+      : outer.pipe(takeUntil(destroy), switchMap(() => inner));
+
+    expectObservable(result).toBe(
+      boundaryAfterFlattening ? '-x-y|' : '-x-y-z---|',
+    );
+    expectSubscriptions(outer.subscriptions).toBe('^---!');
+    expectSubscriptions(inner.subscriptions).toBe(
+      boundaryAfterFlattening ? '^---!' : '^--------!',
+    );
+  });
+}
+
+verifyLifecycle(false); // Chứng minh bản đặt boundary trước còn giữ inner.
+verifyLifecycle(true); // Chứng minh bản sau hủy cả inner ở frame 4.
+```
+
+Trong regression test của ứng dụng, giữ contract của bản đúng: inner phải unsubscribe tại frame destroy. Nếu sau này ai chuyển `takeUntil` lên trước `switchMap`, assertion subscription window phải fail, ngay cả khi test UI vẫn có vẻ đúng.
+
+### Assert teardown của producer
+
+Test bằng resource counter giúp kiểm tra hợp đồng cleanup mà không phụ thuộc GC. Ví dụ này là test đồng bộ về acquire/release, không phải phép đo bộ nhớ:
+
+```ts
+import { strictEqual } from 'node:assert/strict';
+import { Observable } from 'rxjs';
+
+let activeResources = 0;
+let releaseCalls = 0;
+
+const source$ = new Observable<void>(() => {
+  activeResources += 1;
+
+  return () => {
+    activeResources -= 1;
+    releaseCalls += 1;
+  };
+});
+
+const subscription = source$.subscribe();
+strictEqual(activeResources, 1);
+
+subscription.unsubscribe();
+subscription.unsubscribe();
+
+strictEqual(subscription.closed, true);
+strictEqual(activeResources, 0);
+strictEqual(releaseCalls, 1);
+```
+
+Với producer thật, spy vào `clearInterval`, `removeEventListener`, `abort`, `disconnect` hoặc `close`. Kiểm tra các đường unsubscribe, complete, error và dispose lặp; thêm trường hợp producer dừng sau khi vừa acquire resource nếu API có thể lỗi lúc setup.
+
+Với stream shared, test ít nhất hai consumer: consumer đầu rời đi không được dừng source của consumer còn lại; consumer cuối rời đi phải teardown theo policy. Test riêng source đã complete và subscriber đến muộn, vì completed replay cache có lifecycle khác live source.
+
+Sau unit test, vẫn chạy kịch bản mở/đóng màn hình và so snapshot. Output ngừng và counter về baseline chưa chứng minh không còn reference ở cache hoặc registry khác.
+
+## Checklist xác nhận đã sửa
+
+- [ ] Mỗi subscription/resource có owner và dispose hook thực sự được gọi.
+- [ ] Notifier destroy có emission; không chỉ complete và không có subscription mới sau dispose.
+- [ ] Boundary của owner đóng cả inner và không bị operator phía sau tạo execution mới.
+- [ ] Nested subscription đã được compose hoặc quản lý rõ trong cùng owner.
+- [ ] Producer trả teardown cho timer, listener, request, observer và connection thuộc riêng nó.
+- [ ] Đếm riêng consumer và upstream shared; live source dừng đúng policy khi consumer cuối rời đi.
+- [ ] Cache/replay/history có scope và bound; completed stream không giữ payload ngoài ý định.
+- [ ] Queue có capacity/overload policy, không nhầm concurrency với backpressure.
+- [ ] Regression test assert cả output, subscription window và lời gọi cleanup.
+- [ ] Cùng kịch bản sau sửa không còn tăng đều object của màn hình cũ sau GC; resource riêng trở về baseline.
+
+Nếu chưa đạt checklist, giữ snapshot và retaining path của một object cụ thể để điều tra tiếp. Bắt đầu từ owner đang giữ reference, không từ việc đổi operator ngẫu nhiên.
+
+## Nguồn tham khảo
+
+- [Chrome DevTools: Fix memory problems](https://developer.chrome.com/docs/devtools/memory-problems) — heap snapshot, detached DOM và allocation profile.
+- [RxJS 7.8.2: takeUntil](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/takeUntil.ts) — notifier next mới complete output; notifier complete riêng không dừng source.
+- [RxJS 7.8.2: switchMap](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/switchMap.ts) — outer complete chờ inner hiện tại kết thúc.
+- [RxJS 7.8.2: shareReplay](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — mặc định refCount, buffer size và policy giữ replay sau complete.
+- [RxJS 7.8.2: ReplaySubject](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/ReplaySubject.ts) — bound mặc định và thời điểm trim buffer.
+- [RxJS 7.8.2: mergeInternals](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/mergeInternals.ts) — queue input khi không còn slot concurrency.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Nắm hợp đồng acquire và cleanup của một execution." />
+  <Card title="Nested subscribe" href="/docs/troubleshooting/nested-subscribe" description="Đưa các inner về cùng cây subscription bằng composition." />
+  <Card title="shareReplay và stale cache" href="/docs/troubleshooting/share-replay-stale-cache" description="Tách lifecycle của consumer, upstream và replay cache." />
+  <Card title="Hiệu năng và bộ nhớ" href="/docs/patterns-production/performance-memory" description="Đo allocation, giảm execution thừa và thiết kế bound cho dữ liệu." />
+</Cards>

@@ -3,8 +3,465 @@ title: Observability
 description: Theo dõi pipeline, lỗi và latency trong production.
 ---
 
-Trang này sẽ trình bày **Observability** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Một màn hình cứ hiện loading, nhưng log không có lỗi. Request có thể vẫn đang chạy, đã bị `switchMap` hủy, hoặc đã lỗi rồi được `catchError` đổi thành dữ liệu rỗng. Nếu chỉ log trong `subscribe({ error })`, bạn không phân biệt được ba trường hợp này.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình mặc định đặt instrumentation ở **ranh giới operation**, chẳng hạn một lượt tải danh sách sản phẩm, thay vì thêm `console.log` vào mọi operator. Bài này giúp bạn chọn đúng ranh giới, đo lifecycle của subscription và nối kết quả đó với logs, metrics, traces mà không thay đổi hành vi nghiệp vụ.
+
+<Callout type="info" title="Phạm vi và kiến thức nền">
+  Ví dụ dùng RxJS 7.8.x và TypeScript, import trực tiếp từ `rxjs`. Bạn nên biết `defer`, `tap`, `finalize`, `retry`, `catchError` và unsubscribe. Instrumentation dưới đây độc lập với vendor; adapter xuất telemetry là phần ứng dụng cần cung cấp, không phải tính năng có sẵn của RxJS.
 </Callout>
+
+## Mục lục
+
+- [Chọn đơn vị quan sát](#chọn-đơn-vị-quan-sát)
+- [Logs metrics và traces trả lời câu hỏi nào](#logs-metrics-và-traces-trả-lời-câu-hỏi-nào)
+- [Phân biệt complete error và cancellation](#phân-biệt-complete-error-và-cancellation)
+- [Viết operator đo lifecycle](#viết-operator-đo-lifecycle)
+  - [State phải thuộc từng subscription](#state-phải-thuộc-từng-subscription)
+  - [Đọc đúng kết quả đo](#đọc-đúng-kết-quả-đo)
+- [Retry và fallback thay đổi ý nghĩa số liệu](#retry-và-fallback-thay-đổi-ý-nghĩa-số-liệu)
+  - [Đo attempt và logical operation riêng](#đo-attempt-và-logical-operation-riêng)
+  - [Đặt phép đo trước hay sau catchError](#đặt-phép-đo-trước-hay-sau-catcherror)
+- [Multicasting và cancellation](#multicasting-và-cancellation)
+- [Correlation và trace context](#correlation-và-trace-context)
+- [Kiểm soát dữ liệu và chi phí telemetry](#kiểm-soát-dữ-liệu-và-chi-phí-telemetry)
+- [Kiểm thử instrumentation](#kiểm-thử-instrumentation)
+- [Dashboard và cảnh báo](#dashboard-và-cảnh-báo)
+- [Runbook khi pipeline có vấn đề](#runbook-khi-pipeline-có-vấn-đề)
+- [Checklist trước khi đưa lên production](#checklist-trước-khi-đưa-lên-production)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Chọn đơn vị quan sát
+
+Một Observable là mô tả cách lấy dữ liệu; một subscription mới là một lần thực thi mô tả đó. Vì vậy, cùng biến `products$` có thể tạo hai request nếu có hai consumer subscribe vào cold Observable. Ngược lại, khi có `share`, hai consumer có thể dùng chung một upstream subscription.
+
+Trước khi đo, đặt tên cho thứ bạn muốn đếm:
+
+| Đơn vị | Ví dụ | Ranh giới phù hợp |
+| --- | --- | --- |
+| Attempt | Một lần gọi HTTP, chưa tính retry | Bên trong vùng mà `retry` sẽ subscribe lại |
+| Logical operation | Một lượt tải dữ liệu, gồm các attempt và thời gian chờ retry | Bao quanh cả chính sách retry |
+| Consumer subscription | Một component theo dõi dữ liệu đã share | Sau operator multicasting |
+| Business event | Một đơn hàng đã được backend xác nhận | Sự kiện nghiệp vụ rõ ràng, không suy ra từ `complete` |
+
+Ví dụ giả định: một lượt tải thất bại hai lần rồi thành công ở lần thứ ba. Bạn có ba attempt, nhưng chỉ một logical operation. Nếu dashboard gọi cả hai là “request”, error rate sẽ khó diễn giải.
+
+Instrumentation giống việc đặt camera ở cửa một phòng: camera thấy người đi qua cửa đó, không tự biết họ đã hoàn tất công việc trong phòng. Phép đo tại một operator cũng chỉ biết notifications và teardown đi qua ranh giới của nó; nó không chứng minh backend đã commit hay UI đã render.
+
+## Logs metrics và traces trả lời câu hỏi nào
+
+Ba loại tín hiệu bổ sung cho nhau, nhưng không nên mang cùng một lượng dữ liệu:
+
+| Tín hiệu | Câu hỏi | Dữ liệu nên giữ |
+| --- | --- | --- |
+| Structured logs | Lượt tải cụ thể này kết thúc thế nào? | Tên operation, outcome, duration, correlation ID và mã lỗi đã chuẩn hóa |
+| Metrics | Bao nhiêu lượt lỗi, latency phân bố ra sao? | Counter, histogram, gauge với tập label nhỏ và cố định |
+| Traces | Thời gian nằm ở HTTP, retry delay hay xử lý dữ liệu? | Parent span cho operation, child span cho từng attempt, attributes đã lọc |
+
+```text
+Operation boundary
+    ├── summary log  → tìm một lượt thực thi
+    ├── metrics      → nhìn xu hướng theo operation
+    └── trace spans  → lần theo các bước và dịch vụ
+```
+
+Mình ưu tiên một summary khi operation kết thúc, thay vì log toàn bộ `next`. Với request phát một response, summary thường đủ; với WebSocket phát liên tục, log mỗi emission có thể gây nghẽn chính hệ thống bạn đang cố quan sát.
+
+Trong môi trường browser, `console.log` chỉ là công cụ debug cục bộ, không phải kho log production. Adapter cần đưa bản ghi đã lọc vào SDK hoặc hàng đợi xuất telemetry có giới hạn. Không gửi dữ liệu nhạy cảm qua console rồi trông chờ collector phía sau xóa giúp.
+
+## Phân biệt complete error và cancellation
+
+`tap` quan sát notifications, còn `finalize` cho biết subscription đã đóng. Hai vai trò này khác nhau:
+
+| Sự kiện tại ranh giới đo | `tap` thấy gì? | `finalize` chạy? | Outcome kỹ thuật |
+| --- | --- | --- | --- |
+| Upstream complete | `complete` | Có | `complete` |
+| Upstream error | `error` | Có | `error` |
+| Downstream unsubscribe trước terminal notification | Không có `complete` hoặc `error` do unsubscribe tạo ra | Có | `cancelled` |
+
+Đọc theo cột dọc trong sơ đồ: subscription đóng trước khi source kịp phát `b`.
+
+<MarbleDiagram
+  title="tap + finalize"
+  rows={[
+    { label: 'source', marble: '-a---b-|', kind: 'source' },
+    { label: 'consumer', marble: '^---!', kind: 'subscription' },
+    { label: 'output', marble: '-a', kind: 'output' },
+  ]}
+  values={{ a: 'Giá trị đã nhận', b: 'Giá trị sẽ phát nếu còn subscribe' }}
+  caption="Consumer unsubscribe ở frame 4: finalize chạy, nhưng output không có complete hay error. Source là lịch phát dự kiến nếu không bị hủy."
+/>
+
+Ở frame 1, consumer nhận `a`. Đến frame 4, consumer unsubscribe nên `b` dự kiến ở frame 5 không đến output. Gọi trường hợp này là “thành công” chỉ vì finalizer chạy sẽ làm sai số liệu.
+
+<Callout type="warn" title="Complete không đồng nghĩa với thành công nghiệp vụ">
+  `EMPTY` complete mà không có dữ liệu. `catchError(() => of([]))` có thể complete sau một lỗi. Một response cũng có thể chứa kết quả nghiệp vụ bị từ chối. Đặt tên outcome là `complete`, không phải `success`, rồi đo business success bằng tín hiệu riêng.
+</Callout>
+
+`cancelled` ở đây có nghĩa hẹp: subscription kết thúc mà ranh giới đo chưa thấy terminal notification. Nó có thể do người dùng rời trang, `switchMap` thay inner, `take(1)` đóng upstream, hoặc consumer chủ động unsubscribe. RxJS không truyền sẵn lý do hủy vào `finalize`.
+
+## Viết operator đo lifecycle
+
+Operator dưới đây giữ nguyên giá trị và error của source. Nó chỉ đếm emissions, ghi thời gian đến `next` đầu tiên và xuất một summary khi subscription đóng.
+
+`TelemetrySink.record` là hợp đồng đồng bộ: nhận bản ghi rồi enqueue nhanh, không trả Promise và không chờ network. Sink phải xử lý lỗi export bất đồng bộ ở bên trong adapter. `now` là clock monotonic đáng tin cậy; mặc định dùng `performance.now()` trong runtime có API này.
+
+```ts
+import { defer, finalize, tap } from 'rxjs';
+import type { MonoTypeOperatorFunction } from 'rxjs';
+
+export type Outcome = 'complete' | 'error' | 'cancelled';
+
+export type OperationSummary = {
+  operation: string;
+  outcome: Outcome;
+  durationMs: number;
+  firstNextMs: number | null;
+  nextCount: number;
+};
+
+export interface TelemetrySink {
+  record(summary: OperationSummary): void;
+}
+
+export function observeOperation<T>(
+  operation: string,
+  sink: TelemetrySink,
+  now: () => number = () => performance.now(),
+): MonoTypeOperatorFunction<T> {
+  return (source) =>
+    defer(() => {
+      const startedAt = now();
+      let outcome: Outcome = 'cancelled';
+      let firstNextMs: number | null = null;
+      let nextCount = 0;
+
+      return source.pipe(
+        tap({
+          next: () => {
+            nextCount += 1;
+            if (firstNextMs === null) {
+              firstNextMs = now() - startedAt;
+            }
+          },
+          error: () => {
+            outcome = 'error';
+          },
+          complete: () => {
+            outcome = 'complete';
+          },
+        }),
+        finalize(() => {
+          const summary: OperationSummary = {
+            operation,
+            outcome,
+            durationMs: now() - startedAt,
+            firstNextMs,
+            nextCount,
+          };
+
+          try {
+            sink.record(summary);
+          } catch {
+            // Chỉ cách ly lỗi telemetry, không nuốt lỗi của source.
+            // Adapter production cần theo dõi dropped records riêng.
+          }
+        }),
+      );
+    });
+}
+```
+
+### State phải thuộc từng subscription
+
+`defer` tạo `startedAt`, `outcome` và bộ đếm mới cho mỗi subscription. Nếu đặt chúng ngoài `defer`, hai consumer chạy đồng thời sẽ ghi đè thời gian bắt đầu hoặc dùng chung bộ đếm; retry cũng dễ trộn số liệu giữa các attempt.
+
+Chỉ tạo pipeline chưa làm clock chạy. Subscribe vào nó mới bắt đầu đo, kể cả source phát và complete đồng bộ như `of(...)`.
+
+Không gọi thêm `source.subscribe()` trong operator để “nghe ké”. Với cold source, đó có thể là request thứ hai; với event stream, đó có thể là listener mới không được teardown cùng consumer. Instrumentation phải nằm trong pipeline đang thực thi.
+
+### Đọc đúng kết quả đo
+
+| Field | Ý nghĩa | Không có nghĩa là |
+| --- | --- | --- |
+| `durationMs` | Thời gian từ subscribe đến lúc finalizer chạy ở ranh giới này | Thời gian riêng backend hoặc thời gian UI render xong |
+| `firstNextMs` | Thời gian đến emission đầu tiên; `null` nếu chưa có `next` | HTTP time-to-first-byte |
+| `nextCount` | Số notifications `next` đi qua ranh giới | Số phần tử trong một array response |
+| `outcome` | Cách subscription kết thúc tại vị trí đo | Kết quả giao dịch nghiệp vụ |
+
+Finalizer có thể chạy sau phần xử lý notification đồng bộ ở downstream, nên duration không phải đồng hồ riêng của network. Muốn đo HTTP chính xác hơn, dùng instrumentation của HTTP client; muốn đo đến lúc người dùng thấy kết quả, đặt thêm mốc render của framework.
+
+Mẫu này không ghi payload hay raw error. Adapter có thể chuyển summary thành counter và histogram. Nếu cần mã lỗi, dùng taxonomy cố định như `timeout`, `network`, `http_5xx`, `other`, qua một hàm phân loại có kiểm thử; đừng dùng `error.message` làm metric label.
+
+<Callout type="warn" title="Telemetry không được làm lỗi nghiệp vụ">
+  Một exception đồng bộ trong callback `tap` sẽ thành error của pipeline. Exception trong cleanup cũng có thể gây lỗi teardown. Vì vậy, mọi lời gọi logger, metrics SDK hoặc tracing SDK trong callback cần được cách ly; không chỉ riêng `record` ở ví dụ này. `try/catch` đồng bộ không bắt Promise rejection.
+</Callout>
+
+## Retry và fallback thay đổi ý nghĩa số liệu
+
+Vị trí operator đo là một phần của hợp đồng dữ liệu. Di chuyển nó qua `retry` hoặc `catchError` có thể khiến dashboard đổi ý nghĩa dù tên metric không đổi.
+
+### Đo attempt và logical operation riêng
+
+Đo attempt trước `retry`; đo operation sau `retry`. Nhờ vậy, operation duration bao gồm cả thời gian chờ giữa các attempt.
+
+Đoạn sau nối với `observeOperation` ở trên. `requestProducts` và `sink` là hợp đồng do ứng dụng cung cấp, không phải implementation HTTP mẫu.
+
+```ts
+import { catchError, defer, of, retry } from 'rxjs';
+import type { Observable } from 'rxjs';
+
+type Product = { id: string; name: string };
+
+declare function requestProducts(): Observable<Product[]>;
+declare const sink: TelemetrySink;
+
+const products$ = defer(() => requestProducts()).pipe(
+  observeOperation('products.load.attempt', sink),
+  retry({ count: 2, delay: 300 }),
+  observeOperation('products.load.operation', sink),
+  catchError(() => of([] as Product[])),
+);
+```
+
+`count: 2` cho tối đa hai lần retry, tức tối đa ba attempt nếu đều lỗi; `300` ms là delay minh họa, không phải cấu hình production khuyến nghị. `defer` gọi lại factory HTTP ở mỗi attempt, và biến exception đồng bộ của factory thành error mà instrumentation có thể thấy.
+
+Giả sử hai attempt đầu lỗi, attempt thứ ba complete với dữ liệu:
+
+```text
+products.load.attempt    error
+products.load.attempt    error
+products.load.attempt    complete
+products.load.operation  complete
+```
+
+Nếu cả ba attempt lỗi, operation ghi `error` dù consumer sau `catchError` nhận array rỗng và complete. Thứ tự in summary không phải thứ tự nghiệp vụ được bảo đảm trong mọi pipeline: downstream terminal handling và teardown có thể lồng nhau. Dùng scope, IDs và timestamps để liên kết, không dựa vào vị trí dòng log.
+
+Nếu consumer hủy trong retry delay, operation ghi `cancelled`; không có attempt mới cho khoảng chờ đó. Với source có nhiều emissions, `retry` có thể phát lại dữ liệu từ attempt mới, nên `nextCount` của operation không phải số bản ghi duy nhất.
+
+Mình chỉ retry khi lỗi được đánh giá là tạm thời và thao tác có thể lặp an toàn. Không copy chính sách retry này vào thao tác thanh toán hoặc mutation chưa có idempotency. Trong production, giới hạn tổng thời gian, phân loại lỗi và thêm backoff/jitter theo tải hệ thống.
+
+### Đặt phép đo trước hay sau catchError
+
+Hai vị trí phục vụ hai câu hỏi khác nhau:
+
+```text
+source → retry → observe → catchError(fallback) → consumer
+                lỗi cuối của operation vẫn được thấy
+
+source → retry → catchError(fallback) → observe → consumer
+                                      thấy kết quả đã phục hồi
+```
+
+Mình chọn vị trí trước `catchError` cho độ tin cậy của dependency. Nếu cần đo trải nghiệm có fallback, đặt một phép đo khác sau `catchError` với tên riêng và ghi nhận việc đã dùng fallback bằng counter hoặc event riêng. Đừng coi `complete` sau fallback là bằng chứng dependency hoạt động bình thường.
+
+Tương tự, đặt phép đo trước `timeout` có thể chỉ thấy upstream bị unsubscribe, còn đặt sau `timeout` sẽ thấy timeout error. Hãy đo lỗi ở ranh giới thực sự tạo ra hoặc nhận error đó.
+
+## Multicasting và cancellation
+
+Với `share`, instrumentation trước multicast đếm lifecycle upstream, còn instrumentation sau multicast đếm từng consumer:
+
+```ts
+import { defer, share } from 'rxjs';
+
+const sharedProducts$ = defer(() => requestProducts()).pipe(
+  observeOperation('products.load.upstream', sink),
+  share(),
+);
+
+const consumerProducts$ = sharedProducts$.pipe(
+  observeOperation('products.view.subscription', sink),
+);
+```
+
+Đoạn này dùng lại các hợp đồng ở ví dụ trước. Khi hai consumer subscribe trong cùng khoảng upstream đang hoạt động, có thể có một summary upstream và hai summary consumer. Nếu source complete rồi một consumer subscribe mới, `share()` mặc định có thể tạo một lượt upstream khác; đây không phải cache giữ response mãi mãi.
+
+Với `shareReplay({ bufferSize: 1, refCount: false })`, consumer unsubscribe không nhất thiết đóng upstream. Với `refCount: true`, upstream đang chạy có thể bị teardown khi consumer cuối rời đi. Vì vậy, muốn tìm request chạy thừa hoặc resource còn sống, đo phía upstream và kiểm tra cấu hình share, không chỉ đếm subscription của component.
+
+Trong luồng search dùng `switchMap`, input mới hủy inner cũ thường là hành vi đúng. Đặt phép đo trong inner để thấy từng lượt search; đặt ở outer chỉ thấy lifecycle của cả luồng nhập liệu. Không gộp các lượt bị thay thế vào dependency error rate.
+
+Vị trí của `takeUntil` cũng quan trọng. `observeOperation` trước `takeUntil` có thể ghi `cancelled` khi notifier phát; đặt sau nó có thể thấy `complete` do chính `takeUntil` tạo ra. Outcome luôn thuộc ranh giới đo, không phải “sự thật toàn cục” của cả pipeline.
+
+<Callout type="info" title="Unsubscribe chưa chắc đã hủy tác vụ bên dưới">
+  Unsubscribe ngừng nhận notifications và chạy teardown được source đăng ký. Nó không tự hủy một Promise, cũng không hoàn tác thao tác backend đã nhận. Với HTTP, kiểm tra client có nối teardown tới cơ chế abort hay không; `cancelled` trong telemetry chưa chứng minh server dừng xử lý.
+</Callout>
+
+## Correlation và trace context
+
+Metric cho bạn biết nhóm nào có vấn đề; correlation ID giúp tìm lượt thực thi cụ thể trong logs. Trace ID nối các spans của cùng một trace qua nhiều tầng hoặc dịch vụ. Hai ID có thể liên kết, nhưng một UUID bạn tự tạo không tự trở thành trace context hợp lệ.
+
+Thiết kế context theo từng logical operation:
+
+1. Tạo hoặc nhận context lúc operation thực sự bắt đầu, thường bên trong `defer` bao ngoài toàn bộ chính sách retry.
+2. Giữ operation ID ổn định qua retry; mỗi attempt có attempt ID hoặc số thứ tự riêng.
+3. Đóng context bất biến vào closure của operation và truyền xuống các factory cần dùng nó.
+4. Chỉ đưa IDs vào logs và trace attributes, không đưa vào metric labels.
+
+Đừng dùng biến global `currentRequestId` hoặc `currentSpan`: hai inner chạy song song qua `mergeMap` sẽ ghi đè context của nhau. Nếu nhiều consumer share một upstream, upstream có execution context riêng; đừng ép mọi consumer thành cùng một user action chỉ vì họ nhận cùng dữ liệu.
+
+Nếu dùng OpenTelemetry, chọn parent span cho logical operation và child span cho attempt. HTTP client có thể đã tự tạo span; kiểm tra trước khi thêm một HTTP span nữa. `complete` có thể kết thúc span mà không đánh dấu lỗi; `error` ghi error đã lọc và error status theo quy ước của hệ thống. Cancellation do user action thường là event hoặc attribute, không tự động là lỗi dependency.
+
+Kết thúc span trong finalizer, nhưng **không mặc định active context sẽ đi theo mọi scheduler hoặc callback RxJS**. Khả năng propagation phụ thuộc runtime, context manager và instrumentation được cài. Kiểm thử qua HTTP và các ranh giới async thực tế; với ví dụ thuần RxJS, truyền context rõ ràng qua closure là cách dễ kiểm soát hơn.
+
+Khi truyền trace context qua HTTP, dùng propagator của SDK và cấu hình client/server tương ứng, không tự ghép header `traceparent`. Trong browser còn cần kiểm tra CORS và policy cho phép propagation đến đúng origin; không gắn trace context tùy tiện vào mọi request bên thứ ba.
+
+## Kiểm soát dữ liệu và chi phí telemetry
+
+Instrumentation vẫn chạy trên đường xử lý của ứng dụng. Một callback `tap` serialize object lớn hoặc đẩy hàng nghìn log mỗi giây có thể làm tăng chính latency đang đo.
+
+| Vấn đề | Mặc định mình chọn | Tránh |
+| --- | --- | --- |
+| Cardinality của metrics | `operation`, `outcome`, `error_class` từ allowlist hữu hạn | User ID, trace ID, keyword tìm kiếm, full URL, raw message |
+| Dữ liệu nhạy cảm | Summary và attributes đã lọc trước khi export | Token, cookie, request body, email, payload response |
+| Logging | Một summary/operation; debug từng emission chỉ có thời hạn | `tap(console.log)` thường trực trên stream nhiều events |
+| Export | Enqueue nhanh, batch, queue có giới hạn và drop policy | Chờ network hoặc retry exporter vô hạn trên đường nghiệp vụ |
+| Sampling | Quyết định logs/traces theo operation, giữ nhất quán qua attempt | Lấy mẫu từng dòng khiến mất context của cùng operation |
+
+Với URL, dùng route template như `/products/:id`, không dùng `/products/123?token=...`. Error stack và message cũng có thể chứa input người dùng hoặc URL; phải lọc trước khi ghi, không chỉ lọc field `payload`.
+
+Nếu metrics dùng để tính error rate, không lấy mẫu tùy tiện từng summary rồi coi số đếm là toàn bộ traffic. Mặc định giữ counter đầy đủ và lấy mẫu logs/traces riêng. Policy tail sampling ở collector chỉ có tác dụng nếu dữ liệu còn đến được collector; trace bị loại ngay ở SDK không thể được “giữ lại vì có lỗi” ở phía sau.
+
+Theo dõi cả telemetry queue depth và dropped records. `try/catch` giữ pipeline sống nhưng không bảo đảm bạn còn quan sát được nó; dropped telemetry tăng là sự cố observability cần biết, không phải lý do để ném lỗi ngược vào request.
+
+## Kiểm thử instrumentation
+
+Trước khi nối SDK thật, test operator với sink trong bộ nhớ và clock ảo. Cần kiểm tra cả output giữ nguyên lẫn summary đúng; chỉ kiểm tra “logger được gọi” sẽ bỏ sót trường hợp instrumentation đổi complete thành error.
+
+Ví dụ dùng `node:test`, `node:assert/strict` và `TestScheduler`. Giả định bạn đã lưu operator vào module `./observe-operation` trong ứng dụng; đây là mã tham khảo, bài viết không thêm module đó vào site tài liệu.
+
+```ts
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import { TestScheduler } from 'rxjs/testing';
+import { observeOperation } from './observe-operation';
+import type { OperationSummary, Outcome } from './observe-operation';
+
+const cases: Array<{
+  name: Outcome;
+  source: string;
+  expected: string;
+  subscription: string;
+  durationMs: number;
+  nextCount: number;
+}> = [
+  {
+    name: 'complete', source: '-a-b-|', expected: '-a-b-|',
+    subscription: '^-----!', durationMs: 5, nextCount: 2,
+  },
+  {
+    name: 'error', source: '-a-#', expected: '-a-#',
+    subscription: '^----!', durationMs: 3, nextCount: 1,
+  },
+  {
+    name: 'cancelled', source: '-a---b-|', expected: '-a',
+    subscription: '^---!', durationMs: 4, nextCount: 1,
+  },
+];
+
+for (const scenario of cases) {
+  test(`observeOperation: ${scenario.name}`, () => {
+    const summaries: OperationSummary[] = [];
+    const scheduler = new TestScheduler((actual, expected) => {
+      assert.deepEqual(actual, expected);
+    });
+
+    scheduler.run(({ cold, expectObservable, flush }) => {
+      const result$ = cold(scenario.source).pipe(
+        observeOperation(
+          'test.operation',
+          { record: (summary) => { summaries.push(summary); } },
+          () => scheduler.now(),
+        ),
+      );
+
+      expectObservable(result$, scenario.subscription)
+        .toBe(scenario.expected);
+      flush();
+
+      assert.deepEqual(summaries, [{
+        operation: 'test.operation',
+        outcome: scenario.name,
+        durationMs: scenario.durationMs,
+        firstNextMs: 1,
+        nextCount: scenario.nextCount,
+      }]);
+    });
+  });
+}
+```
+
+Trong `run`, một frame là một millisecond ảo. Case cancellation khớp sơ đồ: `a` ở frame 1, unsubscribe ở frame 4, không có output terminal notification. Subscription marble và notification marble được tách riêng; không đưa ký hiệu `^` hay `!` vào `cold()`.
+
+Bổ sung các case sau cho adapter và pipeline của ứng dụng:
+
+- Source complete/error đồng bộ, source rỗng: mỗi subscription có đúng một summary; khi chưa có `next`, `firstNextMs` là `null`.
+- Hai subscriptions đồng thời: không dùng chung clock bắt đầu hoặc bộ đếm.
+- Hai attempt lỗi rồi attempt thứ ba complete: ba summaries attempt, một summary operation, duration operation gồm retry delay.
+- Hủy trong retry delay: không xuất hiện attempt mới.
+- Sink ném exception: output và source error vẫn giữ nguyên, không phát sinh lỗi telemetry ra consumer.
+- Multicasting: số execution summaries và consumer summaries khớp policy share.
+- Redaction và cardinality: token, keyword, URL động không lọt vào labels hoặc bản ghi xuất đi.
+
+## Dashboard và cảnh báo
+
+Dashboard đầu tiên nên trả lời: traffic có đến không, operation có kết thúc không, và phần nào làm người dùng chờ. Không cần chart cho từng operator.
+
+| Tín hiệu đề xuất | Cách cập nhật | Cách dùng |
+| --- | --- | --- |
+| `rxjs_operation_ended_total` | Tăng một lần/summary, label `operation`, `outcome` | Tính lượng operation kết thúc và tỷ lệ error |
+| `rxjs_operation_duration_ms` | Histogram từ `durationMs`, phân theo outcome | Xem p50/p95/p99 trong cửa sổ đo |
+| `rxjs_operation_first_next_ms` | Histogram chỉ khi `firstNextMs` khác `null` | Xem thời gian chờ dữ liệu đầu tiên |
+| `rxjs_operation_inflight` | Tăng khi subscribe, giảm khi finalize | Phát hiện operation kẹt hoặc thiếu teardown |
+| `telemetry_dropped_total` | Adapter tăng khi queue đầy hoặc export thất bại theo policy | Phát hiện khoảng mù của telemetry |
+
+Tên trên là gợi ý, không phải chuẩn bắt buộc; nếu dùng hệ thống ưu tiên đơn vị giây, đổi cả tên metric và giá trị export nhất quán. Với gauge `inflight`, operator mẫu hiện chỉ xuất summary khi kết thúc: bạn cần bổ sung hook bắt đầu đồng bộ, không ném lỗi, và kiểm thử tăng/giảm cân bằng. Không thể suy ra chính xác số đang chạy chỉ từ ended summaries.
+
+Định nghĩa error rate ở một scope nhất quán, chẳng hạn `error / (complete + error)` của **logical operations đã kết thúc** trong cùng cửa sổ; theo dõi cancellation riêng. Loại cancellation khỏi mẫu số là quyết định cần ghi rõ: nó không biến các lượt hủy thành thành công, cũng không phản ánh business failure bị đóng gói trong `complete`.
+
+Tách histogram của complete, error và cancelled. Nếu nhiều request bị hủy sớm, latency gộp có thể giảm dù trải nghiệm xấu đi. Nếu không có operation kết thúc, error rate thấp hoặc không có dữ liệu không chứng minh hệ thống khỏe: nhìn thêm starts, inflight, traffic và thời gian từ event cuối.
+
+Mình cảnh báo theo SLO của operation và cửa sổ có đủ traffic, không theo một lỗi attempt đơn lẻ. Attempt error tăng nhưng operation error vẫn thấp có thể là retry đang che lỗi dependency; đó là tín hiệu để điều tra tải và tail latency, không phải lập tức tăng số retry.
+
+Với polling hoặc WebSocket sống lâu, summary cuối lifecycle đến rất muộn. Đo từng lượt poll/message processing, hoặc thêm counter, heartbeat và mốc `last_event_at`; đừng chờ một subscription dài hạn complete mới biết nó còn hoạt động.
+
+## Runbook khi pipeline có vấn đề
+
+1. **Xác nhận scope.** Chọn operation, phiên bản deploy, môi trường và cửa sổ thời gian. Kiểm tra metric đang đo attempt, operation hay consumer.
+2. **Kiểm tra dữ liệu telemetry.** Xem dropped records, queue depth và tình trạng collector. Nếu exporter hỏng, thiếu log không chứng minh pipeline không chạy.
+3. **So starts với ends và inflight.** Starts tăng nhưng ends không tăng: kiểm tra timeout, subscription không teardown, producer treo hoặc hàng đợi xử lý. Với long-lived stream, đối chiếu heartbeat thay vì chờ ends.
+4. **Tìm một execution bằng correlation ID.** Theo operation qua các attempt và spans. Kiểm tra có fallback, timeout hay cancellation; đừng dựa vào một dòng `complete` ở consumer.
+5. **Khoanh vùng latency.** So `firstNextMs` với duration và các child spans. Thời gian có thể nằm ở retry delay, dependency, queue do `concatMap`, hoặc xử lý đồng bộ downstream.
+6. **Kiểm tra subscriptions trùng.** Nếu attempt nhiều hơn dự kiến, xem consumer subscribe thêm, vị trí share/cache và reset policy trước khi kết luận backend retry.
+7. **Giảm rủi ro.** Nếu instrumentation gây tải, tắt debug từng emission hoặc giảm logs/traces sampling theo policy; giữ counters cần cho SLO và redaction. Không tăng retry trước khi biết dependency có quá tải hay không.
+8. **Xác minh sau thay đổi.** Chạy một operation thử an toàn, kiểm tra summary và trace khớp; theo dõi error rate, cancellation, latency và inflight trong cùng scope.
+
+## Checklist trước khi đưa lên production
+
+- [ ] Tên operation cố định; đã ghi rõ scope attempt/operation/consumer.
+- [ ] State đo nằm trong từng subscription; không subscribe thêm để log.
+- [ ] Complete, error, cancellation đều có test và không bị coi là cùng một outcome.
+- [ ] Vị trí đo qua retry, fallback, timeout, share và `takeUntil` đã được xác minh.
+- [ ] Callback telemetry ngắn, không ném lỗi vào pipeline; lỗi export async được xử lý riêng.
+- [ ] Không xuất payload, credentials hoặc raw error chưa lọc; metric labels có allowlist.
+- [ ] Context không dùng global mutable state; trace propagation được test qua các ranh giới async.
+- [ ] Export queue có giới hạn, drop policy và tín hiệu theo dõi dropped records.
+- [ ] Dashboard tách cancellation, attempt errors và final operation errors; alerts gắn với SLO.
+
+## Học tiếp
+
+Bắt đầu bằng một operation HTTP quan trọng: đo attempt trước retry và operation trước fallback, rồi thử ba đường complete, error và hủy. Khi số liệu khớp lifecycle trong test, mới nối adapter production và mở rộng sang các luồng khác.
+
+<Cards>
+  <Card title="finalize" href="/docs/loi-hoan-tat/finalize" description="Hiểu cleanup và vị trí finalizer trong pipeline." />
+  <Card title="Retry và retryWhen" href="/docs/loi-hoan-tat/retry-retry-when" description="Thiết kế phạm vi retry và chính sách phục hồi." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm thử notifications và cửa sổ subscription bằng thời gian ảo." />
+  <Card title="Hiệu năng và bộ nhớ" href="/docs/patterns-production/performance-memory" description="Theo dõi subscription thừa và resource không được giải phóng." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS tap](https://rxjs.dev/api/operators/tap) — side effects và cách exception trong handler trở thành error của output.
+- [RxJS finalize](https://rxjs.dev/api/operators/finalize) — cleanup khi complete, error hoặc unsubscribe.
+- [RxJS retry](https://rxjs.dev/api/operators/retry) — resubscribe, retry count và delay.
+- [Source RxJS 7.8.2: tap](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/tap.ts), [finalize](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/finalize.ts), [retry](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/retry.ts) — implementation dùng để đối chiếu lifecycle trong bài.

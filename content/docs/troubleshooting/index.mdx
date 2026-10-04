@@ -3,22 +3,288 @@ title: Troubleshooting
 description: Chẩn đoán những lỗi RxJS phổ biến và các anti-pattern khó phát hiện.
 ---
 
-Đây là trang khung cho nhóm **Troubleshooting** trong lộ trình học RxJS.
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+
+Một thao tác gửi hai request, một response không tới UI, hoặc timer vẫn chạy sau khi rời màn hình: những triệu chứng này chưa đủ để chọn operator sửa lỗi. Bạn cần biết producer chạy bao nhiêu lần, consumer bắt đầu nghe lúc nào và subscription kết thúc ở đâu.
+
+Mình ưu tiên tìm **ranh giới đầu tiên mà hành vi thực tế khác với kỳ vọng**, rồi mới đổi pipeline. Trang này là điểm bắt đầu để chọn bài theo triệu chứng và áp dụng một quy trình chẩn đoán chung; các bài con đi sâu vào từng nguyên nhân.
+
+<Callout type="info" title="Phạm vi và kiến thức cần có">
+  Bạn cần biết `Observable`, `subscribe`, `pipe` và teardown. Ví dụ dùng TypeScript với RxJS 7.8.x, đối chiếu implementation 7.8.2; chạy chúng trong ứng dụng hoặc môi trường thử nghiệm đã có RxJS, không phải trong repository tài liệu. Hướng dẫn không phụ thuộc Angular hay React.
+</Callout>
 
 ## Mục lục
 
-- [Phạm vi dự kiến](#phạm-vi-dự-kiến)
+- [Chọn bài theo triệu chứng](#chọn-bài-theo-triệu-chứng)
+- [Ba câu hỏi trước khi sửa](#ba-câu-hỏi-trước-khi-sửa)
+  - [Ai tạo producer và ai subscribe](#ai-tạo-producer-và-ai-subscribe)
+  - [Giá trị dừng ở ranh giới nào](#giá-trị-dừng-ở-ranh-giới-nào)
+  - [Ai sở hữu lifecycle](#ai-sở-hữu-lifecycle)
+- [Quy trình chẩn đoán](#quy-trình-chẩn-đoán)
+  - [Ghi lại tình huống tái hiện](#ghi-lại-tình-huống-tái-hiện)
+  - [Rút pipeline về ví dụ nhỏ](#rút-pipeline-về-ví-dụ-nhỏ)
+  - [Đặt log ở các ranh giới](#đặt-log-ở-các-ranh-giới)
+  - [Sửa một giả thuyết và kiểm chứng](#sửa-một-giả-thuyết-và-kiểm-chứng)
+- [Instrument mà không tạo thêm subscription](#instrument-mà-không-tạo-thêm-subscription)
+  - [Helper theo dõi lifecycle](#helper-theo-dõi-lifecycle)
+  - [Đọc log trước và sau sharing](#đọc-log-trước-và-sau-sharing)
+- [Đọc timeline để phân biệt hủy và mất dữ liệu](#đọc-timeline-để-phân-biệt-hủy-và-mất-dữ-liệu)
+- [Những cách sửa dễ che mất lỗi](#những-cách-sửa-dễ-che-mất-lỗi)
+- [Checklist trước khi đóng lỗi](#checklist-trước-khi-đóng-lỗi)
 - [Các bài trong nhóm](#các-bài-trong-nhóm)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
 
-## Phạm vi dự kiến
+## Chọn bài theo triệu chứng
 
-Nhóm này tập trung vào triệu chứng thực tế, nguyên nhân gốc và hướng sửa có thể kiểm chứng.
+Bắt đầu ở cột bằng chứng, không nhảy thẳng từ triệu chứng sang cách sửa. Một request bị canceled rồi gửi lại có thể do lifecycle hợp lệ; hai request giống nhau cũng có thể là hai trigger khác nhau, không nhất thiết do multiple subscriptions.
+
+| Bạn đang thấy gì? | Bằng chứng cần lấy trước | Bài nên mở |
+| --- | --- | --- |
+| Timer, listener hoặc socket còn hoạt động sau khi owner bị hủy | Upstream có teardown không; owner nào còn giữ subscription hoặc resource | [Memory leak](/docs/troubleshooting/memory-leak) |
+| Một thao tác tạo nhiều request giống nhau | Số trigger, số subscription vào nguồn HTTP, identity của shared Observable | [Request trùng lặp](/docs/troubleshooting/request-trung-lap) |
+| Source có dữ liệu nhưng consumer không nhận được | Thứ tự `next` và subscribe; operator đầu tiên không chuyển tiếp; thời điểm đóng subscription | [Mất emission](/docs/troubleshooting/mat-emission) |
+| UI hiển thị dữ liệu cũ hoặc hành vi khác sau khi quay lại trang | Cache thuộc instance nào; source đã complete chưa; policy refresh và refCount | [shareReplay và stale cache](/docs/troubleshooting/share-replay-stale-cache) |
+| Response cũ ghi đè response mới, hoặc inner vẫn chạy sau khi dừng outer | Các `subscribe` lồng nhau có cleanup riêng không; policy concurrency mong muốn | [Nested subscribe](/docs/troubleshooting/nested-subscribe) |
+| Chưa biết đó là lỗi hay hành vi đúng của RxJS | Phiên bản đang dùng, hợp đồng operator và một ví dụ tái hiện tối thiểu | [Câu hỏi thường gặp](/docs/troubleshooting/faq) |
+
+<Callout type="warn" title="Ưu tiên an toàn khi có side effect">
+  Nếu lỗi liên quan tạo đơn, thanh toán hoặc ghi dữ liệu, hạn chế thao tác lặp trong lúc chẩn đoán và đối chiếu trạng thái ở server. Đừng thêm retry tự động cho mutation khi chưa có hợp đồng idempotency. Unsubscribe ở client không chứng minh server chưa xử lý request.
+</Callout>
+
+## Ba câu hỏi trước khi sửa
+
+### Ai tạo producer và ai subscribe
+
+Một biến tên `data$` không có nghĩa dữ liệu chỉ được tải một lần. Với cold HTTP Observable, mỗi subscription thường khởi tạo một request riêng. Ngược lại, một hot source như `Subject` có thể phát event dù consumer của bạn chưa subscribe.
+
+Liệt kê nơi tạo Observable và mọi consumer: `subscribe` thủ công, binding UI, Effect, service và code debug. Nếu dùng `share` hoặc `shareReplay`, kiểm tra các consumer có giữ **cùng instance** hay mỗi lần gọi hàm lại tạo một pipeline mới. Sharing chỉ có hiệu lực giữa những consumer dùng chung instance đó.
+
+Đếm riêng ba thứ: trigger nghiệp vụ, subscription vào upstream và notification tới consumer. Một upstream emission được gửi tới hai consumer sẽ tạo hai log `next`, nhưng không vì thế mà có hai request.
+
+### Giá trị dừng ở ranh giới nào
+
+Chia đường đi thành các điểm quan sát thay vì đọc một chuỗi operator dài cùng lúc:
+
+```text
+Trigger → Operator chọn input → Inner Observable → Consumer → UI
+```
+
+Nếu không có trigger, điều tra event hoặc binding. Nếu trigger có nhưng inner không bắt đầu, kiểm tra predicate, trạng thái chờ của operator kết hợp và policy flattening. Nếu inner có `next` nhưng consumer không có, kiểm tra cancellation hoặc operator downstream. Nếu consumer đã có `next` mà UI không đổi, kiểm tra state, reference và render trước khi sửa RxJS.
+
+Không phải input nào cũng cần thành output. `filter`, `distinctUntilChanged`, `debounceTime` và `exhaustMap` có thể bỏ hoặc giữ input theo đúng hợp đồng. Ghi rõ giá trị nào nghiệp vụ thật sự cần giữ để phân biệt lỗi với hành vi chủ đích.
+
+### Ai sở hữu lifecycle
+
+Mỗi subscription dài hạn cần một owner: màn hình, service, worker hoặc một tác vụ có điểm kết thúc. Xác định lúc owner bắt đầu, dừng và tạo lại; sau đó kiểm tra producer có giải phóng timer, listener hay socket khi teardown không.
+
+Phân biệt ba cách đóng: `complete` là kết thúc bình thường, `error` là lỗi terminal, còn unsubscribe là consumer hoặc operator dừng nghe. `finalize` chạy trong cả ba trường hợp, nên một dòng log `finalize` không chứng minh tác vụ thành công. Với sharing, consumer đóng cũng chưa chắc upstream đã đóng.
+
+## Quy trình chẩn đoán
+
+<Steps>
+<Step>
+
+### Ghi lại tình huống tái hiện
+
+Ghi thao tác cụ thể, kết quả mong muốn và kết quả thực tế. Kèm phiên bản RxJS thực tế trong ứng dụng, chế độ development hay production, lifecycle UI và điều kiện mạng liên quan. Ví dụ: “Gõ A rồi B khi request A còn chạy; mong chỉ hiện kết quả B; thực tế UI hiển thị A sau B”.
+
+Nếu có HTTP, bật Preserve log trong Network và kiểm tra method, URL, query, body cùng Initiator. `OPTIONS` rồi `GET` thường là CORS preflight, không phải hai request nghiệp vụ. Chỉ so sánh URL path chưa đủ để kết luận request có trùng hay không.
+
+</Step>
+<Step>
+
+### Rút pipeline về ví dụ nhỏ
+
+Giữ lại input, operator nghi ngờ và consumer. Thay API bằng cold Observable kiểm soát được timing khi điều tra logic RxJS; giữ một integration test riêng nếu lỗi phụ thuộc HTTP thật hoặc framework.
+
+Đừng xóa điểm subscribe, sharing hay cleanup đang liên quan đến lỗi. Một ví dụ luôn subscribe từ đầu sẽ không tái hiện được consumer đến muộn; một ví dụ không unmount sẽ bỏ sót lỗi lifecycle.
+
+</Step>
+<Step>
+
+### Đặt log ở các ranh giới
+
+Đặt log trước và sau operator nghi ngờ; với flattening, thêm log bên trong inner. Dùng ID cho từng subscription và tên ranh giới để ghép chuỗi subscribe → notification → đóng. Helper ở phần kế tiếp làm việc này mà không thêm consumer.
+
+Ghi loại sự kiện và các ID cần đối chiếu, không ghi token, thông tin cá nhân hay toàn bộ payload. Nếu cần so sánh object mutable, ghi snapshot của các field primitive liên quan thay vì dựa vào object reference trong DevTools.
+
+</Step>
+<Step>
+
+### Sửa một giả thuyết và kiểm chứng
+
+Viết giả thuyết có thể bác bỏ: “Hai consumer subscribe cùng cold HTTP source nên có hai upstream execution”, thay vì “RxJS bị gọi hai lần”. Chỉ thay đổi phần tương ứng với giả thuyết rồi chạy lại đúng thao tác đã ghi.
+
+Kiểm tra cả output, số upstream subscription và teardown. Nếu chia sẻ request làm hết request trùng nhưng giữ một timer vô hạn, bản sửa chưa đạt. Thêm test hồi quy trước khi gỡ instrumentation.
+
+</Step>
+</Steps>
+
+## Instrument mà không tạo thêm subscription
+
+### Helper theo dõi lifecycle
+
+Mẫu sau chạy độc lập trong môi trường TypeScript có RxJS. `defer` tạo ID và trạng thái riêng cho từng subscription; `tap` quan sát notification, còn `finalize` xác nhận ranh giới đó đã đóng. Helper không log giá trị để tránh đưa payload nhạy cảm vào console.
+
+```ts
+import { defer, finalize, of, shareReplay, tap } from 'rxjs';
+import type { MonoTypeOperatorFunction } from 'rxjs';
+
+let traceId = 0;
+
+function trace<T>(label: string): MonoTypeOperatorFunction<T> {
+  return (source$) => defer(() => {
+    const id = ++traceId;
+    let terminal: 'complete' | 'error' | undefined;
+    const log = (event: string) => console.log(`[${label} #${id}] ${event}`);
+
+    log('subscribe');
+    return source$.pipe(
+      tap({
+        next: () => log('next'),
+        error: () => {
+          terminal = 'error';
+          log('error');
+        },
+        complete: () => {
+          terminal = 'complete';
+          log('complete');
+        },
+      }),
+      finalize(() => log(`closed: ${terminal ?? 'unsubscribe'}`)),
+    );
+  });
+}
+
+const shared$ = of('snapshot').pipe(
+  trace('upstream'),
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+shared$.pipe(trace('consumer A')).subscribe();
+shared$.pipe(trace('consumer B')).subscribe();
+```
+
+Ở đây `of` phát đồng bộ và complete trong subscription của A. B đến sau nhưng nhận snapshot đã cache; không có lần subscribe upstream thứ hai. Hai consumer trong ví dụ mô phỏng hai reader thật của ứng dụng, không phải lời khuyên thêm hai subscription debug.
+
+Trong pipeline đang chạy, chèn `trace('input')`, `trace('after filter')` hoặc `trace('inner')` vào đường đi **hiện có** và giữ consumer hiện tại. Nếu cần log lỗi chi tiết, lọc dữ liệu nhạy cảm trước khi ghi; helper trên chỉ ghi nhận loại notification, không thay thế error handler của ứng dụng.
+
+### Đọc log trước và sau sharing
+
+| Kết quả quan sát | Kết luận ở ranh giới đang log | Kiểm tra tiếp |
+| --- | --- | --- |
+| Upstream subscribe một lần, A và B cùng nhận `next` | Một execution đang phục vụ nhiều consumer | Hai log consumer không phải bằng chứng request trùng |
+| Upstream subscribe nhiều lần | Có nhiều execution upstream | Trigger lặp, retry, refCount, instance mới hoặc thiếu sharing |
+| Trước operator có `next`, sau operator không có | Operator chưa chuyển tiếp hoặc downstream đã đóng | Predicate, timing, state chờ và policy cancellation |
+| Inner đóng với `unsubscribe` trước response dự kiến | Inner bị dừng nghe trước khi có response | Input mới, owner teardown hoặc operator kết thúc sớm |
+| Consumer có `complete`, upstream đóng với `unsubscribe` | Downstream có thể chủ động kết thúc, chẳng hạn `take(1)` | Không suy ra upstream đã complete tự nhiên |
+| Consumer cuối rời đi, upstream chưa đóng | Kết nối vẫn được giữ ở đâu đó | Consumer khác, cấu hình sharing hoặc owner của kết nối |
+
+ID chỉ có ý nghĩa trong phạm vi instrumentation này, không phải request ID ở server. Khi cần biết side effect đã xảy ra chưa, đối chiếu Network và log server bằng correlation ID phù hợp.
+
+<Callout type="warn" title="Subscription debug có thể làm đổi lỗi">
+  Subscribe thêm vào cold source có thể tạo request mới. Subscribe thêm vào shared source có thể giữ refCount lớn hơn zero, làm cache và upstream sống lâu hơn. Ưu tiên `tap`/`defer` trong đường đi hiện có; instrumentation vẫn có chi phí và có thể ảnh hưởng timing, nên dùng virtual time cho giả thuyết nhạy với thời gian.
+</Callout>
+
+## Đọc timeline để phân biệt hủy và mất dữ liệu
+
+Giả sử UI tìm kiếm chỉ cần kết quả của input mới nhất. A bắt đầu trước, B đến khi A chưa có response. Đọc theo cột dọc để thấy `switchMap` đóng inner A trước khi response A dự kiến xuất hiện.
+
+<MarbleDiagram
+  title="switchMap(project)"
+  rows={[
+    { label: 'input', marble: '-a--b-|', kind: 'source' },
+    { label: 'inner A', marble: '-^--!', kind: 'inner' },
+    { label: 'inner B', marble: '----^---y|', kind: 'inner' },
+    { label: 'output', marble: '--------y|', kind: 'output' },
+  ]}
+  values={{
+    a: 'Từ khóa A',
+    b: 'Từ khóa B',
+    y: 'Kết quả tìm kiếm cho B',
+  }}
+  caption="A subscribe ở frame 1, bị unsubscribe ở frame 4 khi B đến. Input complete ở frame 6, nhưng output đợi B phát y ở frame 8 rồi complete ở frame 9."
+/>
+
+Trong ví dụ này, mỗi request nếu không bị hủy sẽ phát response sau 4 frame và complete sau 5 frame. A đáng lẽ phát ở frame 5, nhưng subscription của nó đã đóng ở frame 4. Không có marker response A trong hàng inner đang được quan sát vì nó không còn chuyển tiếp notification đó.
+
+Đây là cancellation đúng với yêu cầu “chỉ kết quả mới nhất”, không phải lý do để đổi sang `mergeMap`. Nếu input là command ghi dữ liệu mà mọi command đều phải được xử lý, cần chọn policy khác theo nghiệp vụ, chẳng hạn `concatMap` cho thứ tự tuần tự. Unsubscribe chỉ mô tả lifecycle phía client; producer dựa trên Promise hoặc backend vẫn có thể tiếp tục công việc.
+
+Test dưới khóa cả notification và subscription window của timeline. Các frame là virtual time, không phải milliseconds đo trên Network; dùng `TestScheduler.run` để không phải chờ timer thật.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { switchMap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ hot, cold, expectObservable, expectSubscriptions }) => {
+  const input$ = hot('-a--b-|');
+  const requestA$ = cold('----x|');
+  const requestB$ = cold('----y|');
+  const result$ = input$.pipe(
+    switchMap((key) => key === 'a' ? requestA$ : requestB$),
+  );
+
+  expectObservable(result$).toBe('--------y|');
+  expectSubscriptions(requestA$.subscriptions).toBe('-^--!');
+  expectSubscriptions(requestB$.subscriptions).toBe('----^----!');
+});
+```
+
+Notification marbles của `cold()` là timeline tương đối tính từ lúc subscribe; subscription marbles và sơ đồ ở trên dùng trục frame toàn cục. Test này kiểm tra composition, không chứng minh HTTP đã abort hay server chưa xử lý request. Những điều đó cần integration test và bằng chứng ở tầng transport hoặc server.
+
+## Những cách sửa dễ che mất lỗi
+
+| Cách sửa vội | Vì sao có thể sai | Hướng ưu tiên |
+| --- | --- | --- |
+| Thêm `shareReplay(1)` vào mọi pipeline | Chỉ share cùng instance; overload này không bật refCount, không tự thiết kế invalidation | Xác định phần side effect cần share, owner, cache key và policy refresh |
+| Thêm `setTimeout` để consumer nhận được dữ liệu | Dời timing không bảo đảm thứ tự trong mọi lifecycle | Sửa thứ tự subscribe hoặc chọn state có replay nếu nghiệp vụ cần |
+| Đổi `switchMap` sang `mergeMap` để không thiếu response | Cho phép response cũ và side effect chồng nhau | Chọn cancellation, queue, parallel hay bỏ trigger theo yêu cầu |
+| Dùng `catchError(() => EMPTY)` ở ngoài cùng | Có thể biến lỗi thành complete im lặng và kết thúc cả luồng trigger | Chọn phạm vi xử lý lỗi, báo lỗi và recovery rõ ràng |
+| Thêm retry không giới hạn | Có thể lặp side effect và làm nhiều request hơn | Giới hạn số lần, loại lỗi được retry và yêu cầu idempotency |
+| Bỏ unsubscribe hoặc cleanup | Giữ consumer sống để thấy dữ liệu, nhưng mất ranh giới owner | Chuyển tác vụ sang owner phù hợp nếu cần sống lâu hơn UI |
+| Chỉ gọi `destroyed$.complete()` với `takeUntil` | Notifier complete không kích hoạt việc dừng source | Phát `next` khi destroy rồi complete, hoặc dùng primitive lifecycle của framework |
+
+Trong RxJS 7.8.2, `shareReplay` reset sau error, giữ buffer sau complete thành công và có thể ngắt/reset nguồn chưa kết thúc khi refCount về zero với `refCount: true`. Vì vậy “refCount luôn xóa cache” và “shareReplay luôn giữ lỗi” đều không phải kết luận đúng. Nếu `catchError` đổi lỗi thành fallback rồi complete **trước** sharing, fallback lại có thể được cache như dữ liệu thành công.
+
+Mình chọn cấu hình explicit như `shareReplay({ bufferSize: 1, refCount: true })` cho nguồn đang chạy mà lifecycle thuộc về consumers. Với snapshot cần refresh hoặc state cần tồn tại qua khoảng không có consumer, thiết kế cache và owner riêng; cấu hình này không phải cơ chế TTL hay invalidation.
+
+## Checklist trước khi đóng lỗi
+
+- [ ] Có thao tác tái hiện cụ thể cùng kết quả mong muốn và thực tế.
+- [ ] Đã xác định cùng hay khác instance Observable, số trigger và số upstream execution.
+- [ ] Có bằng chứng về ranh giới đầu tiên sai khác, không chỉ log cuối pipeline.
+- [ ] Đã phân biệt `complete`, `error` và unsubscribe ở đúng ranh giới.
+- [ ] Bản sửa không tăng request, replay lại command hoặc tạo concurrency ngoài ý muốn.
+- [ ] Đã thử consumer đến muộn, rời màn hình khi inner đang chạy và quay lại nếu liên quan.
+- [ ] Nguồn có owner và teardown resource; cache có policy refresh/invalidation phù hợp.
+- [ ] Test hồi quy kiểm tra output và subscription window hoặc số execution liên quan.
+- [ ] Có integration test cho lỗi phụ thuộc framework, transport hoặc side effect ở server.
+- [ ] Đã gỡ subscription debug và log không cần thiết trước khi đưa lên production.
+
+Nếu chưa tìm được nguyên nhân, chuẩn bị một ví dụ tối thiểu kèm phiên bản RxJS, pipeline liên quan, log đã lọc dữ liệu nhạy cảm và timeline dự kiến. Nêu cả những giả thuyết đã bị bác bỏ để người tiếp theo không phải thử lại từ đầu.
 
 ## Các bài trong nhóm
 
-- **[Memory leak](/docs/troubleshooting/memory-leak)** — Tìm subscription hoặc resource không được giải phóng.
-- **[Request trùng lặp](/docs/troubleshooting/request-trung-lap)** — Chẩn đoán multiple subscriptions gây gọi API nhiều lần.
-- **[Mất emission](/docs/troubleshooting/mat-emission)** — Điều tra timing, hot stream và subscription quá muộn.
-- **[shareReplay và stale cache](/docs/troubleshooting/share-replay-stale-cache)** — Xử lý cache cũ, lỗi bị giữ lại và lifecycle khó đoán.
-- **[Nested subscribe](/docs/troubleshooting/nested-subscribe)** — Thay subscribe lồng nhau bằng composition rõ ràng.
-- **[Câu hỏi thường gặp](/docs/troubleshooting/faq)** — Giải đáp nhanh các nhầm lẫn và lỗi cấu hình phổ biến.
+Chọn một bài theo bằng chứng đã thu được, thay vì thay nhiều operator cùng lúc:
+
+<Cards>
+  <Card title="Memory leak" href="/docs/troubleshooting/memory-leak" description="Tìm subscription và resource chưa được giải phóng theo lifecycle của owner." />
+  <Card title="Request trùng lặp" href="/docs/troubleshooting/request-trung-lap" description="Phân biệt trigger lặp, nhiều consumer và nhiều instance pipeline." />
+  <Card title="Mất emission" href="/docs/troubleshooting/mat-emission" description="Điều tra late subscription, operator giữ hoặc bỏ input và teardown sớm." />
+  <Card title="shareReplay và stale cache" href="/docs/troubleshooting/share-replay-stale-cache" description="Đối chiếu buffer, refCount, terminal state và policy refresh." />
+  <Card title="Nested subscribe" href="/docs/troubleshooting/nested-subscribe" description="Đưa inner vào composition với policy concurrency và cleanup rõ ràng." />
+  <Card title="Câu hỏi thường gặp" href="/docs/troubleshooting/faq" description="Tra các nhầm lẫn thường gặp về Observable và operator." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS: Observable](https://rxjs.dev/guide/observable) và [Subscription](https://rxjs.dev/guide/subscription) — execution và lifecycle.
+- [RxJS: finalize, implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/finalize.ts) — callback chạy cả khi unsubscribe.
+- [RxJS: shareReplay, implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — các policy reset và cấu hình refCount.
+- [RxJS: takeUntil, implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/takeUntil.ts) — notifier cần phát `next` để kết thúc output.
+- [RxJS: marble testing](https://rxjs.dev/guide/testing/marble-testing) — virtual time, notification và subscription assertions.

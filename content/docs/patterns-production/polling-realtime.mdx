@@ -3,8 +3,677 @@ title: Polling và realtime
 description: Thiết kế cập nhật định kỳ, reconnect và backoff.
 ---
 
-Trang này sẽ trình bày **Polling và realtime** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Giả sử bạn có màn hình theo dõi một job xuất báo cáo. Cứ vài giây lại hỏi trạng thái là đủ, nhưng nếu request mất lâu hơn chu kỳ thì sao? Khi người dùng đóng màn hình, job hoàn tất hoặc mạng mất rồi có lại, bạn cần quyết định rõ request nào được chạy, request nào phải dừng và dữ liệu nào còn đáng tin.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình thường bắt đầu bằng polling nếu sản phẩm chấp nhận độ trễ vài giây và đã có API đọc trạng thái. Chỉ chuyển sang SSE hoặc WebSocket khi cần server push, tần suất cập nhật cao hoặc giao tiếp hai chiều. RxJS giúp nối các lifecycle này lại; nó không tự cung cấp delivery guarantee hay khả năng khôi phục event bị mất.
+
+<Callout type="info" title="Phạm vi của ví dụ">
+  Bài dùng API RxJS 7.8.x, đối chiếu implementation 7.8.2. Ví dụ TypeScript dành cho ứng dụng đã có RxJS; không cần cài RxJS vào repository tài liệu. Bạn nên biết `defer`, higher-order Observable và teardown. Các mốc 5 giây, 10 giây và số lần retry bên dưới là cấu hình minh họa, không phải khuyến nghị chung cho mọi API.
 </Callout>
+
+## Mục lục
+
+- [Chọn polling hay server push](#chọn-polling-hay-server-push)
+- [Chọn lịch polling và chính sách overlap](#chọn-lịch-polling-và-chính-sách-overlap)
+  - [Polling theo nhịp với exhaustMap](#polling-theo-nhịp-với-exhaustmap)
+  - [Polling sau khi response hoàn tất](#polling-sau-khi-response-hoàn-tất)
+- [Polling một job với timeout và backoff](#polling-một-job-với-timeout-và-backoff)
+  - [Retry có giới hạn và phân loại lỗi](#retry-có-giới-hạn-và-phân-loại-lỗi)
+  - [Dừng sau trạng thái cuối cùng](#dừng-sau-trạng-thái-cuối-cùng)
+  - [Lỗi một request có làm dừng cả polling không](#lỗi-một-request-có-làm-dừng-cả-polling-không)
+- [Gắn polling vào lifecycle của màn hình](#gắn-polling-vào-lifecycle-của-màn-hình)
+  - [Pause khi tab ẩn và khi offline](#pause-khi-tab-ẩn-và-khi-offline)
+  - [Chia sẻ execution và hiển thị stale data](#chia-sẻ-execution-và-hiển-thị-stale-data)
+- [SSE với reconnect do trình duyệt quản lý](#sse-với-reconnect-do-trình-duyệt-quản-lý)
+- [WebSocket với reconnect có giới hạn](#websocket-với-reconnect-có-giới-hạn)
+- [Khôi phục dữ liệu sau reconnect](#khôi-phục-dữ-liệu-sau-reconnect)
+- [Kiểm thử timing và teardown](#kiểm-thử-timing-và-teardown)
+  - [Tick đang bận bị bỏ qua](#tick-đang-bận-bị-bỏ-qua)
+  - [Job hoàn tất không mở thêm request](#job-hoàn-tất-không-mở-thêm-request)
+  - [Unsubscribe hủy timer backoff](#unsubscribe-hủy-timer-backoff)
+- [Checklist vận hành](#checklist-vận-hành)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Chọn polling hay server push
+
+| Cách cập nhật | Mình chọn khi | Điều phải thiết kế thêm |
+| --- | --- | --- |
+| Polling | Có API snapshot, chấp nhận độ trễ theo chu kỳ | Overlap, timeout, tải lên server, dừng đúng lúc |
+| SSE qua `EventSource` | Server đẩy event một chiều về browser | Reconnect, event ID/cursor, replay và authentication |
+| WebSocket | Cần hai chiều, như điều khiển phiên hoặc cộng tác | Protocol, heartbeat, reconnect, resubscribe và xác nhận lệnh |
+
+Polling giống việc hỏi lại “xong chưa?”: đơn giản, nhưng hỏi nhiều quá thì cả client lẫn server đều tốn công. Ví dụ giả định 1.000 màn hình cùng mở, mỗi màn hình có một request mỗi 5 giây, tải trung bình là khoảng 200 request/giây trước retry. Đây chỉ là phép tính tải; các màn hình có thể gửi dồn cùng lúc thay vì phân bố đều.
+
+Nếu trạng thái chỉ đổi vài lần trong một phút, polling vài giây có thể đủ. Nếu mỗi thay đổi phải xuất hiện ngay ở nhiều client, server push hợp lý hơn. Với dữ liệu ít thay đổi và không cần tự cập nhật, refresh khi người dùng quay lại màn hình thường đơn giản hơn cả hai.
+
+Đừng gọi polling là realtime theo nghĩa tuyệt đối. Độ trễ nhận biết thay đổi còn gồm khoảng chờ đến request kế tiếp, thời gian request và thời gian xử lý UI. Timer ở background tab cũng có thể bị browser trì hoãn; không dùng nó làm đồng hồ cho deadline nghiệp vụ.
+
+## Chọn lịch polling và chính sách overlap
+
+Hai lịch sau nhìn giống nhau khi API nhanh, nhưng hành vi khác hẳn khi mạng chậm:
+
+- **Theo nhịp cố định:** phát trigger ở các mốc định kỳ, rồi quyết định xử lý trigger khi request trước chưa xong.
+- **Sau response:** chờ request complete, nghỉ một khoảng, rồi bắt đầu request tiếp theo.
+
+### Polling theo nhịp với exhaustMap
+
+`timer(0, periodMs)` tạo trigger đầu ngay khi timer được scheduler thực thi, rồi phát theo chu kỳ. Nếu chỉ cần snapshot mới và không muốn request chồng nhau, mình dùng `exhaustMap`: đang bận thì bỏ tick, không xếp hàng.
+
+Helper này cố ý để lỗi đi ra consumer. Nó chưa có retry hay sharing, để chính sách overlap dễ nhìn thấy:
+
+```ts
+import {
+  asyncScheduler,
+  defer,
+  exhaustMap,
+  timer,
+  type Observable,
+  type SchedulerLike,
+} from 'rxjs';
+
+function pollTicks<T>(
+  load: () => Observable<T>,
+  periodMs: number,
+  scheduler: SchedulerLike = asyncScheduler,
+): Observable<T> {
+  return timer(0, periodMs, scheduler).pipe(
+    exhaustMap(() => defer(load)),
+  );
+}
+```
+
+Đọc theo từng cột trong diagram: tick `b` đến khi request A còn hoạt động, nên không có inner B.
+
+<MarbleDiagram
+  title="exhaustMap(load)"
+  rows={[
+    { label: 'ticks', marble: 'a--b--c--d---', kind: 'source' },
+    { label: 'request A', marble: '^---x|-------', kind: 'inner' },
+    { label: 'request C', marble: '------^---y|-', kind: 'inner' },
+    { label: 'output', marble: '----x-----y--', kind: 'output' },
+  ]}
+  values={{
+    a: 'tick đầu tiên',
+    b: 'tick bị bỏ qua khi A đang chạy',
+    c: 'tick mở request C',
+    d: 'tick bị bỏ qua khi C đang chạy',
+    x: 'snapshot từ request A',
+    y: 'snapshot từ request C',
+  }}
+  caption="Tick b ở frame 3 và d ở frame 9 bị bỏ qua, không được giữ lại để chạy sau. Polling vẫn còn sống sau vùng thời gian đang vẽ."
+/>
+
+A subscribe ở frame 0, phát `x` ở frame 4 và complete ở frame 5. Tick `c` ở frame 6 mới được nhận; request C phát `y` ở frame 10 và complete ở frame 11. Vì source là timer chưa complete, output không complete chỉ vì request C đã xong.
+
+Những flattening operator khác không phải lựa chọn thay thế vô điều kiện:
+
+| Operator trên tick | Khi request chậm | Khi nên dùng |
+| --- | --- | --- |
+| `exhaustMap` | Bỏ tick trong lúc inner chưa complete | Snapshot định kỳ, không muốn overlap |
+| `switchMap` | Unsubscribe request trước, bắt đầu request mới | Input/query mới thay thế query cũ |
+| `concatMap` | Giữ tick trong queue, request chạy lần lượt | Mỗi trigger thực sự cần xử lý, không phải tick polling thông thường |
+| `mergeMap` | Có thể mở nhiều request đồng thời | Các tác vụ độc lập, có giới hạn concurrency rõ ràng |
+
+<Callout type="warn" title="switchMap có thể khiến polling không bao giờ có response">
+  Nếu mỗi request luôn chậm hơn chu kỳ, `switchMap` sẽ hủy nó trước khi response về, rồi lặp lại với request kế tiếp. Ngược lại, `concatMap` có thể tích lũy queue, còn `mergeMap` có thể đưa snapshot cũ về sau snapshot mới. Đừng chọn operator chỉ vì nó quen tay.
+</Callout>
+
+`exhaustMap` cũng cần timeout: một inner không bao giờ complete sẽ khiến mọi tick sau bị bỏ mãi. Nếu inner có retry và backoff, toàn bộ thời gian retry đó vẫn được tính là “đang bận”.
+
+### Polling sau khi response hoàn tất
+
+Với màn hình theo dõi job, mình thường chọn lịch sau response. Không có tick cần bỏ hay queue cần dọn; nhịp tự chậm lại khi server chậm.
+
+```ts
+import {
+  asyncScheduler,
+  defer,
+  repeat,
+  takeWhile,
+  timer,
+  type Observable,
+  type SchedulerLike,
+} from 'rxjs';
+
+function pollAfterResponse<T>(
+  load: () => Observable<T>,
+  continuePolling: (value: T) => boolean,
+  delayMs: number,
+  scheduler: SchedulerLike = asyncScheduler,
+): Observable<T> {
+  return defer(load).pipe(
+    repeat({ delay: () => timer(delayMs, scheduler) }),
+    // true: phát cả value đầu tiên khiến predicate trả false.
+    takeWhile(continuePolling, true),
+  );
+}
+```
+
+Hợp đồng của `load` ở đây là **mỗi lần subscribe có đúng một snapshot rồi complete**, như một HTTP GET. Nếu giả sử request mất 2 giây, khoảng nghỉ là 5 giây, các lần bắt đầu cách nhau khoảng 7 giây; đây không phải “gửi request mỗi 5 giây”.
+
+`repeat` chỉ resubscribe sau **complete**, không sau error. `defer(load)` gọi lại factory khi resubscribe, nên bạn tạo request mới và đọc các input hiện tại nếu factory có dùng chúng. Đừng truyền vào một Promise đã chạy hoặc một Observable replay kết quả cũ rồi kỳ vọng có request mới.
+
+## Polling một job với timeout và backoff
+
+Giờ thêm các điều kiện thực tế: job có trạng thái cuối, request có deadline, lỗi tạm thời được retry nhưng lỗi quyền truy cập phải dừng. Việc tạo job qua `POST` nên nằm ngoài vòng polling; phần dưới chỉ đọc `GET /api/jobs/:id`.
+
+### Retry có giới hạn và phân loại lỗi
+
+Helper dưới đây áp dụng capped exponential backoff với jitter. `retryIndex` bắt đầu từ 1; lần retry đầu có khoảng chờ ngẫu nhiên từ 500 đến dưới 1.000 ms, rồi tăng dần nhưng không vượt trần 30 giây. `random` và scheduler được truyền vào để test không phụ thuộc thời gian thật.
+
+```ts
+import {
+  asyncScheduler,
+  retry,
+  throwError,
+  timer,
+  type MonoTypeOperatorFunction,
+  type SchedulerLike,
+} from 'rxjs';
+
+function retryWithBackoff<T>(
+  isRetryable: (error: unknown) => boolean,
+  maxRetries = 3,
+  scheduler: SchedulerLike = asyncScheduler,
+  random: () => number = Math.random,
+): MonoTypeOperatorFunction<T> {
+  return retry<T>({
+    count: maxRetries,
+    resetOnSuccess: false,
+    delay: (error: unknown, retryIndex) => {
+      if (!isRetryable(error)) {
+        return throwError(() => error);
+      }
+
+      const capMs = Math.min(30_000, 1_000 * 2 ** (retryIndex - 1));
+      const waitMs = Math.floor(capMs / 2 + random() * capMs / 2);
+      return timer(waitMs, scheduler);
+    },
+  });
+}
+```
+
+Với `maxRetries = 3`, một request có tối đa **4 attempt**, gồm lần đầu. Giới hạn số attempt không đồng nghĩa giới hạn tổng thời gian: tổng còn gồm timeout của từng attempt và thời gian backoff.
+
+Mình chỉ retry lỗi có khả năng hết khi thử lại, và chỉ cho thao tác an toàn để lặp. Ví dụ đọc trạng thái có thể dùng policy sau:
+
+```ts
+import { TimeoutError } from 'rxjs';
+import { AjaxError } from 'rxjs/ajax';
+
+function isTransientReadError(error: unknown): boolean {
+  return error instanceof TimeoutError || (
+    error instanceof AjaxError && (
+      error.status === 0 ||
+      error.status === 408 ||
+      error.status === 500 ||
+      error.status === 502 ||
+      error.status === 503 ||
+      error.status === 504
+    )
+  );
+}
+```
+
+`status === 0` có thể là mất mạng nhưng cũng có thể là lỗi CORS hoặc cấu hình endpoint; retry sẽ không sửa được CORS. `400`, `401`, `403`, `404` không được retry trong policy này. Với token hết hạn, dùng một auth-refresh flow riêng có giới hạn, không cho mọi poll tự refresh token đồng thời.
+
+`429` cố ý không nằm trong ví dụ: nếu hỗ trợ, đọc `Retry-After` theo hợp đồng API, xử lý cả số giây lẫn HTTP date, và dùng thời gian server yêu cầu làm mức chờ tối thiểu. Backoff client không được rút ngắn thời gian đó. HTTP `503` cũng có thể mang `Retry-After`; policy minh họa này chưa xử lý header ấy, cần mở rộng trước khi dùng với API có yêu cầu này.
+
+<Callout type="warn" title="Retry không bảo đảm thao tác chỉ chạy một lần">
+  Timeout ở client không chứng minh server chưa xử lý request. Đừng đặt request tạo job, thanh toán hay gửi lệnh không idempotent trong helper polling này. Nếu phải retry mutation, cần hợp đồng idempotency/ack từ server; unsubscribe không hoàn tác công việc đã diễn ra.
+</Callout>
+
+### Dừng sau trạng thái cuối cùng
+
+Ghép hai helper đã định nghĩa để đọc trạng thái job. Timeout đặt **trước retry**, nên mỗi attempt có deadline riêng; repeat bọc bên ngoài để budget retry được tạo lại cho mỗi chu kỳ GET.
+
+```ts
+import { defer, timeout } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Job = Readonly<{
+  id: string;
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  progress: number;
+}>;
+
+function createJobPoll(jobId: string) {
+  const url = `/api/jobs/${encodeURIComponent(jobId)}`;
+
+  return pollAfterResponse(
+    () => defer(() => ajax.getJSON<Job>(url)).pipe(
+      timeout({ first: 10_000 }),
+      retryWithBackoff<Job>(isTransientReadError),
+    ),
+    (job) => job.status === 'queued' || job.status === 'running',
+    5_000,
+  );
+}
+
+const jobSub = createJobPoll('report-42').subscribe({
+  next: (job) => console.log('Snapshot:', job),
+  error: (error) => console.error('Dừng theo dõi do lỗi tải:', error),
+  complete: () => console.log('Luồng theo dõi đã complete'),
+});
+
+// Khi màn hình đóng hoặc đổi job:
+// jobSub.unsubscribe();
+```
+
+Generic `ajax.getJSON<Job>` chỉ khai báo kiểu TypeScript, không validate JSON ở runtime. Nếu response không đáng tin hoặc schema có thể thay đổi, validate trước khi xét `status`; lỗi schema nên dừng và báo lỗi protocol, không được retry như lỗi mạng.
+
+Đọc diagram dưới đây như một chuỗi request hữu hạn. Khoảng nghỉ minh họa là 3 frame tính từ complete, không phải 3 frame từ lúc nhận value:
+
+<MarbleDiagram
+  title="repeat → takeWhile(predicate, true)"
+  rows={[
+    { label: 'GET lần 1', marble: '^--r|--------', kind: 'inner' },
+    { label: 'GET lần 2', marble: '-------^--(s!)', kind: 'inner' },
+    { label: 'output', marble: '---r------(s|)', kind: 'output' },
+  ]}
+  values={{ r: 'job running', s: 'job succeeded' }}
+  caption="Snapshot succeeded được phát rồi output complete ngay. Không chờ thêm một chu kỳ và không mở GET lần 3."
+/>
+
+GET đầu phát `r` ở frame 3 rồi complete ở frame 4. GET tiếp theo subscribe ở frame 7, phát `s` ở frame 10; `takeWhile(..., true)` chuyển tiếp `s` rồi complete cũng ở frame 10. Renderer của project hỗ trợ nhóm `(s|)` để vẽ emission và completion cùng một frame; `(s!)` cho thấy inner GET thứ hai bị teardown ngay ở frame 10, trước completion tự nhiên dự kiến ở frame 11.
+
+<Callout type="warn" title="Đặt điều kiện dừng sau repeat">
+  Nếu đặt `takeWhile` trước `repeat`, trạng thái cuối khiến inner complete, và `repeat` lại coi đó là lý do để mở request tiếp theo. Tương tự, `takeUntil` đặt trước `repeat` có thể biến lệnh dừng thành tín hiệu khởi động lại. Điều kiện kết thúc toàn vòng phải nằm sau operator resubscribe.
+</Callout>
+
+`failed` trong payload là trạng thái nghiệp vụ cuối, không phải HTTP error để retry. Và callback `complete` chỉ nói stream đã kết thúc: nếu sau này thêm `takeUntil`, complete cũng có thể do người dùng rời màn hình. Hãy đọc `job.status` để quyết định thông báo thành công hay thất bại.
+
+### Lỗi một request có làm dừng cả polling không
+
+Trong `createJobPoll`, lỗi không retry được hoặc hết budget sẽ đi ra consumer và **dừng vòng polling**. UI có thể giữ snapshot cuối, hiển thị lỗi và cho nút “Thử lại” tạo subscription mới. Mình chọn cách này cho job có vòng đời rõ ràng vì không muốn âm thầm hỏi mãi sau `401` hay job ID không hợp lệ.
+
+Với dashboard cần sống lâu, bạn có thể bắt lỗi bên trong request của `exhaustMap` để tick tương lai vẫn chạy. Khi đó nên phát một state phân biệt rõ data và error, thay vì biến lỗi thành snapshot trống:
+
+```ts
+import { catchError, defer, exhaustMap, map, of, timer } from 'rxjs';
+
+// Dùng Job và isTransientReadError đã định nghĩa ở trên.
+const dashboard$ = timer(0, 5_000).pipe(
+  exhaustMap(() => defer(() => ajax.getJSON<Job>('/api/jobs/report-42')).pipe(
+    timeout({ first: 10_000 }),
+    retryWithBackoff<Job>(isTransientReadError),
+    map((data) => ({ kind: 'data' as const, data })),
+    catchError((error: unknown) => {
+      if (!isTransientReadError(error)) return throwError(() => error);
+      return of({ kind: 'error' as const, error });
+    }),
+  )),
+);
+```
+
+Ví dụ này tiếp tục các tick sau lỗi tạm thời, nhưng dừng với lỗi permanent. Sau khi hết retry của inner, tick tiếp theo có một budget mới; vì thế nó **không phải giới hạn retry cho cả phiên dashboard**. Nếu outage dài, cần circuit breaker, tăng khoảng nghỉ hoặc giới hạn thời gian degraded ở tầng phiên.
+
+Ngược lại, `catchError(() => EMPTY)` đặt ngoài toàn vòng sẽ thay vòng bằng stream complete: tick tiếp theo không còn tồn tại. Còn chuyển lỗi permanent thành `of(fallback)` trước `repeat` sẽ làm repeat tiếp tục như một lần đọc thành công. Vị trí bắt lỗi là một phần của policy, không chỉ là cách bỏ thông báo đỏ.
+
+## Gắn polling vào lifecycle của màn hình
+
+### Pause khi tab ẩn và khi offline
+
+Poll không cần chạy khi màn hình không dùng nó. Ví dụ browser dưới đây ngắt cả request đang chạy lẫn timer backoff khi tab ẩn hoặc browser báo offline; khi active trở lại, nó bắt đầu một vòng mới ngay.
+
+```ts
+import {
+  combineLatest,
+  defer,
+  distinctUntilChanged,
+  EMPTY,
+  fromEvent,
+  map,
+  merge,
+  shareReplay,
+  startWith,
+  switchMap,
+} from 'rxjs';
+
+// Chỉ gọi ở client khi view mount, không gọi lúc SSR/render.
+function createVisibleJobStream(jobId: string) {
+  const visible$ = defer(() =>
+    fromEvent(document, 'visibilitychange').pipe(
+      startWith(undefined),
+      map(() => document.visibilityState === 'visible'),
+      distinctUntilChanged(),
+    ),
+  );
+
+  const online$ = defer(() =>
+    merge(fromEvent(window, 'online'), fromEvent(window, 'offline')).pipe(
+      startWith(undefined),
+      map(() => navigator.onLine),
+      distinctUntilChanged(),
+    ),
+  );
+
+  return combineLatest([visible$, online$]).pipe(
+    map(([visible, online]) => visible && online),
+    distinctUntilChanged(),
+    switchMap((active) => active ? createJobPoll(jobId) : EMPTY),
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+}
+
+// Giữ cùng instance cho các consumer của cùng view/session.
+const visibleJob$ = createVisibleJobStream('report-42');
+const viewSub = visibleJob$.subscribe({
+  next: (job) => console.log(job),
+  error: (error) => console.error(error),
+});
+
+// Trong cleanup của view:
+// viewSub.unsubscribe();
+```
+
+Ở đây `switchMap` phù hợp vì **trạng thái active mới thay thế lifecycle cũ**, không phải mỗi tick thay thế request. `navigator.onLine` chỉ là gợi ý của browser, không chứng minh API truy cập được; timeout và retry vẫn cần thiết. Một ứng dụng mạng nội bộ có thể chọn không gate bằng `onLine` nếu tín hiệu đó không phù hợp môi trường.
+
+Có một giới hạn cần thấy rõ: inner job complete không làm stream DOM bên ngoài complete. Nếu job đã terminal, rồi tab ẩn và hiện lại, ví dụ sẽ GET lại để xác nhận trạng thái. Nếu muốn terminal kết thúc cả theo dõi, đặt thêm `takeWhile` theo trạng thái job **sau `switchMap`, trước sharing**, hoặc lưu terminal state ở service và không tạo vòng mới.
+
+Pause rồi resume cũng tạo lại budget retry. Nếu chính sách yêu cầu budget theo phiên hoặc deadline chung, lưu budget/deadline ngoài inner; đừng để việc đổi tab vô tình xóa giới hạn đó.
+
+### Chia sẻ execution và hiển thị stale data
+
+Đặt sharing sau phần request, retry và lifecycle để nhiều consumer của **cùng Observable instance** dùng chung một execution. Gọi `createVisibleJobStream` hai lần vẫn tạo hai vòng độc lập. `refCount: true` khiến consumer cuối rời đi thì upstream đang sống bị teardown, bao gồm listener DOM, request và timer.
+
+`ajax` có teardown cho XHR đang chạy; với adapter `fetch` tự viết, cần nối teardown với `AbortController`. Chỉ bọc một Promise vào Observable không khiến fetch tự bị abort. Dù client abort, server vẫn có thể đã nhận và xử lý request.
+
+Trong lúc pause, replay buffer vẫn có thể giữ snapshot cuối nếu còn consumer. UI không nên diễn giải “có data” thành “đang live”. Tối thiểu cần state như sau, được cập nhật từ lifecycle và kết quả request:
+
+```ts
+type LiveState<T> = {
+  data: T | undefined;
+  connection: 'paused' | 'connecting' | 'live' | 'reconnecting' | 'failed';
+  updatedAt: number | undefined;
+  stale: boolean;
+  error: unknown | undefined;
+};
+```
+
+Khi pause hoặc reconnect, giữ data nếu policy cho phép nhưng đánh dấu stale. Chỉ bỏ stale sau khi nhận snapshot/catch-up đáng tin, không ngay khi socket vừa open. Nếu dữ liệu có yêu cầu freshness chặt, kiểm tra tuổi snapshot lúc render và trước thao tác quyết định.
+
+<Callout type="info" title="Replay sau complete không phải một vòng polling mới">
+  Với RxJS 7.8.x, `shareReplay` giữ kết quả sau source complete. Nếu share một vòng job hữu hạn đã terminal, subscriber đến sau có thể chỉ nhận snapshot cuối rồi complete, không GET lại. Muốn refresh phải tạo generation mới hoặc thiết kế reset rõ ràng; `refCount: true` không tự giải quyết freshness sau complete.
+</Callout>
+
+Đừng tạo stream chứa dữ liệu cá nhân trong module singleton dùng chung cho SSR. Đổi user/tenant hoặc logout phải hủy scope cũ, bỏ replay buffer cũ và tạo scope mới, không chỉ đổi một biến token.
+
+## SSE với reconnect do trình duyệt quản lý
+
+`EventSource` phù hợp với stream một chiều. Browser đã có reconnect và xử lý trường SSE `retry`/`id`; không thêm một vòng `retry` bên ngoài mỗi lần nhận `error` event, vì event đó thường chỉ báo kết nối đang gián đoạn chứ chưa terminal.
+
+Adapter sau giữ nguyên cơ chế reconnect native, đồng thời có teardown thật. Endpoint minh họa phải gửi dữ liệu bằng event `message` mặc định; với named event như `event: job-updated`, đăng ký listener đúng tên.
+
+```ts
+import { Observable, shareReplay } from 'rxjs';
+
+type SseNotice =
+  | { kind: 'open' }
+  | { kind: 'message'; data: unknown; eventId: string }
+  | { kind: 'reconnecting' }
+  | { kind: 'protocol-error'; error: unknown };
+
+function observeSse(url: string): Observable<SseNotice> {
+  return new Observable((subscriber) => {
+    // Browser-only. GET cùng origin dùng cookie session nếu có.
+    const source = new EventSource(url);
+
+    source.onopen = () => subscriber.next({ kind: 'open' });
+    source.onmessage = (event) => {
+      try {
+        const data: unknown = JSON.parse(event.data);
+        subscriber.next({ kind: 'message', data, eventId: event.lastEventId });
+      } catch (error) {
+        // Policy minh họa: báo payload không hợp lệ, giữ kết nối.
+        subscriber.next({ kind: 'protocol-error', error });
+      }
+    };
+    source.onerror = () => {
+      if (source.readyState === EventSource.CLOSED) {
+        subscriber.error(new Error('SSE đã đóng, không còn reconnect native'));
+      } else {
+        subscriber.next({ kind: 'reconnecting' });
+      }
+    };
+
+    return () => {
+      source.onopen = null;
+      source.onmessage = null;
+      source.onerror = null;
+      source.close(); // Ngừng cả kết nối lẫn reconnect của EventSource này.
+    };
+  });
+}
+
+const updates$ = observeSse('/api/jobs/report-42/events').pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+const updatesSub = updates$.subscribe({
+  next: (notice) => console.log(notice),
+  error: (error) => console.error(error),
+});
+
+// updatesSub.unsubscribe();
+```
+
+`JSON.parse` chỉ chứng minh payload là JSON hợp lệ, không chứng minh đúng schema. Validate message trước khi cập nhật state. Replay trong ví dụ giữ **notice cuối**, không phải một `LiveState` đã tổng hợp; reducer của UI/service phải giữ data khi nhận notice `reconnecting` và xử lý event ID.
+
+Native reconnect không có budget hữu hạn trong adapter này. Nếu sản phẩm yêu cầu “sau một khoảng offline thì dừng và hiện nút thử lại”, thêm watchdog theo trạng thái reconnect và gọi unsubscribe/`close()` khi vượt deadline. Không tạo `EventSource` mới trong mọi callback `onerror` mà quên đóng cái cũ.
+
+`EventSource` native không cho tùy ý đặt header `Authorization`. Với cross-origin cookie cần `withCredentials: true` và CORS phù hợp; nếu dùng fetch-based SSE client thì phải tự quản lý reconnect/cursor theo API của client ấy. Tránh đưa bearer token dài hạn vào URL vì URL dễ lọt vào log.
+
+## WebSocket với reconnect có giới hạn
+
+WebSocket không tự reconnect như `EventSource`. Với RxJS, tạo socket mới qua `defer` mỗi lần retry; chia sẻ **sau** reconnect policy để hai consumer không tự mở hai chuỗi reconnect.
+
+Ví dụ sau dành cho nhận event, chỉ reconnect khi Observable báo error. Nó chưa có subscription protocol hay resume; các phần đó được bàn ở mục tiếp theo.
+
+```ts
+import { defer, shareReplay } from 'rxjs';
+import { webSocket } from 'rxjs/webSocket';
+
+type WireEvent = {
+  id: string;
+  revision: number;
+  job: Job;
+};
+
+// Gọi ở browser; /api/job-events là endpoint WebSocket minh họa.
+function createSocketUpdates() {
+  const url = new URL('/api/job-events', window.location.href);
+  url.protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+
+  return defer(() => webSocket<WireEvent>({ url: url.toString() })).pipe(
+    // Policy minh họa: budget 5 reconnect do error trong một execution.
+    retryWithBackoff<WireEvent>(() => true, 5),
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+}
+
+const socketUpdates$ = createSocketUpdates();
+const socketSub = socketUpdates$.subscribe({
+  next: (event) => console.log(event),
+  error: (error) => console.error('Hết budget reconnect:', error),
+  complete: () => console.log('Socket đã đóng bình thường'),
+});
+
+// socketSub.unsubscribe();
+```
+
+`resetOnSuccess: false` ở helper nghĩa là một message không xóa budget. Nếu đặt `true`, server phát một message rồi rớt liên tục vẫn có thể reconnect mãi. Nếu muốn reset sau một phiên ổn định, định nghĩa “ổn định” bằng thời gian healthy và trạng thái đã sync ở state machine, không chỉ bằng sự kiện open.
+
+Trong RxJS 7.8.x, `WebSocketSubject` thường complete khi close được đánh dấu clean, và error khi close không clean. **`retry` không chạy sau complete.** Vì vậy ví dụ không tự reconnect mọi lần server đóng socket; cần đối chiếu close code và hợp đồng protocol để phân biệt restart tạm thời với logout hoặc đóng chủ động.
+
+Có thể dùng `repeat({ count, delay })` cho các completion được phép reconnect, nhưng phải phân loại trước và giữ budget tổng nếu error/complete xen kẽ. `repeat` có `count` tính cả lần subscribe đầu, khác `retry.count` là số lần thử thêm. Đừng thêm `repeat()` vô hạn vì muốn “luôn kết nối”: nó có thể mở lại ngay sau lệnh đóng có chủ đích.
+
+Policy `() => true` cũng chỉ là điểm khởi đầu cho demo. Trong production, không retry lỗi parse/schema hoặc lỗi auth như lỗi mạng; adapter/protocol nên chuyển chúng thành loại lỗi có thể phân biệt. Browser không cho đọc chi tiết HTTP handshake thất bại như một response AJAX thông thường.
+
+Để phát hiện half-open connection, dùng heartbeat/pong hoặc timeout theo nhịp protocol. `timeout({ each: ... })` trực tiếp trên stream business event không phù hợp nếu server có thể im lặng hợp lệ: bạn sẽ đóng một socket khỏe chỉ vì chưa có job nào thay đổi. Heartbeat phải chứng minh kết nối và service còn responsive, không chỉ client vẫn gửi được byte.
+
+## Khôi phục dữ liệu sau reconnect
+
+Socket open trở lại không chứng minh dữ liệu đã đầy đủ. Có thể job chuyển từ `running` sang `succeeded` trong lúc bạn offline, và server chỉ gửi các thay đổi mới sau khi kết nối lại.
+
+Mình tách ba trạng thái: transport connected, đang đồng bộ dữ liệu, và live. Một flow resume đơn giản là:
+
+```text
+disconnected → backoff → connected → resume hoặc tải snapshot → live
+                            └── cursor hết hạn / có gap ──→ resync
+```
+
+Để flow đó đúng, client và server phải cùng thống nhất:
+
+1. **Cursor/revision:** mỗi event có ID hoặc version theo scope đã định nghĩa. SSE `id` chỉ hỗ trợ mang cursor; server vẫn phải có dữ liệu và logic replay.
+2. **Resume:** reconnect gửi cursor cuối đã áp dụng. WebSocket cần gửi lại subscribe/resume message sau mỗi socket mới, không chỉ sau socket đầu.
+3. **Deduplication:** event được replay có thể trùng; áp dụng idempotent theo ID hoặc revision. Không gọi đây là exactly-once chỉ vì đã dùng `distinctUntilChanged`.
+4. **Gap recovery:** cursor quá cũ hoặc mất event thì tải snapshot có revision và khởi động catch-up theo hợp đồng server.
+5. **Scope:** cursor của job/user/tenant này không được dùng cho scope khác. Logout hủy cả kết nối và các lệnh đang chờ.
+
+Nếu dùng SSE native và cùng một `EventSource` đang reconnect, browser duy trì last event ID để phục vụ resume. Nếu bạn đóng object rồi tạo mới, đừng giả định cursor ấy vẫn được giữ: lưu cursor bên ngoài và truyền theo cơ chế endpoint hỗ trợ. `Last-Event-ID` không buộc server phải replay được mọi event.
+
+<Callout type="warn" title="Snapshot rồi mở stream có thể làm mất thay đổi ở giữa">
+  Nếu GET snapshot xong mới subscribe mà không có cursor, event xuất hiện giữa hai bước có thể bị mất. Cần snapshot kèm revision và subscribe từ revision đó, hoặc subscribe trước, buffer event rồi hợp nhất với snapshot theo version. Không có hợp đồng phía server thì operator ở client không thể tự đóng khoảng trống này.
+</Callout>
+
+Nếu buộc phải fallback từ push sang polling, dùng một mode state và `switchMap` để chỉ một transport có quyền cập nhật state tại một thời điểm. Đổi mode liên tục cần cooldown/hysteresis; đừng chạy polling và socket song song rồi hy vọng response nào đến cuối cũng mới nhất.
+
+Với server gửi nhanh hơn UI xử lý, có thể coalesce snapshot bằng `auditTime` để giảm render. Nhưng không được bỏ event dạng delta như “tăng tiến độ thêm 1” trước khi reducer áp dụng nó. WebSocket phía browser không tự tạo backpressure cho producer; queue lớn cần policy ở protocol/server, không chỉ thêm một operator ở UI.
+
+## Kiểm thử timing và teardown
+
+Những test dưới đây dùng helper của bài. Đặt chúng cùng module với helper hoặc export/import trong ứng dụng của bạn. Các giá trị thời gian được rút ngắn thành virtual frame; không dùng sleep thật để kiểm tra polling.
+
+### Tick đang bận bị bỏ qua
+
+Test này là nguồn kiểm chứng cho diagram `exhaustMap`: chỉ có request ở frame 0 và 6, không có request ở frame 3 hay 9.
+
+```ts
+import { TestScheduler } from 'rxjs/testing';
+
+function newScheduler() {
+  return new TestScheduler((actual, expected) => {
+    // Có thể thay bằng expect(actual).toEqual(expected) trong Jest/Vitest.
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error('Marble assertion failed');
+    }
+  });
+}
+
+const tickScheduler = newScheduler();
+tickScheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const request = cold('----x|');
+  const output$ = pollTicks(() => request, 3, tickScheduler);
+
+  // Hủy trước tick ở frame 12 để test không chạy timer vô hạn.
+  expectObservable(output$, '^----------!').toBe('----x-----x');
+  expectSubscriptions(request.subscriptions).toBe([
+    '^----!',
+    '------^----!',
+  ]);
+});
+```
+
+Output đúng mà có thêm request thừa vẫn là bug. Vì vậy luôn assert `request.subscriptions`, không chỉ các snapshot nhận được.
+
+### Job hoàn tất không mở thêm request
+
+Test dùng request cuối có emission ở frame 10 và completion tự nhiên ở frame 11. Output phải phát cả terminal snapshot và complete **cùng frame 10**, đồng thời teardown inner ở frame 10.
+
+```ts
+const jobScheduler = newScheduler();
+jobScheduler.run(({ cold, expectObservable, expectSubscriptions, flush }) => {
+  const running = cold('---r|', { r: { status: 'running' } });
+  const succeeded = cold('---s|', { s: { status: 'succeeded' } });
+  let calls = 0;
+
+  const output$ = pollAfterResponse(
+    () => (++calls === 1 ? running : succeeded),
+    (job) => job.status === 'running',
+    3,
+    jobScheduler,
+  );
+
+  expectObservable(output$).toBe('---r------(s|)', {
+    r: { status: 'running' },
+    s: { status: 'succeeded' },
+  });
+  expectSubscriptions(running.subscriptions).toBe('^---!');
+  expectSubscriptions(succeeded.subscriptions).toBe('-------^--!');
+
+  flush();
+  if (calls !== 2) throw new Error('Polling continued after terminal state');
+});
+```
+
+### Unsubscribe hủy timer backoff
+
+Request lỗi ở frame 2. Với `random = () => 0`, retry đầu chờ 500 frame trong run mode. Hủy ở frame 100 phải làm timer đó biến mất, không có attempt thứ hai ở frame 502.
+
+```ts
+const backoffScheduler = newScheduler();
+backoffScheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const request = cold('--#', {}, new Error('temporary outage'));
+  const output$ = request.pipe(
+    retryWithBackoff(() => true, 3, backoffScheduler, () => 0),
+  );
+
+  expectObservable(output$, '^ 99ms !').toBe('');
+  expectSubscriptions(request.subscriptions).toBe('^-!');
+});
+```
+
+Marble test kiểm tra subscription logic, không chứng minh browser đã abort network hay socket đã close. Bổ sung test adapter/integration cho những đường sau:
+
+| Trường hợp | Điều cần assert |
+| --- | --- |
+| Request treo | Timeout teardown request, attempt tiếp theo có budget đúng |
+| `401` hoặc `403` | Không retry theo policy đọc; UI nhận lỗi cần xử lý auth |
+| Lỗi tạm thời liên tục | Có đúng số attempt, delay nằm trong khoảng jitter, không vượt budget |
+| Stop trong request hoặc khoảng nghỉ repeat | Request/timer bị hủy, không có lần load tiếp theo |
+| Hai consumer, một consumer rời đi | Một execution; chỉ teardown upstream khi consumer cuối rời |
+| Tab ẩn rồi hiện | Pause hủy inner, resume đọc mới; data cũ được đánh dấu stale |
+| SSE báo error khi còn reconnect | Không tạo thêm `EventSource`; unsubscribe gọi `close()` |
+| WebSocket close clean và không clean | Đi đúng nhánh complete/error theo adapter và close policy |
+| Reconnect có event trùng hoặc gap | Deduplicate đúng scope, resync khi cursor không còn dùng được |
+| Logout trong lúc backoff | Không reconnect session cũ, không replay dữ liệu cũ |
+| Server im lặng nhưng heartbeat khỏe | Không reconnect nhầm vì thiếu business event |
+
+## Checklist vận hành
+
+- [ ] Đã chọn lịch theo nhịp hay sau response; không có queue/overlap ngoài ý muốn.
+- [ ] Có timeout từng attempt, retry budget và giới hạn thời gian theo phiên nếu cần.
+- [ ] Chỉ retry lỗi phù hợp; tôn trọng `Retry-After` khi API yêu cầu.
+- [ ] Terminal status được phát cho UI rồi dừng; create-job/mutation nằm ngoài vòng đọc.
+- [ ] Consumer cuối rời đi hủy network, timer và listener; đã kiểm tra adapter thật.
+- [ ] UI phân biệt có data, stale, đang reconnect và đã đồng bộ xong.
+- [ ] Có một owner cho reconnect: native SSE hoặc policy client, không hai vòng cạnh tranh.
+- [ ] Socket mới thực hiện lại auth/subscription/resume theo protocol.
+- [ ] Có cursor, deduplication và gap recovery nếu sản phẩm không chấp nhận mất event.
+- [ ] Scope user/tenant được reset lúc logout; không dùng singleton dữ liệu cá nhân trên SSR.
+
+Theo dõi request rate, latency, timeout, số attempt, reconnect rate, thời gian offline, tuổi snapshot, gap/resync và số connection đang mở. Đặt metric request trước sharing để đếm execution, không đếm mỗi lần delivery cho component. Với nhiều client, cân nhắc jitter cho khoảng polling bình thường hoặc phase ban đầu nữa; jitter retry không ngăn tất cả client gửi tick đầu cùng lúc. Không log token hay payload nhạy cảm khi debug reconnect.
+
+Bắt đầu với một màn hình cụ thể: chọn mức trễ dữ liệu chấp nhận được, viết test API chậm hơn chu kỳ và test đóng view lúc backoff. Nếu dùng push, viết thêm hợp đồng resume với phía server trước khi bật reconnect tự động.
+
+## Nguồn tham khảo
+
+- [RxJS exhaustMap](https://rxjs.dev/api/operators/exhaustMap) — bỏ input khi inner còn hoạt động.
+- [Implementation repeat 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/repeat.ts) — resubscribe sau complete và delay notifier.
+- [Implementation retry 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/retry.ts) — retry count, delay và reset khi có emission.
+- [RxJS timeout](https://rxjs.dev/api/operators/timeout) — deadline cho emission và teardown khi timeout.
+- [RxJS WebSocketSubject](https://rxjs.dev/api/webSocket/WebSocketSubject) — lifecycle và chia sẻ WebSocket.
+- [MDN Using server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events) — `EventSource`, reconnect, `close`, `id` và `retry`.
+- [RxJS TestScheduler](https://rxjs.dev/api/testing/TestScheduler) — kiểm thử notification và subscription bằng virtual time.
+
+## Học tiếp
+
+<Cards>
+  <Card title="exhaustMap" href="/docs/higher-order-observables/exhaust-map" description="Hiểu rõ input nào bị bỏ qua khi inner còn chạy." />
+  <Card title="Retry và retryWhen" href="/docs/loi-hoan-tat/retry-retry-when" description="Thiết kế retry có phân loại lỗi và giới hạn." />
+  <Card title="WebSocket" href="/docs/tich-hop/websocket" description="Tích hợp transport với lifecycle của ứng dụng." />
+  <Card title="Cache dữ liệu" href="/docs/patterns-production/cache-data" description="Phân biệt replay, freshness và refresh." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm chứng timing và subscription bằng TestScheduler." />
+</Cards>

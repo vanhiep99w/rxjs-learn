@@ -3,8 +3,412 @@ title: Mất emission
 description: Điều tra timing, hot stream và subscription quá muộn.
 ---
 
-Trang này sẽ trình bày **Mất emission** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn thấy producer gọi `next()`, nhưng màn hình không cập nhật và `subscribe` không nhận được gì. Đừng vội thêm `shareReplay(1)`: giá trị có thể đã phát trước khi consumer subscribe, bị operator lọc bỏ, hoặc xuất hiện sau khi subscription đã đóng. Ba trường hợp này cần ba cách sửa khác nhau.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình bắt đầu bằng việc tìm **ranh giới cuối cùng còn nhìn thấy emission**, rồi kiểm tra lifecycle tại ranh giới đó. Trang này là một hướng dẫn troubleshooting: tái hiện lỗi, đọc timeline, chọn cách sửa và khóa hành vi bằng test.
+
+<Callout type="info" title="Phạm vi">
+  Ví dụ dùng TypeScript và RxJS 7.8.x, import từ `rxjs`. Bạn cần biết `Observable`, `Subject`, `pipe` và unsubscribe. RxJS không có sẵn trong dependency của site tài liệu này; chạy ví dụ trong ứng dụng hoặc playground đã có RxJS, không cần thêm dependency vào site để đọc bài.
 </Callout>
+
+## Mục lục
+
+- [Phân loại triệu chứng](#phân-loại-triệu-chứng)
+- [Khoanh vùng bằng lifecycle và tap](#khoanh-vùng-bằng-lifecycle-và-tap)
+  - [Đặt log tại các ranh giới](#đặt-log-tại-các-ranh-giới)
+  - [Đọc kết quả và tránh thay đổi lỗi](#đọc-kết-quả-và-tránh-thay-đổi-lỗi)
+- [Subscription quá muộn](#subscription-quá-muộn)
+  - [Subject không giữ lịch sử](#subject-không-giữ-lịch-sử)
+  - [Cold Observable vẫn có thể phát đồng bộ](#cold-observable-vẫn-có-thể-phát-đồng-bộ)
+- [Chọn cách giữ hoặc tạo dữ liệu](#chọn-cách-giữ-hoặc-tạo-dữ-liệu)
+  - [State hiện tại và lịch sử ngắn](#state-hiện-tại-và-lịch-sử-ngắn)
+  - [shareReplay chỉ giữ dữ liệu đã quan sát](#sharereplay-chỉ-giữ-dữ-liệu-đã-quan-sát)
+- [Operator không chuyển tiếp emission](#operator-không-chuyển-tiếp-emission)
+  - [Lọc và gom theo thời gian](#lọc-và-gom-theo-thời-gian)
+  - [combineLatest và withLatestFrom chưa đủ dữ liệu](#combinelatest-và-withlatestfrom-chưa-đủ-dữ-liệu)
+  - [switchMap hủy và exhaustMap bỏ qua](#switchmap-hủy-và-exhaustmap-bỏ-qua)
+- [Subscription đóng trước dữ liệu](#subscription-đóng-trước-dữ-liệu)
+- [Test hồi quy bằng virtual time](#test-hồi-quy-bằng-virtual-time)
+- [Checklist xác nhận bản sửa](#checklist-xác-nhận-bản-sửa)
+- [Đọc tiếp](#đọc-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Phân loại triệu chứng
+
+“Mất emission” là triệu chứng của consumer, chưa phải kết luận về producer. Ghi lại một input cụ thể, thời điểm producer phát, thời điểm consumer subscribe và thời điểm consumer rời trang. Sau đó chọn nhánh điều tra từ bảng này.
+
+| Dấu hiệu | Kiểm tra trước | Hướng sửa |
+| --- | --- | --- |
+| Không thấy log subscribe | Pipeline chưa có consumer, hoặc subscribe vào nhánh khác | Kiểm tra nơi subscribe và instance đang dùng |
+| Producer phát trước log subscribe | Hot stream và late subscriber | Subscribe sớm hơn, hoặc giữ state nếu nghiệp vụ cần |
+| Có log trước operator nhưng không có sau | Operator lọc, chờ, gom hoặc hủy | Đối chiếu policy của operator với yêu cầu |
+| Có `finalize` trước response | Subscription đã đóng | Tìm `take`, notifier, cancellation hoặc lỗi |
+| Có log cuối pipeline nhưng UI không đổi | Notification đã đến consumer | Kiểm tra nhánh render, state update và cơ chế change detection của framework |
+| Hai phía dùng cùng tên biến nhưng không cùng instance | Hai `Subject`, service hoặc Observable được tạo riêng | Kiểm tra scope provider, factory và reference identity |
+
+`pipe(...)` chỉ tạo pipeline; nó không tự subscribe. Với cold Observable lazy, không có subscription thì thường cũng không có producer chạy. Với hot producer đang chạy độc lập, không có consumer thì producer vẫn có thể phát, nhưng bạn chưa thiết lập đường nhận dữ liệu.
+
+## Khoanh vùng bằng lifecycle và tap
+
+### Đặt log tại các ranh giới
+
+Đặt instrumentation vào **pipeline mà consumer thật đang dùng**. Helper dưới đây ghi thời điểm subscribe, notifications và lúc đóng subscription; `defer` giữ biến `terminal` riêng cho từng lần subscribe.
+
+```ts
+import { defer, finalize, tap } from 'rxjs';
+import type { MonoTypeOperatorFunction } from 'rxjs';
+
+function trace<T>(label: string): MonoTypeOperatorFunction<T> {
+  return (source$) => defer(() => {
+    let terminal: 'complete' | 'error' | undefined;
+    const log = (event: string, value?: unknown) =>
+      console.log(Date.now(), label, event, value);
+
+    log('subscribe');
+    return source$.pipe(
+      tap({
+        next: (value) => log('next', value),
+        error: (error) => {
+          terminal = 'error';
+          log('error', error);
+        },
+        complete: () => {
+          terminal = 'complete';
+          log('complete');
+        },
+      }),
+      finalize(() => log('closed', terminal ?? 'unsubscribe')),
+    );
+  });
+}
+```
+
+Chèn helper trước và sau operator nghi ngờ. Đây là mẫu áp dụng với `input$`, `isValid`, `load` của ứng dụng, không phải một chương trình độc lập:
+
+```ts
+const result$ = input$.pipe(
+  trace('input'),
+  filter(isValid),
+  trace('after filter'),
+  switchMap((input) => load(input).pipe(trace('inner'))),
+  trace('result'),
+);
+// Gắn result$ vào consumer hiện có; không tạo thêm consumer chỉ để log.
+```
+
+Trong file ứng dụng, import thêm `filter`, `switchMap` từ `rxjs`. Nếu dùng multicasting, đặt log trước `share`/`shareReplay` để quan sát upstream, sau chúng để quan sát từng consumer. Hai vị trí có thể cho số lần subscribe khác nhau mà không có lỗi.
+
+### Đọc kết quả và tránh thay đổi lỗi
+
+Tìm emission đầu tiên xuất hiện ở log trước operator nhưng không xuất hiện ở log sau. Nếu `inner` chỉ ghi `subscribe` rồi `closed unsubscribe`, đó là cancellation, chưa đủ bằng chứng để gọi producer bị lỗi. Nếu `result` đã ghi `next`, chuyển sang điều tra consumer thay vì sửa RxJS.
+
+`finalize` chạy khi complete, error **và** unsubscribe; nó không chứng minh request thành công. Một operator downstream như `take(1)` còn có thể complete consumer nhưng unsubscribe upstream. Đọc tên ranh giới cùng với loại terminal notification.
+
+<Callout type="warn" title="Một subscription debug có thể che mất lỗi">
+  Subscribe thêm vào `shareReplay` có thể giữ upstream kết nối và buffer tồn tại. Subscribe thêm vào cold HTTP Observable có thể tạo request mới. Instrument bằng `tap` trong đường đi hiện có trước; nếu cần observer riêng, phải tính cả tác động lifecycle của nó.
+</Callout>
+
+Chỉ log ID và các field cần thiết, không log token hay dữ liệu nhạy cảm. DevTools có thể hiển thị object theo reference sau khi object đã bị mutate; khi điều tra giá trị tại một thời điểm, ghi một snapshot của các field primitive cần so sánh.
+
+## Subscription quá muộn
+
+### Subject không giữ lịch sử
+
+Ví dụ sau không có race giữa các thread: mọi thứ chạy đồng bộ theo thứ tự viết trong code. `Subject` không replay, nên `ready` đã đi qua trước khi có người nghe.
+
+```ts
+import { Subject } from 'rxjs';
+
+const events$ = new Subject<string>();
+events$.next('ready');
+
+const subscription = events$.subscribe((value) => console.log(value));
+events$.next('updated'); // In: updated; không in ready.
+subscription.unsubscribe();
+```
+
+Đọc theo cột dọc: ở frame 1 source phát `a`, nhưng consumer chỉ bắt đầu ở frame 3.
+
+<MarbleDiagram
+  title="Subject + late subscribe"
+  rows={[
+    { label: 'source', marble: '-a---b---c-|', kind: 'source' },
+    { label: 'consumer', marble: '---^', kind: 'subscription' },
+    { label: 'output', marble: '-----b---c-|', kind: 'output' },
+  ]}
+  values={{ a: 'ready', b: 'updated', c: 'saved' }}
+  caption="Consumer subscribe ở frame 3 nên không nhận a ở frame 1. Nó nhận b ở frame 5, c ở frame 9 và complete ở frame 11."
+/>
+
+Subscription giữ nguyên từ frame 3 đến khi source complete ở frame 11. Source không mất `a`; chỉ consumer này chưa có mặt khi `a` được phát. Giống nghe một thông báo trực tiếp sau khi câu đầu đã kết thúc: không có bản ghi thì bạn không nghe lại được câu đầu. Phép so sánh này chỉ nói về lịch sử; RxJS còn có lifecycle và terminal notifications mà loa thông báo không mô tả.
+
+Nếu `ready` là state hiện tại cần hiển thị cho consumer đến muộn, dùng state có replay. Nếu đó là event chỉ có ý nghĩa tại thời điểm xảy ra, ưu tiên đăng ký consumer trước producer. Không replay một click “thanh toán” chỉ để tránh mất emission: consumer mới có thể thực hiện lại side effect.
+
+### Cold Observable vẫn có thể phát đồng bộ
+
+Đừng dựa vào giả định “subscribe xong mới có giá trị”. `of` và nhiều Observable tự viết phát ngay bên trong lời gọi `subscribe`. Nếu bạn nối chúng vào `Subject` trước khi UI nghe, UI vẫn bỏ lỡ dữ liệu:
+
+```ts
+import { of, Subject } from 'rxjs';
+
+const bridge$ = new Subject<number>();
+of(1).subscribe((value) => bridge$.next(value));
+
+const ui = bridge$.subscribe(console.log); // Không in gì.
+ui.unsubscribe();
+```
+
+Nếu chỉ cần chuyển đổi dữ liệu, bỏ bridge và đưa Observable trực tiếp cho consumer. Khi cần tạo nguồn riêng mỗi lần subscribe, dùng `defer`:
+
+```ts
+import { defer, of } from 'rxjs';
+
+const value$ = defer(() => of(1));
+value$.subscribe(console.log); // In: 1.
+```
+
+`defer` trì hoãn việc gọi factory đến lúc subscribe; nó không biến một hot `Subject` thành kho lưu trữ. `defer(() => existingSubject)` vẫn không lấy lại giá trị đã phát. Cũng đừng chữa thứ tự bằng `setTimeout`: đổi timing có thể che lỗi trong một lần chạy mà không thiết lập hợp đồng dữ liệu rõ ràng.
+
+## Chọn cách giữ hoặc tạo dữ liệu
+
+### State hiện tại và lịch sử ngắn
+
+Chọn công cụ theo thứ consumer được quyền nhận, không theo việc công cụ nào làm log xuất hiện trở lại.
+
+| Nhu cầu | Mặc định chọn | Đổi lại |
+| --- | --- | --- |
+| Event mới, không phát lại event cũ | `Subject` hoặc nguồn event trực tiếp | Consumer đến muộn không có lịch sử |
+| State hiện tại với giá trị khởi tạo hợp lệ | `BehaviorSubject(initial)` | Consumer nhận initial ngay; phải mô hình hóa state loading nếu chưa có dữ liệu |
+| Chưa có initial, nhưng muốn giữ giá trị mới nhất đã phát | `ReplaySubject(1)` | Consumer chờ đến emission đầu tiên; chỉ giữ một giá trị |
+| Share một Observable và replay dữ liệu đã quan sát | `shareReplay({ bufferSize: 1, refCount: true })` | Cần quyết định vòng đời kết nối và cache |
+| Mỗi consumer cần một lần thực thi riêng | Cold Observable hoặc `defer` | Có thể lặp side effect/request giữa consumers |
+
+Ví dụ state chưa có initial:
+
+```ts
+import { ReplaySubject } from 'rxjs';
+
+const state$ = new ReplaySubject<string>(1);
+state$.next('ready');
+
+const ui = state$.subscribe((value) => console.log(value)); // In: ready.
+state$.next('updated'); // In: updated.
+ui.unsubscribe();
+state$.complete();
+```
+
+Buffer của `ReplaySubject` này tồn tại vì owner đã tạo subject trước khi gọi `next`. Nó không cần consumer đầu tiên để bắt đầu ghi vào buffer. `BehaviorSubject` cũng giữ state nhưng cần initial và không phát lại giá trị hiện tại cho subscriber mới sau khi đã complete; `ReplaySubject` có thể replay buffer rồi complete cho subscriber đến sau.
+
+<Callout type="warn" title="Replay một giá trị không phải bảo đảm nhận mọi event">
+  `ReplaySubject(1)` chỉ giữ giá trị gần nhất, không cứu toàn bộ lịch sử và không lưu qua restart. Nếu nghiệp vụ yêu cầu xử lý đủ mọi command, cần queue hoặc event log có lưu bền, acknowledgment và cơ chế chống xử lý trùng; một replay buffer không thay thế được các cơ chế đó.
+</Callout>
+
+### shareReplay chỉ giữ dữ liệu đã quan sát
+
+`shareReplay` tạo kết nối upstream khi có consumer đầu tiên. Tạo biến `shared$` không đủ để operator nghe source:
+
+```ts
+import { shareReplay, Subject } from 'rxjs';
+
+const source$ = new Subject<string>();
+const shared$ = source$.pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+source$.next('before connection');
+const first = shared$.subscribe((value) => console.log('first:', value));
+// Không replay before connection: chưa có upstream subscription lúc phát.
+
+source$.next('connected'); // In: first: connected.
+const late = shared$.subscribe((value) => console.log('late:', value));
+// In ngay: late: connected.
+
+first.unsubscribe();
+late.unsubscribe(); // RefCount về 0 khi source chưa complete: ngắt và reset buffer.
+
+source$.next('during gap');
+const again = shared$.subscribe((value) => console.log('again:', value));
+// Không nhận connected hoặc during gap.
+source$.next('fresh'); // In: again: fresh.
+again.unsubscribe();
+```
+
+Hai khoảng trống khác nhau nhưng có cùng kết quả: trước consumer đầu tiên chưa có kết nối, và sau consumer cuối cùng rời đi đã ngắt kết nối. Đổi sang `refCount: false` chỉ giữ upstream sau khi nó đã kết nối; **không** làm operator kết nối ngay từ lúc khai báo.
+
+Trong RxJS 7.8.x, `shareReplay` giữ buffer khi source complete thành công, kể cả với `refCount: true`. Vì vậy “refCount về 0 luôn xóa cache” cũng sai. Source đang chạy, source complete và source error có policy reset khác nhau.
+
+Mình chọn `refCount: true` cho nguồn đang chạy được sở hữu bởi consumers, để không giữ timer hoặc socket vô hạn. Nếu state cần sống qua khoảng UI không có subscriber, đặt state trong owner có lifecycle rõ ràng, hoặc chủ động giữ kết nối và chịu trách nhiệm teardown. Đừng thêm một subscription không có owner chỉ để cache còn sống.
+
+Cuối cùng, kiểm tra `shared$` có được tạo một lần trong scope phù hợp không. Gọi factory tạo `source$.pipe(shareReplay(...))` cho mỗi consumer sẽ tạo nhiều cache riêng; cùng tên hàm không có nghĩa dùng chung buffer.
+
+## Operator không chuyển tiếp emission
+
+### Lọc và gom theo thời gian
+
+Nếu subscription đã hoạt động nhưng emission dừng ở một operator, đối chiếu hành vi của operator trước khi đổi công cụ. Một pipeline không nhất thiết chuyển tiếp mỗi input thành một output.
+
+| Operator | Vì sao input không xuất hiện nguyên vẹn ở output? | Điều cần kiểm tra |
+| --- | --- | --- |
+| `filter` | Predicate trả `false` | Giá trị thật, đặc biệt `0`, `false`, chuỗi rỗng khi dùng `filter(Boolean)` |
+| `distinctUntilChanged` | Giá trị bằng emission đã chuyển tiếp trước đó | Comparator; mặc định dùng `===`, cùng reference object có thể bị bỏ dù field đã mutate |
+| `skip(n)` | Bỏ `n` giá trị đầu | Có đang bỏ luôn state initial cần render không? |
+| `debounceTime` | Giữ giá trị mới nhất, chờ đủ khoảng yên | Source có phát liên tục không? Consumer có rời đi trước lúc flush không? |
+| `throttleTime` / `auditTime` | Chỉ chuyển tiếp một phần giá trị theo cửa sổ thời gian | Giá trị đầu/cuối nào cần giữ; cấu hình leading/trailing nếu operator hỗ trợ |
+| `take(1)` | Chỉ nhận giá trị đầu rồi complete | Emission đầu có chỉ là state loading hoặc initial không? |
+
+Với object mutable, tạo object mới cho state update hoặc đặt comparator theo field nghiệp vụ. Đừng bỏ `distinctUntilChanged` một cách mặc định: nếu mục tiêu là tránh render trùng, cần sửa cách định nghĩa “trùng”.
+
+`debounceTime` phát giá trị pending khi upstream complete, nhưng không flush khi consumer unsubscribe. Nếu UI rời trang trong lúc chờ, không có emission cuối là đúng lifecycle. Nếu yêu cầu là autosave chắc chắn trước khi rời trang, thiết kế một luồng flush có owner phù hợp thay vì chỉ tăng thời gian chờ.
+
+### combineLatest và withLatestFrom chưa đủ dữ liệu
+
+`combineLatest` chờ mỗi nguồn có ít nhất một giá trị rồi mới phát tuple. Nó không phát một tuple cho từng event đã đến trong lúc chờ; khi đủ dữ liệu, nó dùng giá trị mới nhất của từng nguồn.
+
+`withLatestFrom` cũng cần mỗi nguồn phụ có giá trị, nhưng chỉ source chính mới kích hoạt output. Một click đến trước state không được xếp hàng để xử lý lại khi state xuất hiện:
+
+```ts
+import { Subject, withLatestFrom } from 'rxjs';
+
+const clicks$ = new Subject<string>();
+const token$ = new Subject<string>();
+const subscription = clicks$.pipe(withLatestFrom(token$)).subscribe(console.log);
+
+clicks$.next('first'); // Chưa có token: không có output.
+token$.next('token-A'); // Có token vẫn không phát lại first.
+clicks$.next('second'); // In: ['second', 'token-A'].
+subscription.unsubscribe();
+```
+
+Nếu state có initial hợp lệ, dùng `BehaviorSubject` hoặc `startWith` cho giá trị đó. Nếu chưa có token thật, khóa thao tác đến lúc ready hoặc thiết kế queue rõ ràng. Không seed token rỗng chỉ để pipeline phát: bạn sẽ chuyển từ lỗi timing sang request không hợp lệ.
+
+Nếu muốn UI cập nhật khi **bất kỳ** nguồn nào đổi, chọn `combineLatest`. Nếu chỉ muốn xử lý click với state mới nhất, giữ `withLatestFrom`. Hai operator giải quyết hai yêu cầu khác nhau, không phải bản sửa thay thế tùy ý.
+
+### switchMap hủy và exhaustMap bỏ qua
+
+Với `switchMap`, input mới unsubscribe inner cũ. Các giá trị inner cũ đã phát vẫn đến output, nhưng response đến sau cancellation không được chuyển tiếp. Với `exhaustMap`, input mới trong lúc inner đang chạy bị bỏ qua; operator không gọi project cho input đó và không giữ queue.
+
+Đặt `trace` bên trong inner để phân biệt hai trường hợp: inner cũ được subscribe rồi bị đóng, hay input mới chưa từng tạo inner. Chọn policy theo nghiệp vụ:
+
+- Tìm kiếm theo từ khóa mới nhất: thường giữ `switchMap`.
+- Mọi command phải được xử lý theo thứ tự: cân nhắc `concatMap`, đồng thời giới hạn backlog ở tầng thiết kế.
+- Tác vụ có thể chạy song song: `mergeMap` với concurrency phù hợp.
+- Chống submit lặp khi lần trước chưa xong: `exhaustMap` nếu bỏ qua input là chủ đích.
+
+Unsubscribe HTTP ở client không bảo đảm backend chưa thực hiện side effect. Không đổi từ `switchMap` sang `mergeMap` chỉ để thấy mọi response nếu việc đó làm nhiều lệnh ghi chạy cùng lúc.
+
+## Subscription đóng trước dữ liệu
+
+Nếu log cho thấy subscription đã đóng, replay không làm subscription đó sống lại. Kiểm tra owner và những operator có quyền kết thúc luồng: `take`, `takeUntil`, `first`, `timeout`, lỗi chưa xử lý, hoặc `catchError(() => EMPTY)` biến lỗi thành complete không có dữ liệu.
+
+Một lỗi dễ tái hiện là dùng `BehaviorSubject(false)` làm notifier cho `takeUntil`, với ý nghĩ `false` có nghĩa “chưa destroy”:
+
+```ts
+import { BehaviorSubject, of, takeUntil } from 'rxjs';
+
+const destroyed$ = new BehaviorSubject(false);
+of('data').pipe(takeUntil(destroyed$)).subscribe({
+  next: console.log,
+  complete: () => console.log('complete'),
+});
+// Chỉ in complete; of('data') chưa được subscribe.
+```
+
+`takeUntil` dừng ở **bất kỳ `next` nào** của notifier, không kiểm tra truthiness. Nó subscribe notifier trước source, nên initial `false` đồng bộ cũng đủ kết thúc pipeline.
+
+Dùng notifier dạng event và phát đúng lúc teardown:
+
+```ts
+import { Subject, takeUntil, timer } from 'rxjs';
+
+const destroyed$ = new Subject<void>();
+const subscription = timer(0).pipe(takeUntil(destroyed$)).subscribe(console.log);
+
+function destroy() {
+  destroyed$.next();
+  destroyed$.complete();
+}
+// Owner gọi destroy() khi kết thúc; nếu gọi trước timer chạy, không có output.
+```
+
+Notifier chỉ `complete()` mà không `next()` sẽ không kích hoạt `takeUntil`. Cũng không tái sử dụng notifier đã complete cho lifecycle component mới: `Subject` thường không replay event destroy cũ, còn notifier replay có thể kết thúc consumer mới ngay. Mỗi owner cần notifier riêng, hoặc dùng primitive lifecycle chuẩn của framework.
+
+Không xóa cleanup để “sửa” emission. Nếu dữ liệu cần xử lý sau khi component rời trang, chuyển tác vụ sang owner sống lâu hơn và xác định lúc nào owner đó dừng. Nếu dữ liệu chỉ phục vụ màn hình cũ, cancellation có thể chính là hành vi đúng.
+
+## Test hồi quy bằng virtual time
+
+Test cần mô tả cả **thời điểm subscribe** lẫn output. Test chỉ subscribe từ frame 0 dễ bỏ sót lỗi late subscriber trong UI. Ba test dưới đây dùng `TestScheduler.run`, không chờ timer thật và không cần framework assertion riêng.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { shareReplay, withLatestFrom } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const createScheduler = () => new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+// 1. Hot source không replay a cho consumer bắt đầu ở frame 3.
+createScheduler().run(({ hot, expectObservable }) => {
+  const source$ = hot('-a---b---c-|');
+  expectObservable(source$, '---^').toBe('-----b---c-|');
+});
+
+// 2. Consumer đầu giữ kết nối từ frame 0; consumer muộn nhận a đã cache.
+createScheduler().run(({ hot, expectObservable, expectSubscriptions }) => {
+  const source$ = hot('-a---b---c-|');
+  const shared$ = source$.pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+
+  expectObservable(shared$).toBe('-a---b---c-|');
+  expectObservable(shared$, '---^').toBe('---a-b---c-|');
+  expectSubscriptions(source$.subscriptions).toBe('^----------!');
+});
+
+// 3. Click a trước state x bị bỏ; x không kích hoạt output.
+createScheduler().run(({ hot, expectObservable }) => {
+  const clicks$ = hot('-a---b---|');
+  const state$ = hot('---x-----|');
+
+  expectObservable(clicks$.pipe(withLatestFrom(state$))).toBe(
+    '-----y---|',
+    { y: ['b', 'x'] },
+  );
+});
+```
+
+Test đầu là nguồn sự thật cho marble ở phần subscription quá muộn: `a` ở frame 1 bị bỏ, `b` và `c` giữ nguyên frame, complete ở frame 11. Trong test thứ hai, replay `a` xảy ra ngay tại frame 3 khi consumer mới subscribe; nó không quay timeline về frame 1.
+
+Thêm test sát với bản sửa: không có consumer đầu tiên thì `shareReplay` không giữ lịch sử của hot source; refCount về 0 trước complete thì buffer reset; notifier phát đồng bộ thì source không được subscribe. Với bug chỉ xuất hiện khi mount/unmount UI, thêm integration test kiểm tra lifecycle và cùng instance state, không chỉ test operator riêng lẻ.
+
+<Callout type="info" title="Marble hiển thị và marble test">
+  Hàng `consumer` trong sơ đồ chỉ đánh dấu bắt đầu bằng `^`. Trong `TestScheduler`, subscription marble truyền ở tham số thứ hai của `expectObservable`, tách khỏi notification marble. Frame ở đây là virtual time, không phải số milliseconds đo được trong production.
+</Callout>
+
+## Checklist xác nhận bản sửa
+
+- [ ] Producer và consumer dùng đúng cùng instance hoặc cùng shared Observable.
+- [ ] Có bằng chứng emission nằm trước subscription, bị operator giữ/bỏ, hay nằm sau teardown.
+- [ ] Đã quyết định đây là event không replay hay state cần cung cấp cho consumer muộn.
+- [ ] Replay có buffer giới hạn, owner rõ ràng và policy qua khoảng không có subscriber.
+- [ ] Không seed dữ liệu giả, tăng timeout tùy ý hoặc bỏ cleanup để làm output xuất hiện.
+- [ ] Test có late subscription, khoảng ngắt kết nối và cancellation phù hợp với lỗi.
+- [ ] Đã kiểm tra bản sửa không tạo request trùng hoặc replay lại command có side effect.
+- [ ] Đã gỡ subscription debug và log nhạy cảm trước khi đưa lên production.
+
+## Đọc tiếp
+
+<Cards>
+  <Card title="Cold và hot Observable" href="/docs/observable-subscription/cold-va-hot" description="Phân biệt thời điểm producer chạy với thời điểm consumer bắt đầu nghe." />
+  <Card title="BehaviorSubject" href="/docs/subjects-multicasting/behavior-subject" description="Mô hình state hiện tại với initial hợp lệ." />
+  <Card title="shareReplay" href="/docs/subjects-multicasting/share-replay" description="Hiểu kết nối upstream, buffer và refCount." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Khóa timing và subscription windows bằng test." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS: Subject và các biến thể](https://rxjs.dev/guide/subject).
+- [RxJS: shareReplay](https://rxjs.dev/api/operators/shareReplay) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) cho policy reset.
+- [RxJS: withLatestFrom](https://rxjs.dev/api/operators/withLatestFrom) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/withLatestFrom.ts) cho điều kiện ready.
+- [RxJS: takeUntil](https://rxjs.dev/api/operators/takeUntil) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/takeUntil.ts) cho thứ tự subscribe notifier trước source.
+- [RxJS: marble testing](https://rxjs.dev/guide/testing/marble-testing).

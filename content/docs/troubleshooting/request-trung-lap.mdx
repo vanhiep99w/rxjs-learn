@@ -3,8 +3,515 @@ title: Request trùng lặp
 description: Chẩn đoán multiple subscriptions gây gọi API nhiều lần.
 ---
 
-Trang này sẽ trình bày **Request trùng lặp** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn chỉ mở một màn hình, nhưng Network hiện hai lần `GET /api/me`. Trước khi thêm `shareReplay`, hãy xác định: có hai consumer cùng subscribe một HTTP Observable, hay có hai trigger thực sự yêu cầu tải lại? Hai lỗi này nhìn giống nhau trên Network nhưng cần cách sửa khác nhau.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình ưu tiên đếm execution tại chỗ bắt đầu request, rồi lần ngược về subscription và trigger. Đừng dùng số lần `console.log` nhận response làm số request: một response được chia sẻ vẫn có thể xuất hiện trong log của nhiều consumer.
+
+<Callout type="info" title="Phạm vi">
+  Bài này là hướng dẫn troubleshooting cho ứng dụng đã có RxJS. Ví dụ TypeScript dùng RxJS 7.8.x, đối chiếu implementation 7.8.2; `ajax.getJSON` là HTTP Observable cold. Repository tài liệu không cần cài RxJS để đọc bài. Bạn cần biết `subscribe`, teardown và `pipe`; ví dụ Angular và React được ghi riêng theo framework.
 </Callout>
+
+## Mục lục
+
+- [Khoanh vùng từ Network](#khoanh-vùng-từ-network)
+- [Đếm execution thay vì đếm delivery](#đếm-execution-thay-vì-đếm-delivery)
+  - [Đặt log ở hai phía của sharing](#đặt-log-ở-hai-phía-của-sharing)
+  - [Đọc kết quả để chọn nhánh xử lý](#đọc-kết-quả-để-chọn-nhánh-xử-lý)
+- [Một cold Observable có nhiều subscription](#một-cold-observable-có-nhiều-subscription)
+  - [Tái hiện lỗi nhỏ nhất](#tái-hiện-lỗi-nhỏ-nhất)
+  - [Giữ một instance và chia sẻ phần tải dữ liệu](#giữ-một-instance-và-chia-sẻ-phần-tải-dữ-liệu)
+  - [Đọc timeline sau khi sharing](#đọc-timeline-sau-khi-sharing)
+- [Đã sharing nhưng vẫn gửi nhiều request](#đã-sharing-nhưng-vẫn-gửi-nhiều-request)
+  - [Hàm hoặc getter tạo pipeline mới](#hàm-hoặc-getter-tạo-pipeline-mới)
+  - [Sharing đặt trước phần có side effect](#sharing-đặt-trước-phần-có-side-effect)
+  - [Ref count về zero trước complete](#ref-count-về-zero-trước-complete)
+- [Một subscription nhận nhiều trigger](#một-subscription-nhận-nhiều-trigger)
+  - [Chuẩn hóa input trước khi deduplicate](#chuẩn-hóa-input-trước-khi-deduplicate)
+  - [Chọn chính sách cho trigger chồng nhau](#chọn-chính-sách-cho-trigger-chồng-nhau)
+- [Kiểm tra lifecycle của framework](#kiểm-tra-lifecycle-của-framework)
+  - [Angular và AsyncPipe](#angular-và-asyncpipe)
+  - [React và Effect](#react-và-effect)
+- [Kiểm thử số subscription upstream](#kiểm-thử-số-subscription-upstream)
+  - [Hai reader và một reader đến muộn](#hai-reader-và-một-reader-đến-muộn)
+  - [Rời màn hình trước response rồi quay lại](#rời-màn-hình-trước-response-rồi-quay-lại)
+- [Checklist xác nhận đã sửa đúng](#checklist-xác-nhận-đã-sửa-đúng)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Khoanh vùng từ Network
+
+Bật Preserve log, xóa log cũ rồi tái hiện đúng một thao tác. So sánh method, URL, query, body và thời điểm bắt đầu; cùng đường dẫn nhưng khác query chưa chắc là request trùng. Kiểm tra Initiator để tìm nơi gửi request, rồi đối chiếu log backend nếu cần xác nhận server thật sự nhận bao nhiêu lần.
+
+| Dấu hiệu | Kiểm tra trước | Hướng xử lý |
+| --- | --- | --- |
+| `OPTIONS` rồi `GET` hoặc `POST` | CORS preflight | Không phải hai lần gọi nghiệp vụ; không sửa bằng sharing |
+| Hai request giống nhau, gần như đồng thời | Số consumer và identity của Observable | Chia sẻ cùng pipeline nếu chúng cần cùng tài nguyên |
+| Request đầu bị canceled, request sau bắt đầu | Unmount, `switchMap`, ref count hoặc Effect cleanup | Kiểm tra policy cancellation trước khi gọi đây là lỗi |
+| Request thứ hai chỉ xuất hiện sau error | `retry`, interceptor hoặc middleware | Đối chiếu policy retry; có thể là lần thử lại chủ đích |
+| Request lặp sau complete thành công | `repeat`, refresh trigger, tạo instance mới hoặc `share()` | Xác định có cần replay snapshot hay cần tải lại |
+| Request xuất hiện mỗi lần gõ, click hoặc đổi state | Số emission của trigger | Chuẩn hóa input và chọn flattening operator phù hợp |
+| Chỉ lặp khi mount trong môi trường development | Lifecycle framework, đặc biệt React Strict Mode | Kiểm tra setup và cleanup; không vội tắt chế độ kiểm tra |
+
+<Callout type="warn" title="Với mutation, ưu tiên an toàn dữ liệu">
+  Nếu thao tác tạo đơn hoặc thanh toán bị gửi hai lần, chặn thao tác UI lặp trong lúc chẩn đoán và kiểm tra idempotency ở server. Unsubscribe hay trạng thái canceled ở trình duyệt không chứng minh server chưa xử lý request đầu. Không thêm retry tự động cho mutation nếu chưa có hợp đồng idempotency.
+</Callout>
+
+## Đếm execution thay vì đếm delivery
+
+### Đặt log ở hai phía của sharing
+
+Đặt `defer` **trước** sharing để log mỗi subscription vào nguồn HTTP. Đặt log consumer **sau** sharing để thấy ai đang đọc kết quả. Ví dụ dưới dùng hai subscriber đến liên tiếp trong khi request còn chạy:
+
+```ts
+import { defer, finalize, shareReplay, tap } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Profile = Readonly<{ id: string; displayName: string }>;
+let executionId = 0;
+
+const profile$ = defer(() => {
+  const id = ++executionId;
+  console.debug('HTTP start', { resource: 'profile', id });
+
+  return ajax.getJSON<Profile>('/api/me').pipe(
+    tap({
+      complete: () => console.debug('HTTP complete', { id }),
+      error: () => console.debug('HTTP error', { id }),
+    }),
+    finalize(() => console.debug('HTTP finalize', { id })),
+  );
+}).pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+function observeProfile(reader: string) {
+  return defer(() => {
+    console.debug('reader subscribe', { reader });
+    return profile$.pipe(
+      tap(() => console.debug('reader delivery', { reader })),
+      finalize(() => console.debug('reader finalize', { reader })),
+    );
+  });
+}
+
+const headerSub = observeProfile('header').subscribe({
+  error: () => console.error('Header không tải được profile'),
+});
+const pageSub = observeProfile('page').subscribe({
+  error: () => console.error('Trang hồ sơ không tải được profile'),
+});
+
+// Khi từng consumer rời UI, gọi teardown tương ứng.
+// headerSub.unsubscribe();
+// pageSub.unsubscribe();
+```
+
+Nếu request thành công và hai reader vẫn còn nghe, bạn sẽ thấy một `HTTP start` nhưng hai `reader delivery`. `HTTP finalize` chạy khi complete, error **hoặc unsubscribe**; chỉ nhìn finalize không đủ kết luận request thành công hay bị hủy. Log complete/error giúp phân biệt terminal state, còn Network giúp xác nhận cancellation của transport.
+
+Ở pipeline có retry, đặt instrumentation bên trong phần nguồn mà retry sẽ subscribe lại nếu muốn đếm từng attempt. Đặt log sau sharing chỉ đếm delivery cho reader; đặt nó ngoài phạm vi resubscribe của retry có thể chỉ đếm một lượt tải logic.
+
+<Callout type="warn" title="Không log dữ liệu nhạy cảm">
+  Dùng nhãn tài nguyên và ID cục bộ để đối chiếu. Không log token, body chứa thông tin cá nhân hay URL có query nhạy cảm. ID trong ví dụ chỉ phân biệt execution trong một instance; nó không tự trở thành correlation ID trên backend.
+</Callout>
+
+### Đọc kết quả để chọn nhánh xử lý
+
+1. Nếu có hai `HTTP start` cho một trigger, đếm reader và kiểm tra chúng có giữ cùng Observable instance hay không.
+2. Nếu có một reader nhưng hai trigger, sửa nguồn input hoặc policy xử lý trigger. Sharing không loại bỏ event trùng.
+3. Nếu execution đầu finalize trước response rồi execution khác bắt đầu, kiểm tra teardown và khoảng không có subscriber.
+4. Nếu request chỉ lặp sau error hoặc complete, tìm retry, repeat và policy reset trước khi đổi operator.
+
+Log chỉ giúp khoanh vùng. Một loader có thể gửi thêm request bên trong interceptor, hoặc adapter dùng Promise đã bắt đầu trước khi subscribe. Vì vậy hãy đối chiếu execution RxJS với Network thay vì mặc định một Observable luôn tương ứng một HTTP request.
+
+## Một cold Observable có nhiều subscription
+
+### Tái hiện lỗi nhỏ nhất
+
+Đoạn code sau chỉ tạo **một biến** `profile$`, nhưng có hai execution HTTP:
+
+```ts
+import { ajax } from 'rxjs/ajax';
+
+type Profile = Readonly<{ id: string; displayName: string }>;
+const profile$ = ajax.getJSON<Profile>('/api/me');
+
+profile$.subscribe({ next: console.log, error: console.error });
+profile$.subscribe({ next: console.log, error: console.error });
+// Hai subscription => hai request GET /api/me.
+```
+
+Với nguồn cold này, Observable giống một công thức đặt hàng, không phải đơn hàng đã được thực hiện. Mỗi subscription yêu cầu làm lại công thức. Giữ cùng biến chỉ giữ cùng công thức; muốn cùng một execution, bạn cần multicast. Cách hình dung này không áp dụng nguyên xi cho nguồn hot hay Promise đã chạy sẵn.
+
+```text
+Không sharing:  reader A → execution A → HTTP A
+               reader B → execution B → HTTP B
+
+Có sharing:    reader A ─┐
+                        ├→ execution chung → HTTP
+               reader B ─┘
+```
+
+### Giữ một instance và chia sẻ phần tải dữ liệu
+
+Mình chọn `shareReplay({ bufferSize: 1, refCount: true })` cho một snapshot hữu hạn mà nhiều reader cần đọc, kể cả reader đến sau response. Tạo pipeline một lần trong scope của tài nguyên:
+
+```ts
+import { shareReplay } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Profile = Readonly<{ id: string; displayName: string }>;
+
+// Tạo một instance trong service của phiên đăng nhập.
+const profile$ = ajax.getJSON<Profile>('/api/me').pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+const headerSub = profile$.subscribe({
+  next: (profile) => console.log('header:', profile.displayName),
+  error: console.error,
+});
+const pageSub = profile$.subscribe({
+  next: (profile) => console.log('page:', profile.displayName),
+  error: console.error,
+});
+```
+
+Hai reader cùng chờ dùng một subscription upstream. Khi nguồn đã complete thành công, reader đến sau nhận value đã buffer và complete, không gửi request mới. Buffer giữ trong instance này cho đến khi instance không còn được giữ hoặc bạn thay cơ chế cache; nó không tự biết server đã đổi dữ liệu.
+
+| Nhu cầu | Chọn mặc định | Giới hạn cần nhớ |
+| --- | --- | --- |
+| Chỉ chia sẻ execution giữa các reader đang nghe | `share()` | Không replay; mặc định reset sau complete, reader đến sau có thể mở request mới |
+| Reader đến sau cần snapshot cuối | `shareReplay({ bufferSize: 1, refCount: true })` | Cần tự thiết kế freshness và invalidation |
+| Cùng endpoint nhưng khác user, tenant hoặc query | Cache theo key và scope | Một field chung không được dùng cho mọi identity |
+| Chống hai lần mutation do hai click | Policy trigger và idempotency server | Replay không phải cơ chế chống trùng nghiệp vụ |
+
+Đừng giữ profile của mọi user trong module singleton trên SSR. Chọn scope theo request hoặc session; logout và đổi tài khoản phải bỏ dữ liệu scope cũ. Sharing chỉ có hiệu lực trong instance dùng chung, không tự gom request giữa hai tab, hai service instance hay hai server process.
+
+### Đọc timeline sau khi sharing
+
+Đọc theo cột dọc: A subscribe ở frame 0, B ở frame 1, trước khi response về. Dòng `HTTP` thể hiện một execution; hai dòng output thể hiện hai lần delivery của cùng value.
+
+<MarbleDiagram
+  title="shareReplay(config)"
+  rows={[
+    { label: 'HTTP', marble: '^--a|', kind: 'source' },
+    { label: 'reader A', marble: '^---!', kind: 'subscription' },
+    { label: 'reader B', marble: '-^--!', kind: 'subscription' },
+    { label: 'output A', marble: '---a|', kind: 'output' },
+    { label: 'output B', marble: '---a|', kind: 'output' },
+  ]}
+  values={{ a: 'Cùng một response profile' }}
+  caption="Một subscription HTTP phát response ở frame 3, nhưng cả A và B đều nhận nó."
+/>
+
+Response `a` đến ở frame 3; nguồn complete ở frame 4 nên cả hai reader kết thúc tại frame 4. Dấu `!` trên dòng subscription đánh dấu kết thúc subscription, ở đây do complete, không phải một lần hủy HTTP sớm. Reader đến sau complete được kiểm chứng bằng test bên dưới để thấy replay đồng bộ tại thời điểm subscribe.
+
+## Đã sharing nhưng vẫn gửi nhiều request
+
+### Hàm hoặc getter tạo pipeline mới
+
+Lỗi phổ biến là đặt sharing trong một hàm rồi gọi hàm đó hai lần:
+
+```ts
+import { shareReplay } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+function getProfile() {
+  return ajax.getJSON('/api/me').pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+}
+
+const forHeader$ = getProfile();
+const forPage$ = getProfile();
+console.log(forHeader$ === forPage$); // false
+
+forHeader$.subscribe({ next: console.log, error: console.error });
+forPage$.subscribe({ next: console.log, error: console.error });
+// Hai pipeline độc lập => hai request.
+```
+
+Mỗi lần gọi có một replay buffer riêng. Getter `get profile$()` tạo pipeline trong thân getter cũng có lỗi tương tự. `defer(() => tạoPipelineCóSharing())` ở ngoài sharing cũng tạo lại pipeline cho từng subscriber.
+
+Nếu mọi reader cần cùng profile trong một session, giữ field ổn định và cho hàm trả lại field đó:
+
+```ts
+import { shareReplay } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Profile = Readonly<{ id: string; displayName: string }>;
+
+class ProfileResource {
+  private readonly value$ = ajax.getJSON<Profile>('/api/me').pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+
+  getProfile() {
+    return this.value$;
+  }
+}
+
+const resource = new ProfileResource();
+console.log(resource.getProfile() === resource.getProfile()); // true
+```
+
+Hai `new ProfileResource()` vẫn là hai scope độc lập. Với ID động, đừng thay bằng một field chứa request của ID đầu tiên; dùng registry theo key có invalidation và giới hạn bộ nhớ, như trang [Cache dữ liệu](/docs/patterns-production/cache-data).
+
+### Sharing đặt trước phần có side effect
+
+Sharing trigger không đồng nghĩa sharing request tạo từ trigger. Giả sử `refresh$` là một `Subject<void>` và `loadProfile` trả HTTP Observable cold:
+
+```ts
+// Sai nếu mục tiêu là một HTTP execution cho mỗi refresh.
+const duplicated$ = refresh$.pipe(
+  share(),
+  switchMap(() => loadProfile()),
+);
+
+// Đúng: phần tạo và subscribe HTTP nằm trước sharing.
+const profile$ = refresh$.pipe(
+  switchMap(() => loadProfile()),
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+```
+
+Đây là trích đoạn về vị trí operator, cần import `share`, `shareReplay`, `switchMap` trong code ứng dụng. Ở nhánh đầu, mỗi reader có một `switchMap` riêng nên mỗi refresh mở một inner HTTP cho mỗi reader. Ở nhánh sau, một `switchMap` dùng chung xử lý refresh rồi chia sẻ kết quả.
+
+Tương tự, `tap` có side effect đặt sau sharing chạy cho từng reader. Nếu side effect phải chạy một lần mỗi execution, đặt trước sharing. Tuy nhiên, đừng chuyển notification hay state riêng của từng component lên upstream chỉ để giảm số log; chúng có thể đúng là việc của từng consumer.
+
+### Ref count về zero trước complete
+
+Trong RxJS 7.8.2, `shareReplay` reset khi error, không reset khi complete thành công, và dùng `refCount` để quyết định ngắt nguồn đang hoạt động khi không còn reader. Với `refCount: true`, chuỗi sau là hành vi dự kiến:
+
+1. Reader A subscribe, HTTP bắt đầu.
+2. A rời màn hình trước response, không còn reader khác.
+3. Upstream unsubscribe và replay state reset; với transport hỗ trợ teardown, request đang chờ bị abort.
+4. B subscribe sau đó, HTTP mới bắt đầu.
+
+Một biến ổn định và cùng replay operator vẫn có hai execution theo thời gian. Đây có thể là policy đúng: không tải dữ liệu khi không có ai cần nó. Test phải phân biệt hai reader **chồng thời gian** với hai reader ở hai lượt mở màn hình.
+
+<Callout type="warn" title="take(1) có thể rời trước complete của nguồn">
+  `take(1)` và `firstValueFrom` unsubscribe ngay sau value đầu. Nếu consumer cuối rời khi nguồn chưa báo complete tới sharing, ref count có thể về zero và reset buffer. Lần đọc sau vì vậy có thể refetch dù bạn đã thấy một response. Kiểm thử đúng kiểu consumer thực tế, không suy ra lifecycle chỉ từ việc đã nhận value.
+</Callout>
+
+Không đổi tất cả thành `refCount: false` để làm Network “đẹp hơn”. Nó giữ nguồn chạy khi không còn reader; với stream vô hạn có thể tạo công việc nền không được teardown. Với request hữu hạn mà bạn chủ đích cho chạy đến complete, có thể chọn policy này, nhưng phải có scope, timeout và invalidation rõ ràng. Nó cũng không sửa được việc tạo hai instance riêng.
+
+## Một subscription nhận nhiều trigger
+
+### Chuẩn hóa input trước khi deduplicate
+
+Nếu người dùng nhập cùng query theo các dạng khác nhau, hãy chuẩn hóa trước `distinctUntilChanged`. Sau đó đặt sharing ở cuối để nhiều consumer dùng cùng request tìm kiếm:
+
+```ts
+import {
+  catchError,
+  debounceTime,
+  distinctUntilChanged,
+  EMPTY,
+  map,
+  of,
+  shareReplay,
+  Subject,
+  switchMap,
+} from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Product = Readonly<{ id: string; name: string }>;
+const queryInput$ = new Subject<string>();
+
+const results$ = queryInput$.pipe(
+  map((query) => query.trim()),
+  debounceTime(250), // Khoảng đợi minh họa, chọn theo UX thực tế.
+  distinctUntilChanged(),
+  switchMap((query) => {
+    if (!query) return of<Product[]>([]);
+
+    return ajax.getJSON<Product[]>(
+      `/api/products?q=${encodeURIComponent(query)}`,
+    ).pipe(
+      catchError(() => {
+        console.error('Không tải được kết quả tìm kiếm');
+        return EMPTY; // Giữ outer stream sống để query sau vẫn chạy.
+      }),
+    );
+  }),
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+const viewSub = results$.subscribe(console.log);
+queryInput$.next('rxjs');
+queryInput$.next('rxjs ');
+// Khi view rời đi: viewSub.unsubscribe();
+```
+
+Hai input trên chuẩn hóa thành cùng chuỗi và được gom trong khoảng debounce. `distinctUntilChanged` chỉ chặn value bằng value trước đó, không phải cache mọi query đã tìm: đi từ `a` sang `b` rồi quay lại `a` vẫn tải `a`. Với object query, mặc định nó so sánh identity; hãy tạo key ổn định hoặc comparator theo những trường ảnh hưởng response.
+
+Ví dụ bắt lỗi bằng `EMPTY` để không kết thúc luồng input; nó không mô tả loading/error đầy đủ và có thể để UI giữ kết quả trước đó. Ứng dụng thật nên có error state riêng. Đừng deduplicate một nút refresh chỉ vì ID tài nguyên không đổi: refresh chính là yêu cầu tải lại cùng ID.
+
+### Chọn chính sách cho trigger chồng nhau
+
+| Operator hoặc cơ chế | Khi nên chọn | Điều không làm được |
+| --- | --- | --- |
+| `debounceTime` | Chờ người dùng ngừng gõ rồi tìm kiếm | Không ngăn hai reader mở hai HTTP nếu pipeline chưa sharing |
+| `distinctUntilChanged` | Bỏ input liên tiếp có cùng key nghiệp vụ | Không deduplicate giữa các pipeline độc lập |
+| `switchMap` | UI chỉ cần kết quả tìm kiếm hoặc tài nguyên mới nhất | Vẫn bắt đầu request mới cho mỗi trigger được nhận; không rollback mutation |
+| `exhaustMap` | Bỏ click submit mới trong khi thao tác trước chưa kết thúc | Sau khi inner kết thúc, click mới vẫn được nhận; không bảo vệ nhiều tab |
+| `concatMap` | Mọi thao tác phải chạy theo thứ tự | Xếp hàng cả trigger trùng, không loại bỏ chúng |
+| `mergeMap` | Cho phép nhiều thao tác độc lập chạy đồng thời | Không tự ngăn request chồng nhau |
+
+Với tìm kiếm, mình chọn chuẩn hóa input, debounce và `switchMap`. Với submit một thao tác không được chồng nhau, chọn `exhaustMap`, khóa nút theo pending state và dùng idempotency key nếu backend hỗ trợ. Key phải đại diện cùng một thao tác logic qua các lần retry; tạo key mới ở mỗi attempt không chống được ghi trùng.
+
+`switchMap` bảo vệ output của luồng khỏi response cũ, chứ không đảm bảo chỉ có một request được gửi. Server có thể đã bắt đầu xử lý request bị unsubscribe. Đặc biệt, đừng dùng nó như cơ chế chống hai lần tạo đơn.
+
+## Kiểm tra lifecycle của framework
+
+### Angular và AsyncPipe
+
+Mỗi chỗ dùng `| async` có thể tạo một subscription riêng. Nếu `users$` là HTTP Observable cold chưa sharing, vừa `subscribe` thủ công để gán state vừa dùng AsyncPipe trong template sẽ tải hai lần.
+
+Chọn một chủ sở hữu subscription. Nếu view chỉ cần đọc data, ưu tiên AsyncPipe; trong cùng vùng template có thể unwrap một lần rồi dùng alias:
+
+```html
+<!-- Angular dùng control flow @if; users$ là field ổn định. -->
+@if (users$ | async; as users) {
+  <p>Số người dùng: {{ users.length }}</p>
+  <ul>
+    @for (user of users; track user.id) {
+      <li>{{ user.name }}</li>
+    }
+  </ul>
+}
+```
+
+Nếu nhiều vùng hoặc nhiều component thực sự cần đọc, chia sẻ field trong service có scope phù hợp. Không gọi `getUsers()` tạo Observable mới trực tiếp trong template. Khi reference truyền cho AsyncPipe thay đổi, nó bỏ subscription cũ và subscribe reference mới; field/getter không ổn định có thể làm request khởi động lại.
+
+Ẩn rồi hiện một view cũng có thể teardown rồi subscribe lại. Với ref count về zero trước complete, request mới là hệ quả lifecycle đã mô tả, không nhất thiết do AsyncPipe bị lỗi.
+
+### React và Effect
+
+Kiểm tra nơi tạo Observable và dependency của Effect. Nếu mỗi render tạo một `profile$` mới và Effect phụ thuộc reference đó, cleanup/setup có thể diễn ra lại sau mỗi lần cập nhật state. `shareReplay` trong pipeline vừa tạo không giúp sharing với pipeline của render trước.
+
+- Chọn nơi sở hữu resource ổn định: service hoặc store theo session khi nhiều component cần dùng chung; resource theo component khi chỉ component đó cần nó.
+- Subscribe trong Effect và trả cleanup gọi `unsubscribe`; không subscribe hay gửi request trong render.
+- Kiểm tra dependencies đổi vì object/hàm mới hay vì input nghiệp vụ thực sự đổi. Không bỏ dependency để che lỗi và tạo closure đọc dữ liệu cũ.
+- Khi dùng Strict Mode, React có thể chạy thêm vòng setup → cleanup → setup của Effect trong development. Một request bị abort rồi tải lại có thể phản ánh đúng vòng kiểm tra đó.
+
+Đừng tắt Strict Mode hoặc dùng một cờ “đã chạy” để né cleanup. Hãy làm lifecycle đúng và chọn rõ request có được tiếp tục khi không có reader hay không. Test nhiều mount đồng thời và remount; cache tài nguyên dùng chung cần tách khỏi vòng đời của một Effect cụ thể, đồng thời phải bỏ scope cũ khi logout.
+
+## Kiểm thử số subscription upstream
+
+### Hai reader và một reader đến muộn
+
+Test chỉ assert hai reader nhận cùng data chưa chứng minh chỉ có một request. Dùng `expectSubscriptions` để assert số execution upstream. Test dưới chạy trong ứng dụng có RxJS; hàm assertion dùng được không phụ thuộc Jest/Vitest:
+
+```ts
+import { shareReplay } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+function makeScheduler() {
+  return new TestScheduler((actual, expected) => {
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error('Marble assertion failed');
+    }
+  });
+}
+
+makeScheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('---a|', { a: 'profile' });
+
+  // Baseline: cùng một cold Observable nhưng hai execution.
+  expectObservable(source).toBe('---a|', { a: 'profile' });
+  expectObservable(source, '-^').toBe('----a|', { a: 'profile' });
+  expectSubscriptions(source.subscriptions).toBe([
+    '^---!',
+    '-^---!',
+  ]);
+});
+
+makeScheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('---a|', { a: 'profile' });
+  const shared$ = source.pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+
+  expectObservable(shared$).toBe('---a|', { a: 'profile' });
+  expectObservable(shared$, '-^').toBe('---a|', { a: 'profile' });
+
+  // Reader C đến sau complete: replay và complete cùng frame 6.
+  expectObservable(shared$, '------^').toBe(
+    '------(a|)',
+    { a: 'profile' },
+  );
+  expectSubscriptions(source.subscriptions).toBe('^---!');
+});
+```
+
+Test thứ hai là nguồn kiểm chứng timeline: A bắt đầu ở frame 0, B ở frame 1; cùng nhận response frame 3 và complete frame 4. C đến frame 6 vẫn không tạo subscription nguồn mới. Nhóm `(a|)` là cú pháp TestScheduler cho các notification cùng frame, không phải khoảng chờ HTTP mới.
+
+### Rời màn hình trước response rồi quay lại
+
+Test này dùng một scheduler mới và thể hiện policy `refCount: true`: không còn ai chờ thì hủy execution chưa hoàn tất; reader đến sau tạo execution mới.
+
+```ts
+import { shareReplay } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const lifecycleScheduler = new TestScheduler((actual, expected) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Lifecycle assertion failed');
+  }
+});
+
+lifecycleScheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('---a|', { a: 'profile' });
+  const shared$ = source.pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+
+  // A rời ở frame 2, chưa nhận response ở frame 3.
+  expectObservable(shared$, '^-!').toBe('');
+  // B đến frame 5, nhận response frame 8 và complete frame 9.
+  expectObservable(shared$, '-----^').toBe(
+    '--------a|',
+    { a: 'profile' },
+  );
+  expectSubscriptions(source.subscriptions).toBe([
+    '^-!',
+    '-----^---!',
+  ]);
+});
+```
+
+TestScheduler chứng minh subscription và teardown RxJS, không chứng minh server đã hủy tác vụ. Bổ sung integration test hoặc Network inspection để kiểm tra HTTP adapter thật. Với Angular có thể dùng HTTP testing utilities để assert số request; với React hãy kiểm tra cả mount, cleanup và remount của Effect.
+
+## Checklist xác nhận đã sửa đúng
+
+- [ ] Đã phân biệt preflight, retry chủ đích và request nghiệp vụ trùng.
+- [ ] Log HTTP nằm tại execution upstream, không đếm delivery của reader.
+- [ ] Hai consumer cần cùng dữ liệu giữ cùng Observable và cùng service instance.
+- [ ] Sharing nằm sau phần tạo HTTP hoặc side effect cần dùng chung.
+- [ ] Không tạo Observable mới trong getter, template hay mỗi render ngoài ý muốn.
+- [ ] Trigger có key chuẩn hóa và policy phù hợp; refresh vẫn có thể tải lại.
+- [ ] Policy khi reader cuối rời, khi error và khi complete đã được test.
+- [ ] Test có `expectSubscriptions`, kể cả reader đến muộn và reader rời sớm.
+- [ ] Replay cache có scope và invalidation; logout không đọc lại profile cũ.
+- [ ] Mutation có bảo vệ server phù hợp; canceled không được coi là chưa xử lý.
+
+Chọn một endpoint đang bị gọi trùng, thêm execution ID cục bộ rồi tái hiện hai tình huống: hai reader cùng chờ và đóng màn hình trước response rồi mở lại. Chốt số execution mong đợi cho từng tình huống trước khi đổi operator; sau đó giữ hai trường hợp này làm regression test.
+
+## Nguồn tham khảo
+
+- [RxJS shareReplay](https://rxjs.dev/api/operators/shareReplay) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — replay, ref count và reset policy.
+- [Implementation share 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/share.ts) — vị trí connection, reset khi complete/error và ref count về zero.
+- [RxJS TestScheduler](https://rxjs.dev/api/testing/TestScheduler) — assert notification và subscription bằng virtual time.
+- [Angular AsyncPipe](https://angular.dev/api/common/AsyncPipe) — subscription, teardown và đổi reference.
+- [React Strict Mode](https://react.dev/reference/react/StrictMode) — vòng kiểm tra Effect trong development.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Cold và hot Observable" href="/docs/observable-subscription/cold-va-hot" description="Phân biệt công thức tạo execution với nguồn đã hoạt động." />
+  <Card title="shareReplay và stale cache" href="/docs/troubleshooting/share-replay-stale-cache" description="Chẩn đoán replay dữ liệu cũ sau khi đã gom request." />
+  <Card title="Cache dữ liệu" href="/docs/patterns-production/cache-data" description="Thiết kế cache theo key, scope và invalidation." />
+  <Card title="Request orchestration" href="/docs/patterns-production/request-orchestration" description="Chọn chính sách cho request chồng nhau và mutation." />
+</Cards>

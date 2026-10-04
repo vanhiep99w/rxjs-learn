@@ -3,8 +3,492 @@ title: Nested subscribe
 description: Thay subscribe lồng nhau bằng composition rõ ràng.
 ---
 
-Trang này sẽ trình bày **Nested subscribe** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn chọn khách hàng B, nhưng màn hình lại hiện đơn hàng của A vì response cũ về muộn. Hoặc bạn đã unsubscribe khi rời trang mà callback bên trong vẫn cập nhật UI. Với `subscribe` lồng nhau, vấn đề không chỉ là code thụt vào nhiều cấp: mỗi lần gọi `subscribe` tạo một subscription riêng, và subscription ngoài không tự sở hữu những subscription được tạo trong callback.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình sẽ bắt đầu từ lỗi ấy, rồi gom cả workflow thành một Observable. Khi đó bạn có thể quyết định rõ input mới thay thế, xếp hàng hay chạy song song với input cũ; lỗi đi đâu; và ai chịu trách nhiệm teardown.
+
+<Callout type="info" title="Phạm vi và điều kiện chạy">
+  Bài dùng **RxJS 7.8.2** và TypeScript, không phụ thuộc framework. Ví dụ HTTP chạy trong browser qua `rxjs/ajax`; các endpoint `/api/...` là minh họa, cần backend của ứng dụng cung cấp. Site này không có sẵn RxJS runtime hay các endpoint đó. Các marble test cuối bài chạy độc lập trong môi trường đã có RxJS, không cần server. Bạn nên biết [subscription teardown](/docs/observable-subscription/subscription-teardown) và [higher-order Observable](/docs/higher-order-observables/higher-order-stream).
 </Callout>
+
+## Mục lục
+
+- [Nhận diện lỗi và chẩn đoán nhanh](#nhận-diện-lỗi-và-chẩn-đoán-nhanh)
+- [Tái hiện subscribe lồng nhau](#tái-hiện-subscribe-lồng-nhau)
+  - [Chuẩn bị API minh họa](#chuẩn-bị-api-minh-họa)
+  - [Đoạn code có vấn đề](#đoạn-code-có-vấn-đề)
+- [Vì sao subscription ngoài không quản lý inner](#vì-sao-subscription-ngoài-không-quản-lý-inner)
+- [Refactor thành một workflow](#refactor-thành-một-workflow)
+  - [Trả Observable từ mỗi bước](#trả-observable-từ-mỗi-bước)
+  - [Gắn policy latest cho toàn workflow](#gắn-policy-latest-cho-toàn-workflow)
+- [Chọn flattening operator theo yêu cầu](#chọn-flattening-operator-theo-yêu-cầu)
+- [Đặt error handling và teardown đúng chỗ](#đặt-error-handling-và-teardown-đúng-chỗ)
+  - [Catch lỗi ở inner để nhận input tiếp theo](#catch-lỗi-ở-inner-để-nhận-input-tiếp-theo)
+  - [Đặt takeUntil sau flattening](#đặt-takeuntil-sau-flattening)
+  - [Dùng tap và finalize đúng vai trò](#dùng-tap-và-finalize-đúng-vai-trò)
+- [Những cách sửa chưa giải quyết gốc lỗi](#những-cách-sửa-chưa-giải-quyết-gốc-lỗi)
+- [Kiểm thử cả output lẫn subscription](#kiểm-thử-cả-output-lẫn-subscription)
+  - [Subscription ngoài dừng nhưng inner vẫn chạy](#subscription-ngoài-dừng-nhưng-inner-vẫn-chạy)
+  - [Latest hủy workflow cũ](#latest-hủy-workflow-cũ)
+  - [Destroy hủy cả workflow đang chạy](#destroy-hủy-cả-workflow-đang-chạy)
+- [Checklist trước khi đóng lỗi](#checklist-trước-khi-đóng-lỗi)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Nhận diện lỗi và chẩn đoán nhanh
+
+Không phải cứ hai request về sai thứ tự là có nested subscribe. Trước hết, tìm nơi gọi `subscribe` bên trong `next`, `tap` hoặc callback của một operator. Sau đó kiểm tra subscription nào thực sự được giữ lại và hủy.
+
+| Triệu chứng | Điều cần kiểm tra | Hướng sửa |
+| --- | --- | --- |
+| Dữ liệu A ghi đè B sau khi đổi lựa chọn | Workflow A còn được subscribe khi B bắt đầu không? | Bọc toàn workflow trong `switchMap` nếu contract là latest |
+| Rời trang rồi vẫn có callback hoặc request pending | Chỉ unsubscribe nguồn trigger hay cả cây request? | Composition và teardown sau flattening |
+| Error handler ngoài không nhận lỗi request trong | Request trong được tạo bằng một `subscribe` riêng không? | Để error truyền qua một pipeline; catch ở phạm vi mong muốn |
+| Một lần lỗi làm các lựa chọn tiếp theo không còn chạy | `catchError` đặt ngoài stream trigger không? | Catch trong inner nếu muốn trigger tiếp tục sống |
+| Cùng thao tác tạo nhiều request giống nhau | Có nhiều consumer hoặc `subscribe` thủ công trong `tap` không? | Kiểm tra execution trước khi thêm sharing |
+
+Khi debug, log ID của lựa chọn và ID của response ngay tại nơi cập nhật state. Nếu UI đang chọn B mà callback A vẫn ghi vào cùng state, bạn đã có bằng chứng về workflow cũ còn hoạt động. Nếu callback không còn chạy nhưng Network vẫn thấy request tiếp tục, kiểm tra teardown của HTTP adapter; cancellation của subscription và việc dừng công việc thật là hai chuyện cần phân biệt.
+
+## Tái hiện subscribe lồng nhau
+
+### Chuẩn bị API minh họa
+
+Giả sử màn hình cần tải customer trước, rồi dùng `customer.id` để lấy orders. Mỗi API dưới đây phát một body rồi complete. Timeout `5_000` ms chỉ là cấu hình minh họa, không phải giá trị mặc định phù hợp cho mọi ứng dụng.
+
+```ts
+import { type Observable, timeout } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Customer = { id: string; name: string };
+type Order = { id: string; total: number };
+type ViewModel = { customer: Customer; orders: Order[] };
+
+function getCustomer(id: string): Observable<Customer> {
+  return ajax.getJSON<Customer>(
+    `/api/customers/${encodeURIComponent(id)}`,
+  ).pipe(timeout({ first: 5_000 }));
+}
+
+function getOrders(customerId: string): Observable<Order[]> {
+  return ajax.getJSON<Order[]>(
+    `/api/customers/${encodeURIComponent(customerId)}/orders`,
+  ).pipe(timeout({ first: 5_000 }));
+}
+```
+
+Hai helper là cold Observable: gọi hàm chưa gửi HTTP; subscribe mới bắt đầu request. Các biến thể bên dưới dùng lại helper và type ở đây, nhưng **không chạy đồng thời bản lỗi và bản refactor** — nếu chạy cả hai, chính bạn tạo hai workflow cho cùng input.
+
+### Đoạn code có vấn đề
+
+Đoạn này có ba subscription: nguồn lựa chọn, request customer và request orders. Chỉ subscription ngoài được giữ lại.
+
+```ts
+import { Subject } from 'rxjs';
+
+const selectedId$ = new Subject<string>();
+
+const outerSub = selectedId$.subscribe({
+  next: (id) => {
+    getCustomer(id).subscribe({
+      next: (customer) => {
+        getOrders(customer.id).subscribe({
+          next: (orders) => {
+            const view: ViewModel = { customer, orders };
+            console.log('Ghi vào UI:', view);
+          },
+          error: (error) => console.error('Orders lỗi:', error),
+        });
+      },
+      error: (error) => console.error('Customer lỗi:', error),
+    });
+  },
+  error: (error) => console.error('Nguồn lựa chọn lỗi:', error),
+});
+
+selectedId$.next('A');
+selectedId$.next('B');
+
+// Khi rời màn hình:
+outerSub.unsubscribe();
+// Request customer/orders đã bắt đầu vẫn có subscription riêng.
+```
+
+Nếu customer A về sau khi bạn đã rời trang, callback của nó vẫn có thể tạo tiếp request orders A. HTTP thường tự complete, nên đoạn code này không nhất thiết giữ subscription vô hạn; nhưng request thừa, callback sau destroy và cập nhật state cũ vẫn là lỗi lifecycle.
+
+Đọc sơ đồ theo cột dọc. Để tập trung vào race, mỗi hàng `workflow` bên dưới đại diện cho cả chuỗi customer → orders; `x` và `y` là snapshot cuối, không phải từng response trung gian.
+
+<MarbleDiagram
+  title="subscribe trong subscribe"
+  rows={[
+    { label: 'selected ID', marble: '-a--b--|', kind: 'source' },
+    { label: 'workflow A', marble: '-^--------x|', kind: 'inner' },
+    { label: 'workflow B', marble: '----^---y|', kind: 'inner' },
+    { label: 'UI writes', marble: '--------y-x', kind: 'output' },
+  ]}
+  values={{
+    a: 'chọn khách hàng A',
+    b: 'chọn khách hàng B',
+    x: 'snapshot customer và orders của A',
+    y: 'snapshot customer và orders của B',
+  }}
+  caption="B được ghi ở frame 8, rồi A ghi đè ở frame 10. UI writes là các lần cập nhật state, không phải một Observable đã được compose."
+/>
+
+A bắt đầu ở frame 1; B bắt đầu ở frame 4. Nguồn lựa chọn complete ở frame 7 nhưng hai workflow độc lập vẫn chạy. B về trước ở frame 8, A về sau ở frame 10, nên màn hình quay lại dữ liệu A dù lựa chọn mới nhất là B. Hàng UI không có dấu complete vì các callback này không tạo thành một output stream chung.
+
+## Vì sao subscription ngoài không quản lý inner
+
+Việc đặt `subscribe` trong callback chỉ thể hiện quan hệ trong code JavaScript. Nó không tạo quan hệ ownership giữa các `Subscription`. `outerSub.unsubscribe()` dừng việc nhận ID mới, không biết tới những subscription mà callback đã tạo trước đó.
+
+Có thể hình dung bạn ghi tên một việc vào sổ theo dõi, rồi từ việc ấy mở thêm hai công việc nhưng không ghi chúng vào cùng sổ. Đóng sổ đầu không đóng hai việc kia. Analogy này chỉ nói về ownership; RxJS vẫn có cơ chế gắn subscription con bằng `Subscription.add`, nhưng nesting trong callback không tự làm việc đó.
+
+Trong một pipeline có flattening operator, operator subscribe inner và gắn lifecycle của nó vào subscription kết quả. Unsubscribe kết quả sẽ teardown cả source và các inner thuộc execution đó. Error từ inner cũng đi vào error channel chung, thay vì phải tìm từng callback riêng.
+
+<Callout type="warn" title="Complete không đồng nghĩa với unsubscribe toàn cây">
+  Khi outer **complete**, `switchMap` chờ active inner hoàn tất; `concatMap` còn có thể xử lý phần đã queue. Khi bạn **unsubscribe subscription kết quả**, cây upstream của execution ấy bị teardown ngay. Phân biệt hai hành vi này trước khi đặt operator destroy.
+</Callout>
+
+## Refactor thành một workflow
+
+### Trả Observable từ mỗi bước
+
+Thay vì gọi `subscribe` để lấy customer, rồi gọi tiếp `subscribe` để lấy orders, hãy trả về Observable biểu diễn toàn bộ công việc.
+
+```ts
+import { concatMap, map } from 'rxjs';
+
+function loadView(id: string): Observable<ViewModel> {
+  return getCustomer(id).pipe(
+    concatMap((customer) =>
+      getOrders(customer.id).pipe(
+        map((orders): ViewModel => ({ customer, orders })),
+      ),
+    ),
+  );
+}
+```
+
+Ở đây `getCustomer` chỉ phát một body, nên `concatMap` diễn đạt bước orders bắt đầu khi có customer. `map` giữ customer trong closure và ghép nó với orders thành một snapshot. Nếu bước đầu lỗi thì bước orders không được subscribe; nếu orders lỗi thì `loadView` lỗi.
+
+Nếu nguồn customer phát nhiều value, `concatMap` sẽ queue công việc cho từng value. Khi ấy bạn phải chọn lại policy, không coi helper này là phù hợp với mọi stream. Cũng đừng dùng `map((customer) => getOrders(customer.id))` rồi mong nhận orders: cách đó tạo `Observable<Observable<Order[]>>`, chưa flatten inner.
+
+### Gắn policy latest cho toàn workflow
+
+Màn hình chi tiết chỉ nên hiển thị khách hàng đang được chọn, nên mình dùng `switchMap` ở lớp trigger. Input B phải thay **cả chuỗi** của A, kể cả khi A đang ở bước orders.
+
+```ts
+import {
+  Subject,
+  catchError,
+  distinctUntilChanged,
+  of,
+  startWith,
+  switchMap,
+  takeUntil,
+} from 'rxjs';
+
+type ViewState =
+  | { status: 'loading'; id: string }
+  | { status: 'ready'; id: string; view: ViewModel }
+  | { status: 'error'; id: string; message: string };
+
+const selectedId$ = new Subject<string>();
+const destroy$ = new Subject<void>();
+
+const state$ = selectedId$.pipe(
+  distinctUntilChanged(),
+  switchMap((id) => {
+    const loading: ViewState = { status: 'loading', id };
+
+    return loadView(id).pipe(
+      map((view): ViewState => ({ status: 'ready', id, view })),
+      catchError(() => of<ViewState>({
+        status: 'error',
+        id,
+        message: 'Không tải được dữ liệu khách hàng.',
+      })),
+      startWith(loading),
+    );
+  }),
+  takeUntil(destroy$),
+);
+
+const viewSub = state$.subscribe({
+  next: (state) => console.log('Render:', state),
+  // Đây là lỗi ngoài phạm vi loadView, chẳng hạn nguồn trigger lỗi.
+  error: (error) => console.error('Stream màn hình lỗi:', error),
+});
+
+selectedId$.next('A');
+selectedId$.next('B');
+
+// Gọi khi owner của màn hình kết thúc; không gọi ngay sau next trong app thật.
+function disposeView() {
+  destroy$.next();
+  destroy$.complete();
+  selectedId$.complete();
+}
+```
+
+Đây là bản **thay thế** đoạn nested subscribe, dùng lại `loadView` và import `map` ở bước trước. `distinctUntilChanged` bỏ ID trùng liên tiếp, nên chọn lại cùng ID sẽ không reload; nếu cần nút refresh, hãy thiết kế trigger refresh riêng hoặc bỏ operator ấy.
+
+Khi B đến, `switchMap` unsubscribe workflow A trước khi subscribe workflow B. State `loading` mới xuất hiện ngay, và state `ready` chỉ chứa snapshot thuộc workflow còn hợp lệ. `viewSub.unsubscribe()` cũng có thể dùng để teardown trực tiếp nếu owner giữ subscription; notifier hữu ích khi bạn dùng chung sự kiện destroy cho nhiều pipeline.
+
+Sơ đồ tiếp theo chỉ vẽ output dữ liệu của `switchMap(loadView)`, **không vẽ** các state `loading` thêm bằng `startWith` hay notifier destroy trong ví dụ UI.
+
+<MarbleDiagram
+  title="switchMap(loadView)"
+  rows={[
+    { label: 'selected ID', marble: '-a--b--|', kind: 'source' },
+    { label: 'workflow A', marble: '-^--!', kind: 'inner' },
+    { label: 'workflow B', marble: '----^---y|', kind: 'inner' },
+    { label: 'output', marble: '--------y|', kind: 'output' },
+  ]}
+  values={{
+    a: 'chọn khách hàng A',
+    b: 'chọn khách hàng B',
+    y: 'snapshot customer và orders của B',
+  }}
+  caption="A bị unsubscribe ở frame 4. Outer complete ở frame 7; output vẫn đợi B phát ở frame 8 và complete ở frame 9."
+/>
+
+So với bản lỗi, điểm quyết định là dấu `!` ở frame 4 của workflow A. Snapshot A dự định phát ở frame 10 không tới output nữa. B vẫn được phép hoàn tất sau outer complete, vì complete của nguồn lựa chọn không phải yêu cầu hủy workflow đang chạy.
+
+<Callout type="warn" title="Unsubscribe không rollback server">
+  `ajax` có teardown để abort request đang pending. Với Observable bọc Promise không có cơ chế cancel, công việc thật có thể tiếp tục dù RxJS đã chặn notification tới subscriber. Ngay cả khi transport đã abort, server vẫn có thể đã nhận và xử lý request. Vì vậy không dùng `switchMap` như cơ chế rollback mutation.
+</Callout>
+
+## Chọn flattening operator theo yêu cầu
+
+Refactor không có nghĩa là thay mọi nested subscribe bằng `switchMap`. Chọn operator theo điều bạn muốn xảy ra khi input mới đến lúc workflow cũ còn chạy.
+
+| Policy | Operator | Ví dụ phù hợp | Bẫy cần tránh |
+| --- | --- | --- | --- |
+| Chỉ giữ input mới nhất | `switchMap` | Đổi khách hàng, search, filter | Bỏ theo dõi kết quả của lệnh ghi trước đó |
+| Xử lý lần lượt, không bỏ input đã nhận | `concatMap` | Queue các lệnh lưu cần thứ tự | Inner không complete thì queue đứng; input nhanh có thể làm queue tăng |
+| Chạy các công việc độc lập song song | `mergeMap(project, concurrency)` | Batch tải nhiều tài nguyên | Output theo thời điểm về, không đảm bảo thứ tự input |
+| Bỏ input mới khi đang bận | `exhaustMap` | Submit không nhận click lặp lúc pending | Input bị bỏ không được queue để chạy lại |
+
+Mặc định mình chọn latest cho màn hình đọc dữ liệu theo lựa chọn. Với mutation, quyết định phải dựa trên contract nghiệp vụ: queue nếu cần xử lý từng lệnh theo thứ tự, hoặc ignore nếu click lặp phải bị bỏ. `exhaustMap` không thay idempotency ở backend; `concatMap` cũng không phải durable queue sống qua reload.
+
+Nếu sau customer bạn có hai request độc lập và cần một snapshot chung, có thể dùng `forkJoin` trong `loadView`, rồi vẫn bọc workflow bằng operator ở lớp trigger. Chỉ dùng `forkJoin` khi các nguồn phát value và complete; nó không phù hợp với stream state hoặc WebSocket không kết thúc. Xem [request orchestration](/docs/patterns-production/request-orchestration) cho cách phối hợp nhiều nhánh.
+
+## Đặt error handling và teardown đúng chỗ
+
+### Catch lỗi ở inner để nhận input tiếp theo
+
+Trong bản refactor, `catchError` nằm **bên trong `switchMap`**. Khi API của A lỗi, inner chuyển thành một state `error` rồi complete. Subscription với `selectedId$` còn sống, nên chọn B vẫn tạo được workflow mới.
+
+Ngược lại, đoạn dưới catch lỗi sau flattening:
+
+```ts
+// Giả sử selectedId$ và loadView đã được khai báo.
+const endsAfterFailure$ = selectedId$.pipe(
+  switchMap(loadView),
+  catchError(() => of(null)),
+);
+```
+
+Khi inner lỗi, stream trigger phía upstream bị teardown; `catchError` thay cả source bằng `of(null)`. Nó phát `null`, complete, và không tự subscribe lại `selectedId$`. Cách này hợp lệ nếu contract là “kết thúc toàn màn hình sau lỗi”, nhưng sai nếu bạn muốn người dùng tiếp tục đổi lựa chọn.
+
+`catchError(() => EMPTY)` trong inner giữ trigger sống nhưng không cung cấp error state. Nếu trước đó đã phát `loading`, UI có thể mắc ở loading. Mình ưu tiên state có nhãn lỗi thay vì trả `[]` để trông như tải thành công mà không có orders.
+
+Error handler ngoài trong bản nested chỉ nhận lỗi của nguồn ngoài, không nhận lỗi từ các subscription trong. Còn `try/catch` quanh `subscribe` không phải cách xử lý lỗi bất đồng bộ của Observable. Xử lý error channel bằng operator hoặc observer `error`; lỗi do chính callback render ném ra cũng không nên được coi là API error mà upstream `catchError` sẽ bắt.
+
+### Đặt takeUntil sau flattening
+
+Vị trí operator là một phần của lifecycle contract:
+
+```ts
+// Chưa đủ nếu mục tiêu là hủy active workflow khi destroy:
+const waitsForInner$ = selectedId$.pipe(
+  takeUntil(destroy$),
+  switchMap(loadView),
+);
+
+// Đúng với contract hủy toàn workflow của màn hình:
+const cancelsWorkflow$ = selectedId$.pipe(
+  switchMap(loadView),
+  takeUntil(destroy$),
+);
+```
+
+Ở bản đầu, notifier làm outer của `switchMap` complete; active inner vẫn được chờ. Ở bản sau, notifier complete subscriber phía downstream và teardown cả `switchMap`, nên active inner bị unsubscribe. Với `concatMap`, đặt teardown trước flattening còn có thể để phần queue tiếp tục chạy.
+
+Notifier phải **phát value**: `destroy$.complete()` một mình không kích hoạt `takeUntil`. Trong ví dụ UI, owner gọi `next()` rồi mới `complete()`. Một `Subject` đã complete cũng không replay tín hiệu destroy cho subscription tạo muộn; tránh tạo thêm pipeline sau khi owner kết thúc hoặc chọn cơ chế lifecycle phù hợp của framework.
+
+### Dùng tap và finalize đúng vai trò
+
+`tap` phù hợp để log hoặc thực hiện side effect đồng bộ của notification đang đi qua pipeline. Nó không quản lý subscription mà bạn tự mở bên trong callback:
+
+```ts
+import { tap } from 'rxjs';
+
+// Vẫn là subscription tách rời, dù nhìn giống composition.
+selectedId$.pipe(
+  tap((id) => {
+    getCustomer(id).subscribe();
+  }),
+).subscribe();
+```
+
+Đừng “giấu” nested subscribe trong `tap`. Nếu kết quả của một bước cần bước bất đồng bộ tiếp theo, trả Observable rồi flatten. Snippet trên là anti-pattern minh họa, không dùng nó cùng pipeline refactor.
+
+`finalize` chạy khi complete, error **hoặc unsubscribe**. Vì vậy nó phù hợp cho cleanup, không phải callback “request thành công”. Với loading, callback `finalize` của workflow cũ có thể sửa một biến loading dùng chung sai thời điểm. Bản refactor phát state gắn với ID từ inner còn active, thay vì để request cũ trực tiếp ghi vào biến UI.
+
+## Những cách sửa chưa giải quyết gốc lỗi
+
+| Cách sửa | Giải quyết được gì | Điều vẫn còn thiếu |
+| --- | --- | --- |
+| Lưu mọi subscription vào `Subscription` rồi `.add()` | Có thể gom teardown theo một owner | Chưa có policy latest, queue, concurrency hay error channel chung |
+| Thêm `take(1)` vào request | Đóng subscription sau value đầu | Không hủy request cũ đang pending khi chọn B; HTTP body vốn thường chỉ phát một lần |
+| So sánh ID hiện tại trước khi ghi UI | Chặn một số stale writes | Công việc cũ vẫn chạy; phải kiểm tra mọi side effect và phân biệt hai lượt cùng ID |
+| Thêm `shareReplay` | Có thể share một execution nếu đặt đúng scope | Không tự nối ownership hay lựa chọn workflow nào bị thay thế |
+| Chuyển `subscribe` vào helper | Code gọi ngắn hơn | Helper vẫn tự chạy công việc ngoài pipeline nếu không trả Observable |
+| Dùng `async` trong observer `next` | Cho phép dùng `await` trong callback | `subscribe` không chờ Promise ấy; các callback vẫn có thể overlap |
+
+`Subscription.add` vẫn hữu ích khi owner phải gom nhiều tài nguyên độc lập, chẳng hạn listener và timer không cần hợp thành một output. Nhưng một workflow dữ liệu phụ thuộc nhau nên được compose, không nên chuyển thành danh sách subscription phải quản lý bằng tay.
+
+Nhiều `subscribe` ở các boundary độc lập không phải tự động là anti-pattern. View có thể sở hữu một subscription render, service có một subscription xử lý công việc nền với lifecycle riêng. Chúng phải có owner rõ ràng; và nếu cùng subscribe một cold HTTP pipeline, bạn có thể tạo request trùng. Mục tiêu là **không tạo execution tách rời một cách vô tình**, không phải ép cả ứng dụng chỉ có một `subscribe`.
+
+## Kiểm thử cả output lẫn subscription
+
+Happy path chỉ có A thì bản nested và bản compose đều có vẻ đúng. Test cần cho B đến khi A chưa xong, và phải assert thời điểm unsubscribe, không chỉ nhìn snapshot cuối.
+
+Ba test dưới đây dùng cùng timeline với sơ đồ: A dự định trả snapshot ở frame 10, B trả ở frame 8. Mỗi cold Observable thay thế toàn workflow HTTP bằng một nguồn có teardown; test kiểm tra policy RxJS, không kiểm tra server hay XHR thật.
+
+### Subscription ngoài dừng nhưng inner vẫn chạy
+
+Snippet chạy độc lập; các test tiếp theo dùng lại import và hàm `makeScheduler` này. So sánh bằng `deepStrictEqual`, nên không cần Jest hoặc Vitest.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { switchMap, takeUntil } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+function makeScheduler() {
+  return new TestScheduler((actual, expected) => {
+    deepStrictEqual(actual, expected);
+  });
+}
+
+const nestedScheduler = makeScheduler();
+nestedScheduler.run(({ hot, cold, flush }) => {
+  const selected = hot('-a--b--|');
+  const workflowA = cold('---------x|', { x: 'A' });
+  const workflowB = cold('----y|', { y: 'B' });
+  const writes: Array<{ frame: number; value: string }> = [];
+
+  const outerSub = selected.subscribe((id) => {
+    const workflow = id === 'a' ? workflowA : workflowB;
+    workflow.subscribe((value) => {
+      writes.push({ frame: nestedScheduler.frame, value });
+    });
+  });
+
+  // Hủy outer sớm hơn cả hai response.
+  nestedScheduler.schedule(() => outerSub.unsubscribe(), 5);
+  flush();
+
+  deepStrictEqual(writes, [
+    { frame: 8, value: 'B' },
+    { frame: 10, value: 'A' },
+  ]);
+});
+```
+
+Test này còn chặt hơn sơ đồ bản lỗi: không chỉ outer complete bình thường ở frame 7, mà ta chủ động unsubscribe ở frame 5. Kết quả vẫn là B rồi A vì hai subscription trong không thuộc `outerSub`.
+
+### Latest hủy workflow cũ
+
+Test này là nguồn kiểm chứng cho sơ đồ `switchMap(loadView)`. Notification marble chỉ có value và terminal event; cửa sổ subscription được assert riêng.
+
+```ts
+const latestScheduler = makeScheduler();
+latestScheduler.run(({
+  hot, cold, expectObservable, expectSubscriptions,
+}) => {
+  const selected = hot('-a--b--|');
+  const workflowA = cold('---------x|');
+  const workflowB = cold('----y|');
+
+  const result = selected.pipe(
+    switchMap((id) => id === 'a' ? workflowA : workflowB),
+  );
+
+  expectObservable(result).toBe('--------y|');
+  expectSubscriptions(workflowA.subscriptions).toBe('-^--!');
+  expectSubscriptions(workflowB.subscriptions).toBe('----^----!');
+});
+```
+
+A bị unsubscribe ở frame 4, không phát `x` ở frame 10. B phát `y` ở frame 8 và complete ở frame 9; output chờ tới frame 9 dù nguồn ID complete ở frame 7. Dấu `!` trong assertion B là thời điểm subscription đóng do complete bình thường, không nhất thiết là cancellation sớm.
+
+### Destroy hủy cả workflow đang chạy
+
+```ts
+const destroyScheduler = makeScheduler();
+destroyScheduler.run(({
+  hot, cold, expectObservable, expectSubscriptions,
+}) => {
+  const selected = hot('-a--b--|');
+  const destroy = hot('-----d|');
+  const workflowA = cold('---------x|');
+  const workflowB = cold('----y|');
+
+  const result = selected.pipe(
+    switchMap((id) => id === 'a' ? workflowA : workflowB),
+    takeUntil(destroy),
+  );
+
+  expectObservable(result).toBe('-----|');
+  expectSubscriptions(selected.subscriptions).toBe('^----!');
+  expectSubscriptions(workflowA.subscriptions).toBe('-^--!');
+  expectSubscriptions(workflowB.subscriptions).toBe('----^!');
+});
+```
+
+Notifier phát ở frame 5, B bị unsubscribe ngay dù dự định tới frame 8 mới có data. Thử chuyển `takeUntil` lên trước `switchMap`: assertion output và subscription B sẽ thất bại, vì B vẫn được chờ tới frame 9.
+
+Bổ sung các ca sau cho màn hình thực tế:
+
+| Tình huống | Điều cần assert |
+| --- | --- |
+| Customer lỗi | Không subscribe orders; có error state đúng ID |
+| Orders lỗi, sau đó chọn khách hàng mới | Error state rồi workflow mới vẫn chạy nếu catch trong inner |
+| Đổi ID khi đã tải customer nhưng orders còn pending | Orders cũ bị unsubscribe, không phát ready state cũ |
+| Destroy khi đang pending | Không có ready/error state muộn; adapter HTTP được abort nếu hỗ trợ |
+| Reload cùng ID | Có hoặc không có request đúng contract `distinctUntilChanged` đã chọn |
+| Hai consumer của `state$` | Số execution đúng contract sharing, không vô tình gọi HTTP hai lần |
+
+Native Promise không được virtualize như cold Observable trong `TestScheduler`. Dùng marble test cho composition và subscription window; dùng integration test cho abort transport, endpoint thật và hành vi server sau cancellation.
+
+## Checklist trước khi đóng lỗi
+
+- [ ] Tìm hết `subscribe` nằm trong `next`, `tap` và helper tự chạy request.
+- [ ] Helper trả Observable; chỉ subscribe tại boundary có owner rõ ràng.
+- [ ] Chốt policy latest, queue, concurrent hoặc ignore theo nghiệp vụ.
+- [ ] Policy ở lớp trigger bao phủ toàn workflow, không chỉ request đầu.
+- [ ] Catch trong inner nếu input tiếp theo phải hoạt động sau lỗi.
+- [ ] Destroy teardown sau flattening; notifier phát value trước khi complete.
+- [ ] Không coi unsubscribe hay abort HTTP là rollback mutation.
+- [ ] Test input mới, lỗi, destroy, output và subscription window.
+- [ ] Kiểm tra request thật và callback sau rời trang, không chỉ log “đã unsubscribe”.
+
+Lấy một đoạn nested subscribe đang có lỗi, viết trước test “A chậm, B nhanh” và test destroy. Sau đó đổi helper thành Observable và refactor tới khi **cả output lẫn subscription assertion** đúng. Chỉ thêm retry, sharing hoặc cache sau khi ownership của workflow đã rõ.
+
+## Nguồn tham khảo
+
+- [RxJS switchMap 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/switchMap.ts) — hủy inner cũ khi input mới đến, chờ active inner sau outer complete.
+- [RxJS takeUntil 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/takeUntil.ts) — notifier phát value thì complete output; notifier chỉ complete thì không dừng source.
+- [RxJS Subscription 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/Subscription.ts) — quan hệ teardown phải được đăng ký bằng `add`, không tự suy ra từ callback nesting.
+- [RxJS catchError](https://rxjs.dev/api/operators/catchError) và [finalize](https://rxjs.dev/api/operators/finalize) — phạm vi thay source khi lỗi và cleanup khi subscription kết thúc.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Hiểu ownership và cách giải phóng tài nguyên của Observable." />
+  <Card title="switchMap" href="/docs/higher-order-observables/switch-map" description="Theo dõi inner mới nhất và phân biệt cancellation với completion." />
+  <Card title="Request orchestration" href="/docs/patterns-production/request-orchestration" description="Phối hợp request phụ thuộc, song song và mutation theo contract." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Kiểm chứng notification và subscription bằng virtual time." />
+</Cards>
