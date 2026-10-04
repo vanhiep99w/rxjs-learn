@@ -3,8 +3,391 @@ title: ReplaySubject
 description: Phát lại một số emission trước đó theo buffer.
 ---
 
-Trang này sẽ trình bày **ReplaySubject** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Giả sử panel log mở sau khi ứng dụng đã phát vài event. Với `Subject`, panel chỉ thấy event từ lúc subscribe, nên phần lịch sử trước đó biến mất khỏi góc nhìn của người dùng. `ReplaySubject` giải quyết đúng chỗ này: giữ một buffer trong bộ nhớ, phát lại các value còn hợp lệ cho subscriber mới, rồi tiếp tục chuyển các value mới.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình sẽ chọn `ReplaySubject` khi consumer đến muộn vẫn cần một phần lịch sử, nhưng không muốn producer chạy lại. Nếu bạn chỉ cần chia sẻ kết quả của một Observable có sẵn, hãy cân nhắc `shareReplay` trước khi tự quản lý một Subject và subscription upstream.
+
+<Callout type="info" title="Phạm vi và kiến thức nền">
+  Bài dùng API và hành vi của **RxJS 7.8.x**. Bạn nên biết `next`, `error`, `complete` và `unsubscribe`. Các ví dụ TypeScript import từ `rxjs`; dự án tài liệu không cần cài RxJS chỉ để hiển thị chúng.
 </Callout>
+
+## Mục lục
+
+- [Mental model của ReplaySubject](#mental-model-của-replaysubject)
+- [Constructor và giới hạn buffer](#constructor-và-giới-hạn-buffer)
+- [Subscriber đến muộn nhận gì](#subscriber-đến-muộn-nhận-gì)
+  - [Ví dụ đồng bộ với bufferSize](#ví-dụ-đồng-bộ-với-buffersize)
+  - [Đọc timeline của subscriber đến muộn](#đọc-timeline-của-subscriber-đến-muộn)
+- [windowTime không phải timer xóa cache](#windowtime-không-phải-timer-xóa-cache)
+- [Complete và error vẫn cho phép replay](#complete-và-error-vẫn-cho-phép-replay)
+- [Chọn Subject nào hoặc shareReplay](#chọn-subject-nào-hoặc-sharereplay)
+- [Ví dụ panel xem lịch sử event](#ví-dụ-panel-xem-lịch-sử-event)
+- [Những bẫy khi dùng ReplaySubject](#những-bẫy-khi-dùng-replaysubject)
+- [Kiểm thử replay bằng virtual time](#kiểm-thử-replay-bằng-virtual-time)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Mental model của ReplaySubject
+
+`ReplaySubject<T>` vừa là Observer nhận `next(value)`, vừa là Observable cho nhiều consumer subscribe. Nó giống một bảng ghi các thông báo gần nhất: người đến sau đọc từ thông báo cũ nhất còn giữ đến thông báo mới nhất, rồi theo dõi thông báo tiếp theo. Nhưng bảng này chỉ nằm trong RAM của instance; nó không phải log bền vững và không sống qua reload hay restart.
+
+Một lần `next` có hai tác động: cập nhật buffer và gửi value tới các subscriber đang hoạt động. Khi subscriber mới xuất hiện, Subject loại các value không còn hợp lệ rồi **replay đồng bộ theo thứ tự FIFO ngay trong lời gọi `subscribe()`**. Không có độ trễ gốc giữa các value được replay.
+
+Vì thế, hai consumer có thể nhận cùng một value vào hai thời điểm khác nhau: consumer cũ nhận lúc producer phát, consumer mới nhận lúc subscribe. Đây vẫn là một shared Subject, không phải mỗi subscription tạo một execution riêng của producer.
+
+Buffer chỉ lưu các value đã đi qua `next`; nó không gọi lại API, không tái tạo event bị mất, và không tự kết nối tới nguồn nào. Nếu bạn đưa `source$` vào Subject bằng `source$.subscribe(subject)`, việc sở hữu và teardown subscription đó vẫn là trách nhiệm của bạn.
+
+## Constructor và giới hạn buffer
+
+Chữ ký public của RxJS 7.8.x có thể đọc như sau:
+
+```ts
+import { ReplaySubject } from 'rxjs';
+import type { TimestampProvider } from 'rxjs';
+
+const clock: TimestampProvider = { now: () => Date.now() };
+const history$ = new ReplaySubject<string>(3, 2000, clock);
+```
+
+| Tham số | Kiểu | Mặc định | Ý nghĩa |
+| --- | --- | --- | --- |
+| `bufferSize` | `number` | `Infinity` | Số value tối đa được giữ để replay |
+| `windowTime` | `number` | `Infinity` | Thời gian một value còn hợp lệ, tính bằng millisecond với đồng hồ mặc định |
+| `timestampProvider` | `TimestampProvider` | Provider dùng `Date.now()` | Cung cấp `now()` để tính thời điểm hết hạn; hữu ích khi test |
+
+Với `new ReplaySubject<string>(3, 2000)`, subscriber mới nhận tối đa ba value gần nhất **và** các value ấy phải chưa đủ 2000 ms tuổi. Hai giới hạn cùng áp dụng, không phải chọn một trong hai. Tuổi tính từ lúc `next`, không phải lúc subscriber đọc; replay không gia hạn value.
+
+`bufferSize` không giới hạn số value mà subscriber đang hoạt động được nhận. Một consumer ở lại đủ lâu vẫn nhận mọi lần `next`; giới hạn chỉ quyết định lịch sử còn giữ cho những lần subscribe sau.
+
+<Callout type="warn" title="Không để mặc định vô hạn cho stream dài hạn">
+  `new ReplaySubject()` mặc định giữ toàn bộ lịch sử không giới hạn thời gian. Với event stream sống lâu, buffer có thể tăng mãi. Hãy truyền `bufferSize` rõ ràng; thêm `windowTime` nếu lịch sử còn có yêu cầu về độ mới.
+</Callout>
+
+Trong RxJS 7.8.x, constructor chuẩn hóa `bufferSize` và `windowTime` bằng `Math.max(1, ...)`. Vì vậy `ReplaySubject(0)` không phải cách tắt replay; dùng `Subject` nếu không cần giữ lịch sử. Hãy truyền số nguyên dương cho kích thước và khoảng thời gian dương có ý nghĩa thay vì dựa vào các giá trị biên này.
+
+## Subscriber đến muộn nhận gì
+
+### Ví dụ đồng bộ với bufferSize
+
+Bắt đầu bằng ví dụ không có timer để thấy rõ buffer thay đổi thế nào:
+
+```ts
+import { ReplaySubject } from 'rxjs';
+
+const history$ = new ReplaySubject<string>(2);
+
+const early = history$.subscribe((value) => console.log('early:', value));
+history$.next('A');
+history$.next('B');
+history$.next('C');
+
+console.log('before subscribe');
+const late = history$.subscribe((value) => console.log('late:', value));
+console.log('after subscribe');
+
+history$.next('D');
+
+early.unsubscribe();
+late.unsubscribe();
+history$.complete();
+```
+
+Kết quả:
+
+```text
+early: A
+early: B
+early: C
+before subscribe
+late: B
+late: C
+after subscribe
+early: D
+late: D
+```
+
+Sau `C`, buffer là `[B, C]`: `A` đã bị loại do vượt kích thước hai value. Subscriber `late` nhận `B`, `C` trước dòng `after subscribe`, chứng tỏ replay chạy đồng bộ. Lần `next('D')` sau đó đi tới cả hai consumer; lúc này buffer chuyển thành `[C, D]`.
+
+### Đọc timeline của subscriber đến muộn
+
+Đọc theo cột dọc: hàng `next` là các lần producer đưa value vào Subject; hàng `late sub` đánh dấu subscriber đến ở frame 6. Hình này dùng các frame minh họa, không gán chúng thành thời gian thực của đoạn code trên.
+
+<MarbleDiagram
+  title="ReplaySubject(2)"
+  rows={[
+    { label: 'next', marble: '-a-b-c---d-|', kind: 'source' },
+    { label: 'late sub', marble: '------^----!', kind: 'subscription' },
+    { label: 'late output', marble: '------(bc)--d-|', kind: 'output' },
+  ]}
+  values={{ a: 'A', b: 'B', c: 'C', d: 'D' }}
+  caption="Ở frame 6, B rồi C được replay trong cùng frame. D đến trực tiếp ở frame 9; Subject complete ở frame 11."
+/>
+
+`A`, `B`, `C` đến ở frame 1, 3, 5. Khi subscriber vào ở frame 6, chỉ `B` và `C` còn trong buffer; nhóm `(bc)` thể hiện hai notification cùng frame, theo thứ tự `B` rồi `C`. Sau đó subscriber nhận `D` ở frame 9 và complete ở frame 11.
+
+Dấu `!` ở hàng subscription chỉ thời điểm subscription đóng do completion, không phải một lần hủy chủ động riêng. Renderer của dự án gom `(bc)` thành một cột; syntax này không có cách đếm frame giống hoàn toàn nhóm của `TestScheduler`, nên đừng sao chép nguyên hàng visual thành chuỗi expected trong test.
+
+## windowTime không phải timer xóa cache
+
+Nếu không có value mới, lịch sử có tự biến mất khỏi RAM đúng sau `windowTime` không? Không. Trong RxJS 7.8.x, buffer được trim khi gọi `next()` hoặc khi có subscriber mới; `ReplaySubject` không đặt timer riêng để dọn các value hết hạn.
+
+Điều này phân biệt hai chuyện: một value hết hạn sẽ không được replay cho subscriber mới, nhưng tham chiếu vật lý tới nó có thể còn trong buffer cho tới lần trim tiếp theo. `windowTime` là chính sách chọn lịch sử hợp lệ, không phải cam kết giải phóng bộ nhớ đúng thời điểm TTL.
+
+Ví dụ sau dùng đồng hồ tự điều khiển để kiểm tra mốc hết hạn, không phải chờ timer thật:
+
+```ts
+import { ReplaySubject } from 'rxjs';
+
+let now = 0;
+const history$ = new ReplaySubject<string>(3, 100, { now: () => now });
+
+history$.next('A'); // Hết hạn ở 100.
+now = 40;
+history$.next('B'); // Hết hạn ở 140.
+now = 80;
+history$.next('C'); // Hết hạn ở 180.
+
+now = 100;
+const first = history$.subscribe((value) => console.log('at 100:', value));
+first.unsubscribe();
+
+now = 140;
+const second = history$.subscribe((value) => console.log('at 140:', value));
+second.unsubscribe();
+
+history$.complete();
+```
+
+Kết quả:
+
+```text
+at 100: B
+at 100: C
+at 140: C
+```
+
+Tại `now = 100`, `A` vừa đủ 100 đơn vị tuổi nên đã hết hạn. Điều kiện giữ value là `thời điểm phát + windowTime > now`, không phải lớn hơn hoặc bằng. Lần replay ở 100 không thay đổi deadline của `B`, nên ở 140 nó cũng bị loại.
+
+<Callout type="info" title="Tham số thứ ba không lên lịch replay">
+  `timestampProvider` chỉ cung cấp đồng hồ. Dù truyền một scheduler có `now()`, nó cũng không biến replay thành async. Nếu cần chuyển notification sang scheduler khác, dùng operator như `observeOn`; đó là bước riêng, không phải chức năng của constructor.
+</Callout>
+
+## Complete và error vẫn cho phép replay
+
+`ReplaySubject` giữ trạng thái terminal. Khi subscribe sau `complete()` hoặc `error()`, consumer vẫn nhận các value còn hợp lệ trong buffer trước, rồi mới nhận terminal notification tương ứng. Subject không mở lại và không nhận thêm value mới sau terminal event.
+
+```ts
+import { ReplaySubject } from 'rxjs';
+
+const done$ = new ReplaySubject<string>(2);
+done$.next('A');
+done$.next('B');
+done$.next('C');
+done$.complete();
+done$.next('ignored');
+
+done$.subscribe({
+  next: (value) => console.log('done next:', value),
+  complete: () => console.log('done complete'),
+});
+
+const failed$ = new ReplaySubject<string>(1);
+failed$.next('cached');
+failed$.error(new Error('connection lost'));
+
+failed$.subscribe({
+  next: (value) => console.log('failed next:', value),
+  error: (error: unknown) => {
+    console.log('failed error:', error instanceof Error ? error.message : String(error));
+  },
+});
+```
+
+Kết quả:
+
+```text
+done next: B
+done next: C
+done complete
+failed next: cached
+failed error: connection lost
+```
+
+Nếu cấu hình `windowTime` và subscriber đến sau khi toàn bộ value đã hết hạn, nó chỉ nhận `complete` hoặc `error`, không nhận lịch sử. Terminal status không hết hạn theo `windowTime`.
+
+Điều này hữu ích khi phát lại một tác vụ đã hoàn tất, nhưng dễ gây hiểu nhầm với state: nhận `cached` rồi error không có nghĩa kết nối đã hồi phục. Nếu cần một vòng kết nối mới, tạo execution hoặc instance mới theo lifecycle của ứng dụng; `retry` subscribe lại cùng một Subject đã error không thể hồi sinh nó.
+
+<Callout type="warn" title="Complete không phải xóa buffer">
+  `complete()` đóng stream, nhưng không tự xóa lịch sử để subscriber đến muộn còn replay được. Nếu instance vẫn được giữ trong service hoặc biến toàn cục, các payload còn trong buffer vẫn có thể được giữ trong RAM. Muốn bỏ dữ liệu của một phiên, hãy quản lý và loại bỏ tham chiếu tới instance cũ theo lifecycle; đừng dùng `complete()` như lệnh clear cache.
+</Callout>
+
+## Chọn Subject nào hoặc shareReplay
+
+| Lựa chọn | Khi consumer subscribe muộn | Khi nên chọn |
+| --- | --- | --- |
+| `Subject` | Không nhận value cũ; nhận terminal nếu stream đã kết thúc | Event chỉ có ý nghĩa ở thời điểm phát, như lệnh click hoặc submit |
+| `BehaviorSubject(seed)` | Nhận value hiện tại khi còn hoạt động; sau terminal chỉ nhận terminal | State luôn có initial value hợp lệ và cần truy cập `value` hoặc `getValue()` |
+| `ReplaySubject(1)` | Nhận value gần nhất nếu đã có; sau terminal replay value còn hợp lệ rồi terminal | Cần latest value nhưng chưa có initial value hợp lệ |
+| `ReplaySubject(n, windowTime)` | Nhận lịch sử còn trong cả hai giới hạn, rồi theo dõi live | Consumer cần nhiều event gần đây |
+| `AsyncSubject` | Chờ complete để nhận value cuối; error không phát value đã giữ | Chỉ quan tâm kết quả cuối của tác vụ hoàn tất |
+| `shareReplay(...)` | Nhận lịch sử từ shared execution theo cấu hình và lifecycle operator | Đã có Observable nguồn và muốn chia sẻ execution cùng replay |
+
+`ReplaySubject(1)` không phải `BehaviorSubject` bỏ seed. Trước lần `next` đầu tiên nó không phát gì, không có public `getValue()`, và cách xử lý late subscription sau terminal khác nhau. Nếu state có initial value thật, mình ưu tiên `BehaviorSubject` vì mô hình rõ ràng hơn; không nên tạo một seed giả chỉ để thỏa constructor.
+
+Với nguồn có sẵn, `source$.pipe(shareReplay({ bufferSize: 1, refCount: true }))` thường gọn hơn bridge thủ công. Tuy nhiên `shareReplay` còn quản lý kết nối upstream: trong RxJS 7.8.x nó reset khi error, không reset chỉ vì complete, và `refCount: true` cho phép ngắt upstream khi không còn consumer trong execution chưa kết thúc. Các chính sách này không phải tính năng tự có của một `ReplaySubject` độc lập.
+
+## Ví dụ panel xem lịch sử event
+
+Giả sử bạn muốn panel mở muộn vẫn thấy tối đa 20 event trong 30 giây gần nhất. Producer của event là logic ứng dụng, nên một service giữ `ReplaySubject` có thể phù hợp. Chỉ expose Observable cho consumer để panel không thể tự gọi `next` hoặc `complete`.
+
+```ts
+import { ReplaySubject } from 'rxjs';
+
+type AppEvent = Readonly<{
+  id: number;
+  message: string;
+}>;
+
+class EventHistory {
+  private readonly subject = new ReplaySubject<AppEvent>(20, 30_000);
+  readonly events$ = this.subject.asObservable();
+
+  record(event: AppEvent): void {
+    // Snapshot các field primitive, không giữ object mutable của caller.
+    this.subject.next({ ...event });
+  }
+
+  finish(): void {
+    this.subject.complete();
+  }
+}
+
+const history = new EventHistory();
+history.record({ id: 1, message: 'Connected' });
+history.record({ id: 2, message: 'Data loaded' });
+
+// Panel mở sau hai event.
+const panel = history.events$.subscribe((event) => {
+  console.log(`${event.id}: ${event.message}`);
+});
+
+history.record({ id: 3, message: 'Refresh completed' });
+panel.unsubscribe(); // Panel đóng; service vẫn nhận và giữ event.
+history.finish(); // Owner kết thúc vòng đời stream.
+```
+
+Nếu ba event diễn ra trong cửa sổ 30 giây, output là:
+
+```text
+1: Connected
+2: Data loaded
+3: Refresh completed
+```
+
+Đóng panel chỉ unsubscribe consumer đó; nó không xóa lịch sử, không đóng Subject và không dừng producer khác. Owner của service phải quyết định lúc kết thúc stream và lúc bỏ instance. Trong ứng dụng có login/logout, không nên dùng chung lịch sử của người dùng cũ cho người dùng mới.
+
+Đây là lịch sử quan sát, không phải hàng đợi xử lý công việc. Đừng nối mỗi event replay vào một side effect không idempotent như gửi email hay thanh toán: mỗi lần panel hoặc consumer subscribe lại có thể chạy side effect cho cùng một value cũ.
+
+## Những bẫy khi dùng ReplaySubject
+
+- **Replay giữ tham chiếu, không deep clone.** Nếu `next(object)` rồi sửa object đó, subscriber muộn có thể nhìn thấy dữ liệu đã sửa. Ví dụ service trên chỉ copy nông và an toàn với các field primitive; payload lồng nhau cần chiến lược snapshot riêng. `Readonly` chỉ là ràng buộc TypeScript, không tự freeze object lúc chạy.
+- **Buffer lớn làm `subscribe()` nặng.** Replay chạy đồng bộ và kích hoạt downstream cho từng value. Giới hạn buffer theo nhu cầu thực; việc chuyển notification bằng `observeOn` không thay thế giới hạn bộ nhớ.
+- **Không có ref count tự động.** Consumer cuối unsubscribe không tự hủy `source$.subscribe(subject)`. Giữ subscription upstream và teardown nó theo owner, hoặc dùng operator chia sẻ phù hợp.
+- **Replay không có cờ đánh dấu lịch sử.** Consumer nhận `next` bình thường cho cả value cũ lẫn mới. Nếu nghiệp vụ phải phân biệt, payload cần metadata riêng như timestamp hoặc ID; đừng đoán dựa vào tốc độ callback.
+- **Consumer có thể đóng giữa lúc replay.** Với `take(1)`, consumer chỉ nhận value đầu tiên trong buffer theo FIFO rồi complete. Trong `ReplaySubject(3)` chứa `[A, B, C]`, đó là `A`, không phải `C`; dùng buffer một value nếu yêu cầu là latest.
+
+Một bẫy khác đến từ timing: callback có thể chạy trước khi biến chứa kết quả `subscribe()` được gán. Vì thế đừng tự gọi `subscription.unsubscribe()` trong callback bằng chính biến đang khởi tạo; hãy để `take(1)` hoặc operator lifecycle xử lý.
+
+```ts
+import { ReplaySubject, take } from 'rxjs';
+
+const latest$ = new ReplaySubject<string>(1);
+latest$.next('ready');
+
+latest$.pipe(take(1)).subscribe((value) => console.log(value));
+// ready; subscription đóng ngay, không cần tham chiếu tới chính nó.
+latest$.complete();
+```
+
+## Kiểm thử replay bằng virtual time
+
+Không cần `setTimeout` để kiểm tra consumer đến muộn. Test sau dùng `TestScheduler` làm đồng hồ và lập lịch cả `next` lẫn subscription. Nó kiểm tra cùng lúc FIFO, eviction theo `bufferSize`, value live và terminal replay.
+
+```ts
+import { deepStrictEqual } from 'node:assert';
+import { ReplaySubject } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+type Seen = { frame: number; value: string };
+const seen: Seen[] = [];
+
+scheduler.run(() => {
+  const history$ = new ReplaySubject<string>(2, Infinity, scheduler);
+  scheduler.schedule(() => history$.next('A'), 1);
+  scheduler.schedule(() => history$.next('B'), 3);
+  scheduler.schedule(() => history$.next('C'), 5);
+
+  scheduler.schedule(() => {
+    history$.subscribe({
+      next: (value) => seen.push({ frame: scheduler.now(), value }),
+      complete: () => seen.push({ frame: scheduler.now(), value: 'complete' }),
+    });
+  }, 6);
+
+  scheduler.schedule(() => history$.next('D'), 9);
+  scheduler.schedule(() => history$.complete(), 11);
+
+  scheduler.schedule(() => {
+    const late: string[] = [];
+    history$.subscribe({
+      next: (value) => late.push(value),
+      complete: () => late.push('complete'),
+    });
+    deepStrictEqual(late, ['C', 'D', 'complete']);
+  }, 13);
+});
+
+deepStrictEqual(seen, [
+  { frame: 6, value: 'B' },
+  { frame: 6, value: 'C' },
+  { frame: 9, value: 'D' },
+  { frame: 11, value: 'complete' },
+]);
+```
+
+Test chạy thành công khi không có assertion lỗi. Việc ghi frame trực tiếp làm hai lần replay ở frame 6 rõ ràng, tránh nhầm cách đếm nhóm của visual renderer với marble parser trong test.
+
+Để kiểm tra `windowTime`, dùng cách điều khiển `now` ở ví dụ trước hoặc truyền `scheduler` như trên với một window hữu hạn. Các case nên có: chưa có value, eviction theo số lượng, đúng mốc hết hạn, subscribe sau complete, subscribe sau error, và consumer dùng `take(1)` đóng ngay giữa replay. Trong test này, virtual frame của `run()` tương ứng một millisecond; scheduler không tự điều khiển mọi Promise hay API async bên ngoài RxJS.
+
+## Bài tập tự kiểm tra
+
+Giả sử `new ReplaySubject<string>(2, 100, clock)` nhận `A` ở 0, `B` ở 40 và `C` ở 80, rồi complete ở 90. Không có `next` nào sau đó.
+
+1. Subscriber đến ở 100 nhận gì?
+2. Subscriber khác đến ở 180 nhận gì?
+3. Nếu consumer ở 100 dùng `take(1)`, value nào được nhận?
+
+Đáp án: ở 100 nhận `B`, `C`, rồi complete; ở 180 chỉ nhận complete vì `C` cũng vừa hết hạn. Với `take(1)` ở 100, consumer nhận `B` rồi complete do operator, không chờ lấy `C` hay terminal của Subject.
+
+Hãy tự thêm assertion cho ba case này vào test trước. Nếu bạn dự đoán `take(1)` lấy `C`, quay lại thứ tự FIFO: “mới nhất còn giữ” và “value đầu tiên được replay” chỉ trùng nhau khi buffer có một value.
+
+## Nguồn tham khảo
+
+- [RxJS — ReplaySubject API](https://rxjs.dev/api/index/class/ReplaySubject): constructor và hành vi replay.
+- [Mã nguồn ReplaySubject 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/ReplaySubject.ts): trim buffer, mốc hết hạn, replay đồng bộ và terminal status.
+- [Mã nguồn BehaviorSubject 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/BehaviorSubject.ts): seed, current value và hành vi subscribe.
+- [Mã nguồn shareReplay 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts): connector ReplaySubject và chính sách reset/ref count.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Subject" href="/docs/subjects-multicasting/subject" description="Multicast value mới mà không giữ lịch sử." />
+  <Card title="BehaviorSubject" href="/docs/subjects-multicasting/behavior-subject" description="Quản lý current state với initial value hợp lệ." />
+  <Card title="shareReplay" href="/docs/subjects-multicasting/share-replay" description="Chia sẻ Observable nguồn cùng buffer replay và lifecycle upstream." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm tra notification và subscription bằng virtual time." />
+</Cards>

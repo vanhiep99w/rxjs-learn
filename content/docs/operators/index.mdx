@@ -3,22 +3,310 @@ title: Operators
 description: Hệ thống hóa các nhóm operator và cách chọn operator phù hợp.
 ---
 
-Đây là trang khung cho nhóm **Operators** trong lộ trình học RxJS.
+Bạn có một stream từ ô tìm kiếm và muốn bỏ khoảng trắng, bỏ từ khóa quá ngắn, tránh xử lý hai giá trị liên tiếp giống nhau. Viết tất cả trong `subscribe` thì chạy được, nhưng khi thêm request, cancellation và xử lý lỗi, callback ấy rất khó đọc. Operator giúp bạn chia yêu cầu thành từng bước có hành vi rõ ràng, rồi ghép chúng thành một pipeline.
+
+Trang này là bản đồ cho nhóm **Operators**: phân biệt cách tạo stream với cách biến đổi stream, đọc thứ tự trong `pipe`, và chọn operator từ yêu cầu thay vì đoán theo tên.
+
+<Callout type="info" title="Trước khi bắt đầu">
+  Bạn nên biết `Observable`, `next`, `error`, `complete` và `Subscription` trong bài [Vòng đời stream](/docs/nen-tang/vong-doi-stream) và [Pipe và operator](/docs/bat-dau/pipe-va-operator). Ví dụ ở đây dùng public API của **RxJS 7.8.2**, import trực tiếp từ `rxjs`; không dùng API deprecated.
+</Callout>
 
 ## Mục lục
 
-- [Phạm vi dự kiến](#phạm-vi-dự-kiến)
-- [Các bài trong nhóm](#các-bài-trong-nhóm)
+- [Operator thay đổi điều gì](#operator-thay-đổi-điều-gì)
+- [Hai cách sử dụng operator](#hai-cách-sử-dụng-operator)
+  - [Creation function tạo Observable](#creation-function-tạo-observable)
+  - [Pipeable operator nhận và trả Observable](#pipeable-operator-nhận-và-trả-observable)
+- [Đọc một pipeline từ trái sang phải](#đọc-một-pipeline-từ-trái-sang-phải)
+  - [Ví dụ chuẩn hóa từ khóa](#ví-dụ-chuẩn-hóa-từ-khóa)
+  - [Theo dõi emission bằng marble diagram](#theo-dõi-emission-bằng-marble-diagram)
+- [Thứ tự operator là một phần của yêu cầu](#thứ-tự-operator-là-một-phần-của-yêu-cầu)
+- [Bản đồ chọn operator theo bài toán](#bản-đồ-chọn-operator-theo-bài-toán)
+- [Đọc contract trước khi chọn](#đọc-contract-trước-khi-chọn)
+  - [Giá trị và số emission](#giá-trị-và-số-emission)
+  - [Thời điểm phát và điều kiện chờ](#thời-điểm-phát-và-điều-kiện-chờ)
+  - [Lỗi hoàn tất và teardown](#lỗi-hoàn-tất-và-teardown)
+- [Những hiểu nhầm dễ gặp](#những-hiểu-nhầm-dễ-gặp)
+- [Lộ trình trong nhóm Operators](#lộ-trình-trong-nhóm-operators)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
 
-## Phạm vi dự kiến
+## Operator thay đổi điều gì
 
-Nhóm này tổ chức operator theo mục đích để bạn hiểu hành vi thay vì chỉ ghi nhớ tên hàm.
+Một stream không chỉ có giá trị. Nó còn có thời điểm phát, số lần phát và cách kết thúc. Vì vậy, chọn operator không chỉ là chọn hàm để đổi object thành object khác.
 
-## Các bài trong nhóm
+Hãy bắt đầu từ bốn câu hỏi:
 
-- **[Creation operators](/docs/operators/creation-operators)** — Khởi tạo stream cho các loại nguồn dữ liệu phổ biến.
-- **[Transformation operators](/docs/operators/transformation-operators)** — Biến đổi cấu trúc và giá trị của emission.
-- **[Filtering operators](/docs/operators/filtering-operators)** — Chọn, bỏ qua hoặc giới hạn emission theo điều kiện.
-- **[Combination operators](/docs/operators/combination-operators)** — Kết hợp nhiều stream theo thứ tự và thời điểm emission.
-- **[Utility operators](/docs/operators/utility-operators)** — Thực hiện side effect, thu thập dữ liệu và hỗ trợ debug.
-- **[Conditional & boolean operators](/docs/operators/conditional-boolean-operators)** — Rẽ nhánh và kiểm tra điều kiện trên stream.
+| Câu hỏi | Ví dụ yêu cầu | Operator để nghĩ tới |
+| --- | --- | --- |
+| Giá trị cần có hình dạng nào? | Đổi API user thành label cho UI | `map` |
+| Emission nào được đi tiếp? | Chỉ nhận từ khóa dài ít nhất hai ký tự | `filter` |
+| Khi nào nên phát? | Chờ người dùng ngừng gõ một khoảng | `debounceTime` |
+| Khi nào nên dừng hoặc cleanup? | Ngừng lắng nghe khi màn hình đóng | `takeUntil`, `finalize` |
+
+Có thể hình dung pipeline như các trạm xử lý trên một dây chuyền: mỗi trạm nhận đầu vào từ trạm trước và đưa kết quả xuống trạm sau. Nhưng đừng kéo phép so sánh này quá xa: operator có thể giữ state, chờ nguồn khác hoặc quản lý nhiều subscription, chứ không chỉ xử lý từng value độc lập.
+
+Mình thường bắt đầu bằng `map` và `filter` khi yêu cầu chỉ là đổi và chọn dữ liệu. Nếu một array đồng bộ đã giải quyết được bài toán, bạn không cần chuyển nó thành Observable chỉ để dùng hai operator này.
+
+## Hai cách sử dụng operator
+
+RxJS dùng tên “operator” cho cả hàm tạo Observable lẫn hàm ghép vào pipeline. Hai nhóm khác nhau ở cách gọi; còn các nhóm như transformation, filtering hay combination mô tả **mục đích sử dụng**. Đừng trộn hai cách phân loại ấy.
+
+### Creation function tạo Observable
+
+Creation function được gọi độc lập và trả về một Observable. Bạn truyền dữ liệu, event target hoặc cấu hình thời gian, không đặt nó vào `source$.pipe(...)` như `map`.
+
+```ts
+import { from, of } from 'rxjs';
+
+of([1, 2, 3]).subscribe((value) => console.log('of:', value));
+// of: [1, 2, 3] — một emission chứa cả array
+
+from([1, 2, 3]).subscribe((value) => console.log('from:', value));
+// from: 1
+// from: 2
+// from: 3
+```
+
+`of` phát từng argument, còn `from` chuyển đầu vào được hỗ trợ, như iterable hoặc Promise, thành Observable. `fromEvent`, `interval`, `timer` và `defer` cũng là những điểm bắt đầu thường gặp. Bài [Creation operators](/docs/operators/creation-operators) đi sâu vào cách chọn nguồn và thời điểm công việc thật sự bắt đầu.
+
+Các hàm `combineLatest`, `forkJoin`, `merge` hay `concat` cũng được gọi độc lập để tạo Observable từ nhiều nguồn. Trong lộ trình này, chúng nằm ở **Combination operators** vì bài toán chính là phối hợp stream. Nhóm theo mục đích không có nghĩa là mọi API trong nhóm đều pipeable.
+
+### Pipeable operator nhận và trả Observable
+
+Về hình dạng, một pipeable operator là hàm nhận `Observable<T>` và trả `Observable<R>`. Hầu hết API bạn gọi, như `map(project)` hoặc `filter(predicate)`, là **operator factory**: nó nhận cấu hình rồi trả về operator thực sự.
+
+```ts
+import { map, of } from 'rxjs';
+
+const source$ = of(1, 2, 3);
+const doubled$ = source$.pipe(map((value) => value * 2));
+
+source$.subscribe((value) => console.log('source:', value));
+// source: 1
+// source: 2
+// source: 3
+
+doubled$.subscribe((value) => console.log('doubled:', value));
+// doubled: 2
+// doubled: 4
+// doubled: 6
+```
+
+`source$` không bị sửa. `doubled$` là Observable mới, mô tả cách nhận và biến đổi notification từ `source$` khi được subscribe. Hai subscription trong ví dụ tạo hai execution riêng của nguồn `of`.
+
+```text
+Observable<T> ──► operator ──► Observable<R>
+```
+
+Chữ “không sửa source” nói về Observable, không bảo đảm callback của bạn là pure. Nếu bạn mutate object trong `map` hoặc `tap`, những nơi cùng giữ reference đó vẫn có thể thấy dữ liệu bị đổi.
+
+<Callout type="warn" title="pipe không tự chạy và không tự chia sẻ nguồn">
+  Gọi `pipe` chỉ tạo mô tả pipeline; subscription vào output mới kết nối execution tới input. Nó không biến cold source thành cache. Hai subscription vào một cold HTTP Observable có thể tạo hai request; xem [Unicast và multicast](/docs/observable-subscription/unicast-va-multicast) và [share](/docs/subjects-multicasting/share) khi cần chia sẻ execution.
+</Callout>
+
+## Đọc một pipeline từ trái sang phải
+
+Với `source$.pipe(op1(), op2(), op3())`, output của `op1` là input của `op2`, rồi tới `op3`. Mỗi operator chỉ thấy các notification đã qua những bước ở trước nó.
+
+### Ví dụ chuẩn hóa từ khóa
+
+Giả sử yêu cầu là bỏ khoảng trắng ở hai đầu, chỉ nhận chuỗi dài ít nhất hai ký tự, bỏ giá trị liên tiếp trùng nhau sau chuẩn hóa, rồi đổi sang chữ hoa để hiển thị. Dùng `of` để ví dụ chạy đồng bộ và không cần DOM hay server:
+
+```ts
+import { distinctUntilChanged, filter, map, of, tap } from 'rxjs';
+
+const rawKeywords$ = of(' r ', ' rx ', 'rx', ' rxjs ', 'x');
+
+const keywords$ = rawKeywords$.pipe(
+  map((keyword) => keyword.trim()),
+  filter((keyword) => keyword.length >= 2),
+  distinctUntilChanged(),
+  map((keyword) => keyword.toUpperCase()),
+  tap((keyword) => console.log('debug:', keyword)),
+);
+
+keywords$.subscribe({
+  next: (keyword) => console.log('result:', keyword),
+  error: (error) => console.error('error:', error),
+  complete: () => console.log('complete'),
+});
+
+// debug: RX
+// result: RX
+// debug: RXJS
+// result: RXJS
+// complete
+```
+
+`map(trim)` đưa `' rx '` và `'rx'` về cùng một chuỗi. `filter` loại `'r'` và `'x'`. `distinctUntilChanged` chỉ thấy `'rx'`, `'rx'`, `'rxjs'`, nên bỏ `'rx'` thứ hai. `map(toUpperCase)` đổi giá trị, còn `tap` quan sát giá trị đi qua mà không dùng return value của callback để thay nó.
+
+Ở đây, `subscribe` là nơi sử dụng kết quả cuối; logic chọn và đổi dữ liệu nằm trong pipeline. Vì `of`, `map`, `filter`, `distinctUntilChanged` và `tap` trong ví dụ này không thêm scheduling bất đồng bộ, toàn bộ output xuất hiện ngay trong lời gọi `subscribe`.
+
+### Theo dõi emission bằng marble diagram
+
+Đọc từng cột dọc để đối chiếu source với output. Diagram dưới đây mô phỏng phần xử lý từ `map(trim)` đến `map(toUpperCase)` ở ví dụ trên; `tap` không đổi output nên không có hàng riêng.
+
+<MarbleDiagram
+  title="map → filter → distinctUntilChanged → map"
+  rows={[
+    { label: 'source', marble: '-a-b-c-d-e--|', kind: 'source' },
+    { label: 'output', marble: '---u---v----|', kind: 'output' },
+  ]}
+  values={{
+    a: "' r '",
+    b: "' rx '",
+    c: "'rx'",
+    d: "' rxjs '",
+    e: "'x'",
+    u: "'RX'",
+    v: "'RXJS'",
+  }}
+  caption="Chuẩn hóa trước khi lọc và so sánh trùng; chỉ hai emission đi xuống output."
+/>
+
+Ở frame 1, `a` bị loại vì sau trim chỉ còn một ký tự. `b` ở frame 3 tạo `u` ngay tại frame 3; `c` ở frame 5 bị bỏ vì giống giá trị trước đó sau trim. `d` ở frame 7 tạo `v`, còn `e` ở frame 9 bị loại. Source và output đều complete ở frame 12.
+
+`-` biểu diễn một frame không có notification, chữ cái là một value và `|` là complete. Đây là **virtual timeline để giải thích hành vi**, không phải thời gian chạy của `of` ở ví dụ đồng bộ phía trên. Không có operator nào ở đây thêm delay.
+
+## Thứ tự operator là một phần của yêu cầu
+
+Có hai yêu cầu trông gần giống nhau: “lấy hai số chẵn đầu tiên” và “xem hai số đầu tiên rồi giữ số chẵn”. Chúng cần hai pipeline khác nhau:
+
+```ts
+import { filter, of, take } from 'rxjs';
+
+const source$ = of(1, 2, 3, 4, 6);
+
+source$.pipe(
+  filter((value) => value % 2 === 0),
+  take(2),
+).subscribe(console.log);
+// 2
+// 4
+
+source$.pipe(
+  take(2),
+  filter((value) => value % 2 === 0),
+).subscribe(console.log);
+// 2
+```
+
+Ở pipeline đầu, `take` chỉ thấy `2`, `4`, nên đủ hai emission rồi complete và unsubscribe upstream. Ở pipeline sau, `take` đếm `1`, `2`, sau đó kết thúc; `filter` chỉ giữ được `2`. Số `4` không bao giờ tới `filter` ở execution này.
+
+Tương tự, `tap` trước `filter` quan sát cả giá trị bị loại, còn `tap` sau `filter` chỉ thấy giá trị được giữ. Vì vậy, vị trí log cũng phải trả lời đúng câu hỏi debug: “nguồn đã phát gì?” hay “bước lọc đã cho qua gì?”.
+
+<Callout type="idea" title="Cách đọc khi pipeline cho kết quả sai">
+  Đừng vội thay operator. Viết ra output kỳ vọng sau từng bước, đặc biệt trước và sau `filter`, `distinctUntilChanged`, `take` hoặc operator chờ thời gian. Nếu kết quả đúng ở một bước nhưng sai ở bước kế tiếp, bạn đã thu hẹp được nơi cần kiểm tra.
+</Callout>
+
+## Bản đồ chọn operator theo bài toán
+
+Bảng này chọn theo hành vi, không phải danh sách toàn bộ API. Những operator dễ nhầm được đặt cạnh nhau để bạn thấy câu hỏi quyết định.
+
+| Bạn cần gì? | Bắt đầu với | Câu hỏi cần kiểm tra |
+| --- | --- | --- |
+| Tạo stream từ value, array, Promise, event hoặc timer | `of`, `from`, `fromEvent`, `timer`, `defer` | Công việc bắt đầu lúc tạo hay lúc subscribe? |
+| Đổi từng value độc lập | `map` | Callback trả value hay trả Observable/Promise? |
+| Phát state mới sau từng event | `scan` | Có seed không, và accumulator có bị mutate không? |
+| Tính một kết quả cuối hoặc gom tất cả value | `reduce`, `toArray` | Source có complete không? |
+| Chỉ giữ value đúng điều kiện | `filter` | Bạn muốn bỏ emission hay phát một value thay thế? |
+| Bỏ giá trị liên tiếp giống nhau | `distinctUntilChanged` | So sánh primitive, reference hay một key? |
+| Giới hạn số emission hoặc kết thúc theo tín hiệu | `take`, `takeUntil` | Đếm sau bước nào; notifier có phát `next` không? |
+| Chờ khoảng lặng khi gõ | `debounceTime` | Có muốn tiếp tục nhận đều đặn khi input không ngừng không? |
+| Giảm tần suất trong lúc input tiếp tục | `throttleTime`, `auditTime`, `sampleTime` | Cần value đầu, cuối cửa sổ hay value tại nhịp lấy mẫu? |
+| Tính lại khi bất kỳ nguồn nào đổi | `combineLatest` | Mọi nguồn đã phát ít nhất một value chưa? |
+| Chỉ một nguồn kích hoạt, các nguồn khác cung cấp context | `withLatestFrom` | Nguồn phụ đã có value khi trigger đến chưa? |
+| Ghép emission thứ nhất với thứ nhất, thứ hai với thứ hai | `zip` | Nguồn nhanh có phải giữ nhiều value chờ nguồn chậm không? |
+| Lấy value cuối của mỗi nguồn khi tất cả hoàn tất | `forkJoin` | Mỗi nguồn có phát value và complete không? |
+| Chạy nhiều nguồn song song hoặc lần lượt | `merge`, `concat` | Có cần chờ nguồn trước complete rồi mới subscribe nguồn sau không? |
+| Log hoặc làm side effect | `tap` | Có vô tình mutate value hoặc ném lỗi trong callback không? |
+| Cleanup khi execution kết thúc | `finalize` | Cleanup có phải chạy cả khi unsubscribe không? |
+| Phát fallback nếu source không có value | `defaultIfEmpty` | Đây là source rỗng hay source bị error? |
+| Kiểm tra toàn bộ, tìm value hoặc kiểm tra rỗng | `every`, `find`, `isEmpty` | Có thể kết luận sớm hay phải chờ complete? |
+
+Nếu callback cần mở một công việc trả về Observable, hãy dừng ở đó và chọn **flattening policy** thay vì chỉ thêm `map`. Mặc định mình chọn từ yêu cầu về công việc cũ khi input mới tới:
+
+| Yêu cầu | Operator |
+| --- | --- |
+| Chỉ còn quan tâm công việc mới nhất | `switchMap` |
+| Mọi công việc phải chạy lần lượt, giữ thứ tự | `concatMap` |
+| Công việc độc lập có thể chạy song song | `mergeMap`, với giới hạn concurrency khi cần |
+| Bỏ trigger mới trong lúc công việc hiện tại đang chạy | `exhaustMap` |
+
+`switchMap` phù hợp với kết quả tìm kiếm mới nhất, nhưng không phải mặc định an toàn cho thao tác ghi cần hoàn thành. Unsubscribe inner cũng không bảo đảm server đã hủy thao tác ghi. Phần [Higher-order Observables](/docs/higher-order-observables) giải thích subscription, hàng đợi và cancellation của bốn lựa chọn này.
+
+## Đọc contract trước khi chọn
+
+Đọc tên operator thường chưa đủ. Trước khi đưa nó vào pipeline, hãy kiểm tra data shape, thời gian và lifecycle; một operator “đúng tên” vẫn có thể sai yêu cầu ở hai phần còn lại.
+
+### Giá trị và số emission
+
+`map` đổi mỗi value thành một value mới nếu projection không ném lỗi; `filter` có thể bỏ một số value. `scan` phát các state trung gian, còn `reduce` chỉ phát kết quả khi source complete. Hai operator tích lũy nhưng phục vụ hai cách đọc dữ liệu khác nhau.
+
+Nếu callback của `map` trả `Observable<User>`, output là `Observable<Observable<User>>`, không phải `Observable<User>`. Nếu callback là `async`, nó trả Promise và `map` sẽ phát Promise ấy. `map` không tự subscribe inner hay await kết quả; hãy chọn flattening operator để lấy value bên trong.
+
+Với object, `distinctUntilChanged()` mặc định dùng `===`: hai object mới có cùng field vẫn là hai value khác nhau. Khi yêu cầu là “không xử lý lại cùng user ID”, hãy cung cấp comparator theo ID thay vì dựa vào reference.
+
+### Thời điểm phát và điều kiện chờ
+
+`filter` không cần đợi source complete để giữ một value. Ngược lại, `toArray` phải đợi complete mới phát array; đặt nó vào event stream không kết thúc thì subscriber có thể chờ mãi dù source liên tục phát event.
+
+Khi kết hợp nguồn, `combineLatest` và `withLatestFrom` cần mỗi nguồn liên quan có value đầu tiên trước khi tạo tuple. Nhưng nguồn kích hoạt khác nhau: `combineLatest` phản ứng với mọi nguồn sau giai đoạn khởi tạo, còn `withLatestFrom` chỉ phát theo source chính. Chọn sai có thể khiến thao tác “bấm lưu kèm state mới nhất” chạy cả khi state đổi.
+
+Các điều kiện này quan trọng hơn chuyện ngắn hay dài của pipeline. Một bước `startWith` có thể cung cấp value ban đầu, nhưng chỉ nên thêm nếu giá trị đó có ý nghĩa trong domain, không phải để che việc một nguồn chưa sẵn sàng.
+
+### Lỗi hoàn tất và teardown
+
+`error`, `complete` và unsubscribe không phải ba tên cho cùng một việc. `error` và `complete` là terminal notification gửi tới observer; unsubscribe đóng subscription và cleanup mà không tự gọi callback `complete`.
+
+`take` có thể chủ động complete output và dừng upstream sớm. `takeUntil(notifier$)` dừng khi notifier phát `next`; notifier chỉ complete mà không phát value thì **không** kích hoạt việc dừng. `finalize` chạy khi execution kết thúc bởi complete, error hoặc unsubscribe, nên phù hợp với cleanup hơn callback `complete` nếu bạn phải xử lý cả cancellation.
+
+Lỗi được chuyển tiếp qua nhiều operator thông thường. Nếu projection của `map` hoặc callback của `tap` ném lỗi đồng bộ, lỗi ấy đi vào error channel. `catchError` có thể thay phần bị lỗi bằng Observable khác; vị trí của nó quyết định bạn đang thay một inner hay cả pipeline. Đọc tiếp nhóm [Lỗi và hoàn tất](/docs/loi-hoan-tat) khi yêu cầu có recovery, retry hoặc timeout.
+
+## Những hiểu nhầm dễ gặp
+
+| Hiểu nhầm | Hành vi thật và cách sửa |
+| --- | --- |
+| Trả `undefined` trong `map` là bỏ value | Output vẫn nhận một emission có giá trị `undefined`; dùng `filter` để loại emission. |
+| Return trong `tap` đổi output | Return value bị bỏ qua; dùng `map` để biến đổi và giữ side effect rõ ràng trong `tap`. |
+| `distinctUntilChanged` nhớ tất cả value đã thấy | Nó chỉ so với value vừa phát qua operator. Chuỗi `a, b, a` vẫn phát cả ba. |
+| Thêm operator là làm stream bất đồng bộ | Các operator như `map` và `filter` không tự thêm scheduling. Thời gian phụ thuộc source và operator được dùng. |
+| `defaultIfEmpty` xử lý được error | Nó chỉ phát fallback khi source complete mà chưa phát value; dùng `catchError` cho error. |
+| `pipe` khiến nhiều subscriber dùng cùng kết quả | Cold execution vẫn có thể chạy lại cho mỗi subscription; cần chọn cơ chế chia sẻ và lifetime riêng. |
+| Có thể `subscribe` bên trong `subscribe` để chạy request tiếp | Cách này tách quản lý subscription và error; ưu tiên flattening operator với policy rõ ràng. |
+
+Mình không khuyên thêm `shareReplay`, `catchError` hay `debounceTime` vào mọi pipeline như một mẫu có sẵn. Cache cần lifetime và quy tắc hết hạn; fallback cần ý nghĩa nghiệp vụ; debounce có thể bỏ những input mà bạn phải xử lý đầy đủ. Chỉ thêm khi bạn mô tả được hành vi mình cần.
+
+## Lộ trình trong nhóm Operators
+
+Nếu mới học, bắt đầu với **creation → transformation → filtering** để viết được pipeline từ một nguồn. Sau đó học combination để phối hợp nhiều nguồn, rồi utility và conditional để quan sát và xử lý các trường hợp biên. Bạn không cần nhớ toàn bộ tên operator trước khi viết một pipeline đúng.
+
+<Cards>
+  <Card title="Creation operators" href="/docs/operators/creation-operators" description="Chọn cách tạo stream từ dữ liệu, event, Promise và thời gian." />
+  <Card title="Transformation operators" href="/docs/operators/transformation-operators" description="Đổi value, tích lũy state và gom emission thành cấu trúc mới." />
+  <Card title="Filtering operators" href="/docs/operators/filtering-operators" description="Chọn emission, loại trùng và đặt giới hạn cho stream." />
+  <Card title="Combination operators" href="/docs/operators/combination-operators" description="Chọn nguồn kích hoạt và cách phối hợp nhiều stream." />
+  <Card title="Utility operators" href="/docs/operators/utility-operators" description="Side effect, debug và các tiện ích hỗ trợ pipeline." />
+  <Card title="Conditional & boolean operators" href="/docs/operators/conditional-boolean-operators" description="Tìm kiếm, kiểm tra điều kiện và xử lý source rỗng." />
+</Cards>
+
+Các chủ đề có lifecycle phức tạp được tách riêng: [Higher-order Observables](/docs/higher-order-observables), [Thời gian và Schedulers](/docs/thoi-gian-schedulers), [Subjects và Multicasting](/docs/subjects-multicasting) và [Testing](/docs/testing). Khi chưa chắc output đúng, một [marble test](/docs/testing/marble-testing) nhỏ thường hữu ích hơn việc đổi operator theo cảm giác.
+
+## Bài tập tự kiểm tra
+
+Trước khi mở bài tiếp theo, thử giải thích output và điều kiện kết thúc của ba trường hợp:
+
+1. Với `of(1, 2, 3, 4)`, pipeline `filter(n => n > 2), take(1)` khác gì `take(1), filter(n => n > 2)`?
+2. Với `of('rx', 'rx', 'rxjs', 'rx')`, `distinctUntilChanged()` phát những gì? Vì sao `'rx'` cuối vẫn xuất hiện?
+3. Một stream click không tự complete được đưa qua `toArray()`. Vì sao click liên tục mà chưa có array? Bạn đổi sang gì nếu muốn một batch cho mỗi ba click?
+
+**Đối chiếu:** Trường hợp 1 phát `3` rồi complete ở pipeline đầu; pipeline sau complete mà không phát value vì `1` bị lọc. Trường hợp 2 phát `'rx'`, `'rxjs'`, `'rx'` vì chỉ bỏ trùng liên tiếp. Trường hợp 3 chưa có output do `toArray` chờ complete; `bufferCount(3)` phù hợp hơn để phát batch sau mỗi ba click.
+
+Nếu bạn giải thích được cả value lẫn thời điểm dừng, hãy chọn một yêu cầu đang có trong ứng dụng và viết lại nó thành ba phần: nguồn, các bước xử lý, và điều kiện kết thúc. Sau đó dùng bản đồ phía trên để chọn operator cho từng phần.
+
+## Nguồn tham khảo
+
+- [RxJS — Operators guide](https://rxjs.dev/guide/operators): creation, pipeable operators, piping và các nhóm hành vi.
+- [Operators guide ở tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/docs_app/content/guide/operators.md): bản nguồn tương ứng với phiên bản dùng trong ví dụ; danh sách phân nhóm có cả API deprecated, không phải danh sách nên dùng mới.
+- [RxJS API reference](https://rxjs.dev/api): tra signature, overload và contract của từng operator.

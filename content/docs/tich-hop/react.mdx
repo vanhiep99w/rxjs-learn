@@ -3,8 +3,582 @@ title: RxJS với React
 description: Kết nối Observable với hook và vòng đời component.
 ---
 
-Trang này sẽ trình bày **RxJS với React** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn có ô tìm kiếm cần chờ người dùng ngừng gõ, hủy request cũ và không để response đến muộn ghi đè kết quả mới. React lo phần render; RxJS có thể lo thứ tự các event và tác vụ bất đồng bộ. Điểm dễ sai nằm ở chỗ nối hai bên: subscribe lúc nào, ai hủy subscription, và React đọc state của stream bằng cách nào?
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi và điều kiện">
+  Bài này dùng React 18 trở lên và public API của RxJS 7.8.2, không cần thư viện hook RxJS bên thứ ba. Bạn nên biết `useState`, `useEffect`, `Observable`, `Subscription` và `switchMap`. Các ví dụ TSX chạy ở client; với Next.js App Router, giữ directive `'use client'` ở file component. Dự án ứng dụng chạy ví dụ cần có dependency `rxjs`; các đoạn code không phải yêu cầu thêm dependency vào site tài liệu này.
 </Callout>
+
+## Mục lục
+
+- [Chọn đúng ranh giới giữa React và RxJS](#chọn-đúng-ranh-giới-giữa-react-và-rxjs)
+- [Subscription gắn với useEffect](#subscription-gắn-với-useeffect)
+  - [Ví dụ bộ đếm có cleanup](#ví-dụ-bộ-đếm-có-cleanup)
+  - [Dependencies và stale closure](#dependencies-và-stale-closure)
+  - [Strict Mode và quyền sở hữu tài nguyên](#strict-mode-và-quyền-sở-hữu-tài-nguyên)
+- [Tìm kiếm có chờ gõ và hủy request](#tìm-kiếm-có-chờ-gõ-và-hủy-request)
+  - [Tách pipeline khỏi component](#tách-pipeline-khỏi-component)
+  - [Nối input và kết quả với React](#nối-input-và-kết-quả-với-react)
+  - [Đọc timeline hủy request](#đọc-timeline-hủy-request)
+- [Store dùng chung với useSyncExternalStore](#store-dùng-chung-với-usesyncexternalstore)
+  - [Tạo store có snapshot ổn định](#tạo-store-có-snapshot-ổn-định)
+  - [Cấp store bằng Context và đọc bằng hook](#cấp-store-bằng-context-và-đọc-bằng-hook)
+  - [Snapshot SSR và hydration](#snapshot-ssr-và-hydration)
+- [Các bẫy thường gặp](#các-bẫy-thường-gặp)
+- [Kiểm chứng pipeline và lifecycle](#kiểm-chứng-pipeline-và-lifecycle)
+  - [TestScheduler kiểm tra kết quả và subscription](#testscheduler-kiểm-tra-kết-quả-và-subscription)
+  - [Checklist kiểm tra component](#checklist-kiểm-tra-component)
+- [Bài tập thực hành](#bài-tập-thực-hành)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Chọn đúng ranh giới giữa React và RxJS
+
+Mình mặc định dùng `useState` hoặc `useReducer` cho state thuộc một component. Một nút bật tắt, giá trị input hay danh sách có thể suy ra trực tiếp từ props chưa cần Observable. RxJS đáng dùng khi bạn phải phối hợp nhiều event, timer, request hoặc stream realtime với chính sách rõ ràng: thay thế tác vụ cũ, xếp hàng hay chạy đồng thời.
+
+```text
+React event → RxJS pipeline → notification → React state → render
+                 ↑
+        subscription do Effect sở hữu
+```
+
+Nếu state đã nằm trong một store bên ngoài React và nhiều component cùng đọc, cần một ranh giới khác: React đọc **snapshot đồng bộ** và đăng ký nhận thông báo thay đổi qua `useSyncExternalStore`. Một Observable bất kỳ chỉ hứa sẽ phát giá trị; nó không nhất thiết có snapshot hiện tại. Vì vậy không thể lấy mọi Observable rồi coi chúng là external store.
+
+| Nhu cầu | Lựa chọn mặc định | Lý do |
+| --- | --- | --- |
+| State UI đơn giản trong một component | `useState` hoặc `useReducer` | Không thêm một lifecycle cần quản lý |
+| Timer, event, request thuộc component | `useEffect` và cleanup subscription | Tài nguyên bắt đầu và dừng theo component hoặc dependencies |
+| State RxJS dùng chung, có snapshot đọc đồng bộ | `useSyncExternalStore` và adapter store | React có thể kiểm tra snapshot nhất quán khi render |
+| Server data cần cache, SSR, refetch, deduplication | Cơ chế data fetching của framework hoặc thư viện chuyên dụng | Một subscription tự viết chưa cung cấp các chính sách này |
+
+RxJS không thay React render và cũng không tự tích hợp với Suspense. Trong các ví dụ bên dưới, notification chỉ cập nhật state; React quyết định lần render tiếp theo. Đừng dựa vào việc mỗi `next` sẽ tạo một lần paint riêng, vì React có thể batch các update.
+
+## Subscription gắn với useEffect
+
+Render phải thuần: đọc props/state và trả JSX. Không gọi `subscribe()` trong thân component, `useMemo` hay initializer tạo state. Một render có thể bị chạy lại hoặc bị bỏ trước khi commit; subscription tạo ở đó không có cleanup đáng tin cậy.
+
+`useEffect` là nơi nối component với nguồn bên ngoài. Mỗi lần setup tạo subscription, lần cleanup tương ứng hủy đúng subscription đó. Cleanup chạy khi unmount **và trước setup mới nếu dependencies thay đổi**, không chỉ khi component biến mất.
+
+### Ví dụ bộ đếm có cleanup
+
+```tsx title="Ticker.tsx"
+'use client';
+
+import { useEffect, useState } from 'react';
+import { interval } from 'rxjs';
+
+export function Ticker({ periodMs = 1000 }: { periodMs?: number }) {
+  const [ticks, setTicks] = useState(0);
+
+  useEffect(() => {
+    setTicks(0);
+    const subscription = interval(periodMs).subscribe(() => {
+      setTicks((current) => current + 1);
+    });
+
+    return () => subscription.unsubscribe();
+  }, [periodMs]);
+
+  return <p>Số nhịp: {ticks}</p>;
+}
+```
+
+Với `periodMs = 1000`, sau khoảng một giây số nhịp thành `1`. Khi đổi `periodMs`, React hủy timer cũ, reset bộ đếm trong setup mới và tạo timer mới. Khi unmount, subscription được hủy nên timer không tiếp tục chạy cho component này.
+
+Có hai lựa chọn có chủ ý trong ví dụ. Observable được tạo **bên trong Effect** vì nó chỉ phục vụ Effect đó. Callback dùng functional update `setTicks(current => current + 1)` vì nó cần state mới nhất, không cần đóng trên `ticks` của render lúc subscribe.
+
+<Callout type="warn" title="Cleanup là một function">
+  Viết `return () => subscription.unsubscribe()`, không viết `return subscription.unsubscribe()` — cách sau hủy ngay trong setup. Cũng không trả về chính object `Subscription`; React cần một function cleanup. Callback của `useEffect` không được là `async` vì nó sẽ trả Promise thay vì cleanup.
+</Callout>
+
+### Dependencies và stale closure
+
+Nếu callback subscriber đọc `userId`, `periodMs` hoặc một prop khác, callback giữ giá trị của render đã tạo Effect. Khi giá trị đó phải làm thay đổi hành vi nguồn, đưa nó vào dependencies để React hủy nguồn cũ và nối nguồn mới.
+
+```tsx
+useEffect(() => {
+  const subscription = messagesForUser$(userId).subscribe({
+    next: (message) => setLatestMessage(message),
+    error: (error: unknown) => setError(String(error)),
+  });
+
+  return () => subscription.unsubscribe();
+}, [userId]);
+```
+
+Đây là đoạn minh họa: `messagesForUser$` là factory ở tầng service, còn các setter là state của component. Khi `userId` đổi, subscription cũ bị hủy trước subscription mới. Nếu UI không được hiển thị message của user cũ trong lúc chờ, reset state hoặc gắn `userId` vào trạng thái kết quả để kiểm tra trước khi hiển thị.
+
+Một bẫy khác là tạo `const source$ = factory().pipe(...)` ở mỗi render rồi đưa `source$` vào dependencies. Mỗi render có reference mới, Effect subscribe lại, emission cập nhật state, và vòng lặp có thể tiếp tục. Nếu nguồn chỉ phục vụ Effect, tạo nó ngay trong Effect. Nếu nguồn phải được truyền qua nhiều component, giữ identity ở tầng sở hữu thích hợp; `useMemo` không phải nơi chạy side effect hay cơ chế bảo đảm tài nguyên chỉ được tạo một lần.
+
+Đừng bỏ dependencies chỉ để “subscribe một lần”. Nếu cần giữ subscription nhưng nhận input mới, mô hình hóa input thành stream, như ví dụ tìm kiếm bên dưới.
+
+### Strict Mode và quyền sở hữu tài nguyên
+
+Trong development, Strict Mode có thể chạy thêm một chu kỳ **setup → cleanup → setup** để kiểm tra Effect. Một Effect đúng phải chịu được chu kỳ này mà không có hai timer hay hai listener còn hoạt động. Không dùng một ref kiểu `hasSubscribed` để bỏ qua setup thứ hai: cleanup vừa hủy subscription, nên component sẽ không còn nguồn dữ liệu.
+
+Quyền sở hữu quyết định cleanup được làm gì:
+
+| Tài nguyên | Cleanup của component |
+| --- | --- |
+| Subscription mà Effect vừa tạo | Gọi `unsubscribe()` |
+| Timer/listener/request có teardown trong Observable | Unsubscribe để teardown của nguồn chạy |
+| Subject hoặc store dùng chung qua service/Context | Chỉ hủy subscription của component, không `complete()` store |
+| Subject được tạo riêng trong từng setup Effect | Có thể complete trong cleanup nếu cùng Effect sở hữu cả producer |
+| Subject có identity được giữ qua các render và qua lần setup lại | Không complete trong cleanup subscription nếu setup tiếp theo còn cần dùng nó |
+
+`subscription.unsubscribe()` hủy một người nghe. `subject.complete()` kết thúc kênh cho mọi người nghe và cả subscriber tương lai. Hai thao tác không thay thế nhau. Unsubscribe cũng **không gửi notification `complete`** cho observer, dù các teardown và `finalize` liên quan vẫn chạy.
+
+## Tìm kiếm có chờ gõ và hủy request
+
+Giả sử API `GET /api/products?q=...` trả một mảng `{ id, name }`. Ví dụ này cần bốn điều: chỉ tìm khi query có ít nhất hai ký tự, chờ 300 ms sau lần thay đổi, hủy tác vụ cũ ngay khi query mới tới, và cho phép tiếp tục tìm sau một lỗi HTTP.
+
+Bạn thường thấy `debounceTime(300)` rồi `switchMap(request)`. Cách đó phù hợp nếu chấp nhận request cũ còn chạy trong khoảng chờ debounce. Nhưng khi cần hủy ngay, query mới phải tới `switchMap` **trước** thời gian chờ. Mình đặt `timer(300)` trong inner stream: input mới hủy cả timer lẫn request thuộc input trước.
+
+### Tách pipeline khỏi component
+
+```ts title="product-search-stream.ts"
+import {
+  catchError,
+  concat,
+  defer,
+  distinctUntilChanged,
+  map,
+  type Observable,
+  of,
+  startWith,
+  switchMap,
+  timer,
+} from 'rxjs';
+
+export type Product = { id: string; name: string };
+
+export type SearchState =
+  | { status: 'idle'; query: string }
+  | { status: 'waiting'; query: string }
+  | { status: 'loading'; query: string }
+  | { status: 'success'; query: string; products: Product[] }
+  | { status: 'error'; query: string; message: string };
+
+export function createSearchState$(
+  queries$: Observable<string>,
+  request: (query: string) => Observable<Product[]>,
+  waitMs = 300,
+): Observable<SearchState> {
+  return queries$.pipe(
+    map((query) => query.trim()),
+    distinctUntilChanged(),
+    switchMap((query): Observable<SearchState> => {
+      if (query.length < 2) {
+        return of<SearchState>({ status: 'idle', query });
+      }
+
+      return concat(
+        of<SearchState>({ status: 'waiting', query }),
+        timer(waitMs).pipe(
+          switchMap(() =>
+            defer(() => request(query)).pipe(
+              map((products): SearchState => ({
+                status: 'success',
+                query,
+                products,
+              })),
+              catchError((error: unknown) =>
+                of<SearchState>({
+                  status: 'error',
+                  query,
+                  message:
+                    error instanceof Error
+                      ? error.message
+                      : 'Không tải được sản phẩm',
+                }),
+              ),
+              startWith<SearchState>({ status: 'loading', query }),
+            ),
+          ),
+        ),
+      );
+    }),
+  );
+}
+```
+
+`waiting` xuất hiện ngay khi query hợp lệ tới, nên UI có thể bỏ kết quả cũ thay vì tiếp tục hiển thị chúng dưới query mới. Hết thời gian chờ, `loading` xuất hiện trước khi request được subscribe. `defer` gọi factory request tại thời điểm đó, đồng thời đưa lỗi ném đồng bộ từ factory vào error channel để `catchError` xử lý.
+
+`catchError` nằm **trong inner request**. Một request lỗi được đổi thành state `error`, rồi inner kết thúc; stream query vẫn sống để nhận lần gõ tiếp theo. Nếu đặt `catchError` ở ngoài cùng và trả `of(errorState)`, toàn bộ pipeline có thể kết thúc sau lỗi đầu tiên.
+
+Query ngắn được xử lý bên trong `switchMap`, không bị `filter` loại bỏ trước nó. Nhờ vậy, khi bạn xóa input còn một ký tự, event ấy vẫn tới nơi hủy request cũ và đưa UI về `idle`. `distinctUntilChanged` chỉ bỏ query liên tiếp giống nhau **sau trim**; gõ thêm dấu cách cuối không khởi động lại request. Nếu cần nút retry cùng query, thêm một trigger retry riêng thay vì trông chờ phát lại query giống hệt.
+
+### Nối input và kết quả với React
+
+```tsx title="ProductSearch.tsx"
+'use client';
+
+import { useEffect, useId, useState } from 'react';
+import { BehaviorSubject } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+import {
+  createSearchState$,
+  type Product,
+  type SearchState,
+} from './product-search-stream';
+
+function requestProducts(query: string) {
+  return ajax.getJSON<Product[]>(
+    `/api/products?q=${encodeURIComponent(query)}`,
+  );
+}
+
+export function ProductSearch() {
+  const inputId = useId();
+  const [query, setQuery] = useState('');
+  const [queries$] = useState(() => new BehaviorSubject(''));
+  const [state, setState] = useState<SearchState>({
+    status: 'idle',
+    query: '',
+  });
+
+  useEffect(() => {
+    const subscription = createSearchState$(
+      queries$,
+      requestProducts,
+    ).subscribe({
+      next: (nextState) => setState(nextState),
+      error: (error: unknown) => {
+        // Lỗi ngoài request là lỗi kết thúc pipeline.
+        setState({
+          status: 'error',
+          query: queries$.getValue().trim(),
+          message: String(error),
+        });
+      },
+    });
+
+    return () => subscription.unsubscribe();
+  }, [queries$]);
+
+  const busy = state.status === 'waiting' || state.status === 'loading';
+
+  return (
+    <section aria-busy={busy}>
+      <label htmlFor={inputId}>Tìm sản phẩm</label>
+      <input
+        id={inputId}
+        value={query}
+        onChange={(event) => {
+          const nextQuery = event.currentTarget.value;
+          setQuery(nextQuery);
+          queries$.next(nextQuery);
+        }}
+      />
+
+      <div aria-live="polite">
+        {state.status === 'idle' && <p>Nhập ít nhất hai ký tự.</p>}
+        {state.status === 'waiting' && <p>Đang chờ bạn ngừng gõ…</p>}
+        {state.status === 'loading' && <p>Đang tải…</p>}
+        {state.status === 'error' && <p role="alert">{state.message}</p>}
+        {state.status === 'success' && (
+          <>
+            <p>Kết quả cho “{state.query}”</p>
+            {state.products.length === 0 ? (
+              <p>Không có sản phẩm phù hợp.</p>
+            ) : (
+              <ul>
+                {state.products.map((product) => (
+                  <li key={product.id}>{product.name}</li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
+```
+
+`query` là state cho controlled input; `queries$` là kênh nhận command tìm kiếm. Handler lấy chuỗi từ event ngay và phát chuỗi đó, không giữ object event để xử lý về sau. Hai giá trị này có vai trò khác nhau: input giữ nguyên chữ bạn gõ, còn pipeline tìm kiếm dùng query đã trim.
+
+Initializer của `useState` giữ identity `queries$` trong cùng một instance component. Nó chỉ tạo một object chưa nối I/O, không subscribe, gọi API hay tạo timer. React có thể gọi initializer thêm lần trong development để kiểm tra tính thuần; object bị bỏ không có tài nguyên bên ngoài cần hủy.
+
+Ở cleanup, chỉ subscription bị hủy. Không gọi `queries$.complete()` vì Strict Mode cần setup lại với cùng subject còn hoạt động. `BehaviorSubject` còn giữ query hiện tại nên setup mới đọc được nó; khi instance thật sự bị bỏ và không có reference bên ngoài, subject có thể được garbage collect. Pattern này dành cho kênh riêng của component, không phải một store toàn ứng dụng.
+
+<Callout type="warn" title="Hủy subscription không đồng nghĩa hủy mọi tác vụ">
+  Trong RxJS 7.8.2, `ajax` dùng XMLHttpRequest và teardown abort request chưa hoàn tất khi unsubscribe. Với `from(fetch(...))`, unsubscribe chỉ ngừng chuyển kết quả tới subscriber, không tự abort fetch; cần `AbortController` hoặc nguồn như `fromFetch` có hỗ trợ teardown phù hợp. Abort phía client cũng không bảo đảm server chưa xử lý request. Với thao tác ghi như thanh toán, đừng dùng `switchMap` như một cơ chế rollback.
+</Callout>
+
+Generic `ajax.getJSON<Product[]>` giúp TypeScript hiểu kiểu response, nhưng không kiểm chứng JSON ở runtime. Trong ứng dụng thực, validate response ở tầng request và có endpoint thật; đoạn code không kèm implementation `/api/products`.
+
+### Đọc timeline hủy request
+
+Đọc theo cột dọc: A là query `rx`, B là `rxjs`. Sơ đồ dùng thời gian chờ **hai virtual frame** để dễ nhìn, không phải 300 ms của UI. Hàng `success` chỉ vẽ các kết quả thành công; bỏ qua notification `waiting` và `loading`.
+
+<MarbleDiagram
+  title="switchMap(query => search$(query))"
+  rows={[
+    { label: 'query', marble: '-a---b-----|', kind: 'source' },
+    { label: 'HTTP A', marble: '---^-!', kind: 'inner' },
+    { label: 'HTTP B', marble: '-------^-y|', kind: 'inner' },
+    { label: 'success', marble: '---------y-|', kind: 'output' },
+  ]}
+  values={{
+    a: 'query rx',
+    b: 'query rxjs',
+    y: 'kết quả của query rxjs',
+  }}
+  caption="B tới là hủy HTTP A ngay, không đợi hết thời gian chờ của B."
+/>
+
+A tới ở frame 1, HTTP A bắt đầu ở frame 3. B tới ở frame 5 làm A unsubscribe ngay tại frame 5; B chờ đến frame 7 mới bắt đầu HTTP B. Kết quả B xuất hiện ở frame 9, HTTP B complete ở frame 10, rồi output complete ở frame 11 khi query source cũng complete.
+
+Trong component thật, subject query không tự complete khi input ngừng gõ. Khi unmount, cleanup unsubscribe pipeline; output không gửi `complete` tới component. Các mốc complete trong sơ đồ thuộc nguồn hữu hạn dùng cho test ở cuối bài.
+
+## Store dùng chung với useSyncExternalStore
+
+Nếu nhiều component đọc cùng một state RxJS, việc mỗi component tự subscribe trong `useEffect` rồi sao chép state vào `useState` không phải adapter external store mặc định mình chọn. Effect chỉ chạy sau commit; React cần cách đọc và kiểm tra snapshot trong render để tránh các consumer nhìn thấy các phiên bản state không nhất quán, thường gọi là *tearing*.
+
+`useSyncExternalStore` nhận ba function:
+
+| Function | Trách nhiệm |
+| --- | --- |
+| `subscribe(notify)` | Đăng ký notification khi store thay đổi; trả function unsubscribe |
+| `getSnapshot()` | Trả state hiện tại đồng bộ, immutable và ổn định nếu state không đổi |
+| `getServerSnapshot()` | Trả snapshot ban đầu cho server rendering và client hydration nếu có SSR |
+
+`BehaviorSubject` là nền phù hợp vì có seed và `getValue()`. Nhưng bạn vẫn cần thiết kế adapter: không phải chỉ truyền Observable vào hook.
+
+### Tạo store có snapshot ổn định
+
+```ts title="counter-store.ts"
+import { BehaviorSubject } from 'rxjs';
+
+type CounterState = Readonly<{ count: number }>;
+
+export function createCounterStore(initialCount = 0) {
+  const initialSnapshot: CounterState = { count: initialCount };
+  const state$ = new BehaviorSubject<CounterState>(initialSnapshot);
+
+  return {
+    changes$: state$.asObservable(),
+    getSnapshot: () => state$.getValue(),
+    getServerSnapshot: () => initialSnapshot,
+    subscribe: (notify: () => void) => {
+      const subscription = state$.subscribe(() => notify());
+      return () => subscription.unsubscribe();
+    },
+    increment: () => {
+      const current = state$.getValue();
+      state$.next({ count: current.count + 1 });
+    },
+  };
+}
+
+export type CounterStore = ReturnType<typeof createCounterStore>;
+```
+
+Mỗi command tạo object mới; giữa hai command, `getSnapshot()` trả đúng object đang được subject giữ. React so sánh snapshot bằng `Object.is`, nên hai quy tắc đi cùng nhau: **không mutate object hiện tại, và không tạo object mới chỉ vì React gọi getter**.
+
+```ts
+// Sai: mỗi lần đọc đều tạo một reference mới dù state không đổi.
+const getSnapshot = () => ({ ...state$.getValue() });
+
+// Sai: thay đổi dữ liệu nhưng giữ nguyên reference snapshot.
+const current = state$.getValue();
+// current.count += 1; // Readonly chặn phép gán này ở TypeScript.
+// state$.next(current);
+```
+
+`Readonly` ở đây là rào chắn TypeScript, không phải deep freeze ở runtime. Với object lồng nhau, cần giữ immutable cả những phần được snapshot tham chiếu. Không đưa quyền `next`, `error` hay `complete` cho consumer; lỗi tải dữ liệu nên là một trường trong state, không phải `state$.error(...)` khiến `getValue()` ném lỗi và store không thể cập nhật tiếp.
+
+`BehaviorSubject` phát seed đồng bộ khi adapter subscribe; callback `notify` chỉ nhắc React đọc snapshot, không lấy notification làm state riêng. Các function adapter được tạo một lần trong factory, nên identity ổn định trong suốt đời store.
+
+### Cấp store bằng Context và đọc bằng hook
+
+```tsx title="counter.tsx"
+'use client';
+
+import {
+  createContext,
+  type ReactNode,
+  useContext,
+  useState,
+  useSyncExternalStore,
+} from 'react';
+import { createCounterStore, type CounterStore } from './counter-store';
+
+const CounterContext = createContext<CounterStore | null>(null);
+
+export function CounterProvider({
+  initialCount = 0,
+  children,
+}: {
+  initialCount?: number;
+  children: ReactNode;
+}) {
+  const [store] = useState(() => createCounterStore(initialCount));
+
+  return (
+    <CounterContext.Provider value={store}>
+      {children}
+    </CounterContext.Provider>
+  );
+}
+
+function useCounter() {
+  const store = useContext(CounterContext);
+  if (!store) throw new Error('Cần bọc component bằng CounterProvider');
+
+  const snapshot = useSyncExternalStore(
+    store.subscribe,
+    store.getSnapshot,
+    store.getServerSnapshot,
+  );
+
+  return { count: snapshot.count, increment: store.increment };
+}
+
+export function Counter() {
+  const { count, increment } = useCounter();
+  return <button onClick={increment}>Số lượng: {count}</button>;
+}
+```
+
+Hai `Counter` trong cùng một provider chia sẻ state; hai provider độc lập có hai store khác nhau:
+
+```tsx
+<CounterProvider initialCount={2}>
+  <Counter />
+  <Counter />
+</CounterProvider>
+```
+
+Bấm một nút làm cả hai hiển thị `3`. Unmount một consumer chỉ hủy subscription của consumer đó, không reset count hay complete store. `initialCount` chỉ được dùng lúc tạo instance provider; thay prop sau đó không tự reset. Nếu cần reset, thêm command rõ ràng hoặc dùng `key` để chủ động tạo lại provider và cả subtree.
+
+Store này chỉ giữ dữ liệu trong RAM, không sở hữu timer hay socket nên không cần Effect để khởi động I/O. Nếu mở rộng store để có kết nối, tạo API `connect`/`disconnect` với lifecycle riêng và gọi ở tầng sở hữu, thay vì mở socket trong initializer `useState`.
+
+### Snapshot SSR và hydration
+
+Effect không chạy trên server, nhưng Client Component trong Next.js vẫn có thể được prerender thành HTML. `'use client'` không làm mọi biểu thức trong module an toàn để đọc `window`, `document` hay `localStorage` khi render.
+
+Ví dụ counter giữ `initialSnapshot` riêng cho `getServerSnapshot`. Nếu server render với `initialCount = 2`, client hydration phải nhận cùng dữ liệu ban đầu `2`; sau đó `getSnapshot` đọc state đang sống trên client. Với seed từ server, truyền dữ liệu đã serialize vào provider. “Cùng dữ liệu” không có nghĩa server và browser dùng chung object reference qua mạng, nhưng mỗi getter ở từng môi trường phải trả snapshot ổn định.
+
+<Callout type="warn" title="Không dùng singleton server cho state riêng của người dùng">
+  Đừng tạo store chứa session, giỏ hàng hay dữ liệu user ở module scope rồi dùng chung cho mọi request SSR. Một server process có thể phục vụ nhiều người dùng, khiến state bị chia sẻ ngoài ý muốn. Factory và provider cho phép cô lập theo request/subtree. Chỉ dùng singleton client khi việc chia sẻ toàn ứng dụng là chủ đích.
+</Callout>
+
+Nếu store bắt đầu từ `localStorage`, dùng seed server xác định trước, rồi đọc storage ở Effect sau hydration và cập nhật store. Đọc storage ngay trong `getServerSnapshot` không chạy được trên server và có thể làm HTML ban đầu khác nhau. Nếu không có snapshot server hợp lệ, thiết kế một nhánh chỉ render ở client phù hợp với framework; đừng đơn giản bỏ argument thứ ba trong một cây đang SSR vì React có thể ném lỗi khi render server.
+
+## Các bẫy thường gặp
+
+| Triệu chứng | Nguyên nhân thường gặp | Cách xử lý |
+| --- | --- | --- |
+| Mỗi lần gõ tạo nhiều request cho cùng query | Subscribe trong render hoặc thiếu cleanup | Subscribe trong Effect và giữ identity nguồn đúng scope |
+| UI ngừng cập nhật dưới Strict Mode | Cleanup complete subject còn được dùng ở setup tiếp theo | Chỉ hủy subscription; tách lifecycle producer khỏi consumer |
+| Callback vẫn dùng prop cũ | Stale closure hoặc thiếu dependency | Khai báo dependency, dùng functional update khi chỉ cần state trước |
+| Xóa input nhưng request trước vẫn trả kết quả | `filter` bỏ query ngắn trước `switchMap` | Cho query ngắn vào `switchMap`, trả state `idle` |
+| Sau lỗi HTTP không tìm được nữa | `catchError` ngoài cùng kết thúc stream input | Catch lỗi ở inner request, biểu diễn lỗi bằng state |
+| Hook store báo snapshot cần cache hoặc render liên tục | `getSnapshot` tạo object mới mỗi lần | Giữ snapshot; chỉ tạo object mới khi cập nhật thật |
+| Store đổi dữ liệu nhưng UI không render lại | Mutate snapshot, giữ nguyên reference | Cập nhật immutable để `Object.is` thấy thay đổi |
+| Component đã hủy nhưng socket vẫn mở | Cleanup consumer không đóng producer sống độc lập | Kiểm tra owner kết nối và chính sách chia sẻ |
+
+Có hai bẫy không chỉ là lỗi lifecycle:
+
+**Nhiều subscriber có thể tạo nhiều producer.** Hai component subscribe cùng một cold HTTP Observable vẫn có thể gọi API hai lần. `shareReplay({ bufferSize: 1, refCount: true })` hữu ích khi cần chia sẻ trong cùng scope, nhưng không phải cache server data hoàn chỉnh. Nó không tự đặt TTL, phân vùng theo user hay invalidate khi mutation. `refCount: true` cũng không có nghĩa luôn xóa mọi kết quả đã complete; hãy đọc chính sách reset của operator trước khi chọn.
+
+**Một boolean loading dùng chung dễ bị update chéo.** `finalize(() => setLoading(false))` chạy cả khi inner cũ bị hủy. Nếu đặt `setLoading(true)` cho input mới trước `switchMap`, teardown của input cũ có thể đặt lại `false` dù request mới còn đang chạy. State có `query` và `status` từ chính inner hiện tại, như ví dụ trên, dễ theo dõi hơn các side effect rải rác. Vẫn dùng `finalize` cho đo đạc và dọn tài nguyên, nhưng không coi nó là notification “thành công”.
+
+Với stream tần suất cao như vị trí chuột, đừng đẩy mọi event vào React rồi mới bỏ bớt ở render. Giảm tần suất ở pipeline bằng `auditTime`, `throttleTime` hoặc chính sách phù hợp trước notification cập nhật state. Mất bớt event có chấp nhận được hay không là quyết định domain, không phải tối ưu tự động.
+
+## Kiểm chứng pipeline và lifecycle
+
+Tách pipeline khỏi component cho phép kiểm tra phần khó bằng virtual time, không phải chờ timer thật. Tuy vậy, TestScheduler không thay test React: việc Effect được setup, cleanup và render đúng cần kiểm tra ở tầng component.
+
+### TestScheduler kiểm tra kết quả và subscription
+
+Test sau import đúng helper của ví dụ tìm kiếm. `waitMs = 2` là hai ms virtual trong `TestScheduler.run`, tương ứng hai frame minh họa ở marble. HTTP được thay bằng cold Observable, nên test không cần endpoint thật.
+
+```ts title="product-search-stream.test.ts"
+import { deepStrictEqual } from 'node:assert/strict';
+import { TestScheduler } from 'rxjs/testing';
+import {
+  createSearchState$,
+  type Product,
+  type SearchState,
+} from './product-search-stream';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const queries$ = cold('-a---b-----|', { a: 'rx', b: 'rxjs' });
+  const oldProducts: Product[] = [{ id: 'old', name: 'Kết quả cũ' }];
+  const newProducts: Product[] = [{ id: 'new', name: 'Kết quả mới' }];
+  const requestA$ = cold<Product[]>('----x|', { x: oldProducts });
+  const requestB$ = cold<Product[]>('--y|', { y: newProducts });
+
+  const result$ = createSearchState$(
+    queries$,
+    (query) => (query === 'rx' ? requestA$ : requestB$),
+    2,
+  );
+
+  const states: Record<string, SearchState> = {
+    w: { status: 'waiting', query: 'rx' },
+    l: { status: 'loading', query: 'rx' },
+    v: { status: 'waiting', query: 'rxjs' },
+    m: { status: 'loading', query: 'rxjs' },
+    s: { status: 'success', query: 'rxjs', products: newProducts },
+  };
+
+  expectObservable(result$).toBe('-w-l-v-m-s-|', states);
+  expectSubscriptions(requestA$.subscriptions).toBe('---^-!');
+  expectSubscriptions(requestB$.subscriptions).toBe('-------^--!');
+});
+```
+
+Request A được subscribe ở frame 3 và hủy ở frame 5; kết quả dự định tới frame 7 không xuất hiện trong output. Request B subscribe ở frame 7, phát kết quả ở frame 9 và kết thúc ở frame 10. Test kiểm tra cả notification lẫn thời gian sống subscription, nên không chỉ chứng minh “UI cuối cùng đúng” mà còn chứng minh tác vụ cũ đã bị hủy.
+
+Marble notification của `cold()` là thời gian **tương đối so với lần subscribe**. Subscription marble là vị trí tuyệt đối trên timeline test. Hàng HTTP B trong hình có cả `^` và `y` để người đọc nhìn được lifecycle; đừng truyền nguyên hàng hình đó vào `cold()`.
+
+### Checklist kiểm tra component
+
+Chạy các tình huống này bằng test runner React hiện có của ứng dụng hoặc kiểm tra thủ công trong development:
+
+- Mount `Ticker`, đổi `periodMs`, rồi unmount: chỉ timer hiện tại được phép cập nhật state; sau unmount không còn tài nguyên do subscription đó sở hữu.
+- Render dưới Strict Mode: sau chu kỳ setup lại vẫn nhận dữ liệu và không có hai subscription còn hoạt động cùng lúc.
+- Gõ nhanh `rx` rồi `rxjs`: kết quả cũ không xuất hiện; request mới chỉ bắt đầu sau khoảng chờ. Trong Network panel, request cũ có thể hiện là canceled, tùy thời điểm hoàn tất.
+- Xóa input xuống dưới hai ký tự trong lúc request đang chạy: UI về `idle` và request cũ bị hủy.
+- Giả lập HTTP lỗi, sau đó gõ query khác: thấy lỗi ở query đầu nhưng query tiếp theo vẫn tải được.
+- Mount hai `Counter` chung provider: cả hai đọc cùng count; unmount một cái không làm cái còn lại mất state.
+- Với SSR, dùng seed xác định từ server: HTML và hydration khớp, không cảnh báo mismatch và không chia sẻ state giữa các request user khác nhau.
+
+Trong test component, bọc tương tác và thay đổi timer bằng `act` hoặc helper tương ứng của test runner. React có thể batch update, nên assert UI sau khi flush đúng công việc; đừng assert số lần render bằng số lần stream phát giá trị. TestScheduler ở trên dùng nguồn RxJS có scheduler, không điều khiển timing của Promise hoặc fetch thật.
+
+## Bài tập thực hành
+
+1. Thêm test cho query dưới hai ký tự xuất hiện trong lúc HTTP A đang chạy. Kiểm tra output chuyển `idle` và subscription A kết thúc ngay tại frame query ngắn tới.
+2. Thay request A bằng `cold('--#')`, rồi phát query B. Output phải chứa `error` của A và `success` của B, không complete ngay sau A.
+3. Thêm command `reset()` vào counter store. Hai consumer trong một provider phải cùng về seed, nhưng provider khác không đổi.
+4. Thêm nút retry vào tìm kiếm. Thiết kế trigger riêng để retry cùng query vượt được `distinctUntilChanged`, nhưng vẫn giữ chính sách hủy tác vụ trước.
+
+Bắt đầu bằng test subscription cho bài tập đầu tiên. Nó buộc bạn xác định rõ thời điểm hủy trước khi chỉnh UI, và thường tìm được lỗi mà test “kết quả cuối đúng” bỏ qua.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Hiểu phần tài nguyên thực sự được dọn khi unsubscribe." />
+  <Card title="switchMap" href="/docs/higher-order-observables/switch-map" description="Theo dõi inner hiện tại và tác vụ bị thay thế." />
+  <Card title="BehaviorSubject" href="/docs/subjects-multicasting/behavior-subject" description="Seed, snapshot và trạng thái kết thúc của state subject." />
+  <Card title="HTTP và Ajax" href="/docs/tich-hop/http-ajax" description="Chọn nguồn request và kiểm tra khả năng abort." />
+  <Card title="shareReplay" href="/docs/subjects-multicasting/share-replay" description="Chia sẻ kết quả mà không nhầm với cache hoàn chỉnh." />
+  <Card title="Integration tests" href="/docs/testing/integration-tests" description="Kiểm tra kết nối stream với lifecycle thực của ứng dụng." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [React: useEffect](https://react.dev/reference/react/useEffect) — dependencies, cleanup, Strict Mode và Effect không chạy trên server.
+- [React: useSyncExternalStore](https://react.dev/reference/react/useSyncExternalStore) — hợp đồng snapshot immutable, `Object.is` và server snapshot.
+- [React: Synchronizing with Effects](https://react.dev/learn/synchronizing-with-effects) — vì sao setup phải chịu được cleanup và setup lại.
+- [RxJS 7.8.2: ajax implementation](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/ajax/ajax.ts) — teardown abort XMLHttpRequest chưa hoàn tất.
+- [RxJS 7.8.2: switchMap implementation](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/switchMap.ts) — hủy inner trước và điều kiện complete output.
+- [RxJS: Marble testing](https://rxjs.dev/guide/testing/marble-testing) — virtual time và kiểm tra subscription bằng TestScheduler.

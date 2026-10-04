@@ -8,7 +8,7 @@ Bạn cần refresh dashboard mỗi 30 giây, trì hoãn một notification, ho�
 RxJS đưa những quy tắc đó vào pipeline. `timer` và `interval` tạo nhịp thời gian; `delay` và `delayWhen` dời emission; `timeout` đặt deadline; `timestamp` và `timeInterval` giúp quan sát thời điểm. Bài này tập trung vào cách chọn và ghép các API đó, còn nhóm operator giảm tần suất event được tách sang bài riêng.
 
 <Callout type="info" title="Phạm vi phiên bản">
-  Ví dụ trong bài nhắm tới **RxJS 7.8.x** và import public API từ `rxjs`. Các mốc thời gian dùng milliseconds trừ khi đoạn code ghi rõ khác.
+  Ví dụ trong bài nhắm tới **RxJS 7.8.2** và import public API từ `rxjs`. Mỗi block TypeScript là một ví dụ độc lập, có imports và source riêng; không cần ghép các block lại. Các ví dụ dùng URL tương đối với `fetch` hoặc `window` chạy trong browser. Các mốc thời gian dùng milliseconds trừ khi đoạn code ghi rõ khác.
 </Callout>
 
 ## Mục lục
@@ -165,7 +165,7 @@ done
 `of()` phát đồng bộ, nên hai dòng `source` xuất hiện ngay trong call stack của `subscribe`. `delay` không trì hoãn side effect phía trước nó; nó chỉ dời các value khi chúng đi qua vị trí của operator trong pipeline. Completion đợi những value đang được giữ phát xong, nhưng error từ source đi qua ngay và các value đang chờ có thể bị hủy.
 
 <Callout type="warn" title="Muốn trì hoãn lúc bắt đầu công việc">
-  Đừng đặt `delay` sau một Observable có side effect rồi kỳ vọng side effect bắt đầu muộn. Hãy dùng `timer(due).pipe(switchMap(() => source$))`, hoặc bọc việc tạo source bằng `defer` nếu nó phải được khởi tạo tại thời điểm đó.
+  Đừng đặt `delay` sau một Observable có side effect rồi kỳ vọng side effect bắt đầu muộn. Hãy dùng `timer(due).pipe(switchMap(() => source$))`, trong đó `source$` là Observable chứa công việc bạn muốn bắt đầu muộn. Nếu việc tạo source đã gây side effect, dùng `defer` như ví dụ dưới để chỉ tạo nó khi được subscribe.
 </Callout>
 
 ```ts
@@ -174,6 +174,11 @@ import { defer, switchMap, timer } from 'rxjs';
 const delayedRequest$ = timer(1_000).pipe(
   switchMap(() => defer(() => fetch('/api/report'))),
 );
+
+delayedRequest$.subscribe({
+  next: (response) => console.log('HTTP status:', response.status),
+  error: (error: unknown) => console.error('Request failed', error),
+});
 ```
 
 Ở đây `fetch` chỉ được gọi sau khi `timer` phát. Nếu consumer unsubscribe trong một giây đầu, `switchMap` chưa tạo request.
@@ -196,13 +201,17 @@ type Notice = {
   waitMs: number;
 };
 
-of<Notice>(
+const notices: Notice[] = [
   { id: 'slow', waitMs: 600 },
   { id: 'fast', waitMs: 100 },
-)
+];
+
+of(...notices)
   .pipe(delayWhen((notice) => timer(notice.waitMs)))
   .subscribe((notice) => console.log(notice.id));
 ```
+
+Mảng `notices` được khai báo là `Notice[]`, nên `of(...notices)` suy luận source là `Observable<Notice>`. Với overload nhận nhiều argument trong RxJS 7.8.2, generic của `of` biểu diễn tuple các argument, không phải kiểu của từng value. Vì vậy `of<Notice>(noticeA, noticeB)` gây TS2344; để TypeScript suy luận từ mảng đã định kiểu sẽ tránh lỗi mà không cần ép kiểu.
 
 Kết quả theo thời gian:
 
@@ -221,6 +230,8 @@ import { delayWhen, of, timer } from 'rxjs';
 const output$ = of(0, 250, 500).pipe(
   delayWhen((waitMs) => (waitMs === 0 ? of(null) : timer(waitMs))),
 );
+
+output$.subscribe(console.log);
 ```
 
 ## Đặt deadline với timeout
@@ -236,15 +247,26 @@ Cấu hình object giúp ý định rõ hơn overload nhận một con số:
 - Khi có cả hai, `first` chỉ quản lý value đầu; `each` quản lý những value sau.
 
 ```ts
-source$.pipe(
-  timeout({
-    first: 5_000,
-    each: 2_000,
-  }),
-);
+import { take, timeout, timer } from 'rxjs';
+
+// Source minh họa: value đầu sau 1 giây, các value sau cách nhau 1,5 giây.
+const source$ = timer(1_000, 1_500).pipe(take(3));
+
+source$
+  .pipe(
+    timeout({
+      first: 5_000,
+      each: 2_000,
+    }),
+  )
+  .subscribe({
+    next: (value) => console.log(value),
+    error: (error: unknown) => console.error(error),
+    complete: () => console.log('complete'),
+  });
 ```
 
-Pipeline trên cho source tối đa 5 giây để khởi động, rồi không cho phép khoảng im lặng giữa hai value vượt 2 giây. Source complete trước deadline thì timer nội bộ được dọn và output complete bình thường.
+Pipeline trên cho source tối đa 5 giây để khởi động, rồi không cho phép khoảng im lặng giữa hai value vượt 2 giây. Source minh họa phát `0`, `1`, `2` trong các giới hạn đó rồi complete nhờ `take(3)`. Source complete trước deadline thì timer nội bộ được dọn và output complete bình thường.
 
 ### Chuyển sang fallback
 
@@ -288,10 +310,17 @@ Nếu không có `with`, operator phát `TimeoutError`. Khi bắt lỗi bằng `
 import {
   TimeoutError,
   catchError,
+  map,
   of,
   throwError,
   timeout,
+  timer,
 } from 'rxjs';
+
+// Source minh họa phản hồi sau 3,5 giây, vượt deadline 3 giây bên dưới.
+const source$ = timer(3_500).pipe(
+  map(() => ({ state: 'ready' as const })),
+);
 
 const guarded$ = source$.pipe(
   timeout({ first: 3_000 }),
@@ -303,7 +332,14 @@ const guarded$ = source$.pipe(
     return throwError(() => error);
   }),
 );
+
+guarded$.subscribe({
+  next: (value) => console.log(value),
+  error: (error: unknown) => console.error('Non-timeout error', error),
+});
 ```
+
+Sau khoảng 3 giây, ví dụ phát `{ state: 'unavailable' }` rồi complete; value `ready` không đến vì timer nguồn đã bị unsubscribe. Trong ứng dụng, thay `source$` minh họa bằng Observable của request hoặc stream cần giám sát.
 
 Đặt `catchError` ở đâu quyết định phần nào của hệ thống sống tiếp. Trong polling, mình thường bắt lỗi **bên trong** operator xử lý từng tick để một lần timeout không giết cả clock. Nếu timeout phải dừng toàn bộ feature, bắt ở boundary ngoài hoặc để error đi thẳng tới subscriber.
 

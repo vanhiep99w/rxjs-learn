@@ -3,21 +3,263 @@ title: Thời gian & Schedulers
 description: Hiểu cách RxJS điều phối thời gian và thứ tự thực thi.
 ---
 
-Đây là trang khung cho nhóm **Thời gian & Schedulers** trong lộ trình học RxJS.
+Bạn muốn ô tìm kiếm đợi người dùng ngừng gõ, dashboard refresh theo chu kỳ, hoặc callback chạy sau khi state hiện tại cập nhật xong. Cả ba đều liên quan đến thời gian, nhưng không cùng một bài toán: có lúc bạn cần **quy tắc chọn emission**, có lúc bạn cần **đổi thời điểm thực thi**. Trộn hai việc này dễ dẫn đến pipeline có nhiều timer mà vẫn sai thứ tự.
+
+Trang này là bản đồ cho nhóm **Thời gian & Schedulers**. Mình sẽ tách thời gian nghiệp vụ khỏi scheduling, minh họa cách đọc timeline và chỉ ra bài nên đọc tiếp theo nhu cầu của bạn.
+
+<Callout type="info" title="Trước khi bắt đầu">
+  Bạn nên nắm [Vòng đời stream](/docs/nen-tang/vong-doi-stream) và cách ghép operator bằng `pipe()`. Ví dụ dùng public API của **RxJS 7.8.2**; mỗi block TypeScript là một ví dụ độc lập. Các duration trong code tính bằng milliseconds, trừ khi đang nói về virtual frame.
+</Callout>
 
 ## Mục lục
 
-- [Phạm vi dự kiến](#phạm-vi-dự-kiến)
-- [Các bài trong nhóm](#các-bài-trong-nhóm)
+- [Tách thời gian nghiệp vụ khỏi scheduling](#tách-thời-gian-nghiệp-vụ-khỏi-scheduling)
+- [Observable có thể phát ngay khi subscribe](#observable-có-thể-phát-ngay-khi-subscribe)
+- [Scheduler điều khiển phần nào của pipeline](#scheduler-điều-khiển-phần-nào-của-pipeline)
+  - [Ba điểm đặt scheduling](#ba-điểm-đặt-scheduling)
+  - [Bốn scheduler thường gặp](#bốn-scheduler-thường-gặp)
+- [Chọn operator theo ý định](#chọn-operator-theo-ý-định)
+- [Đọc một timeline debounce](#đọc-một-timeline-debounce)
+- [Thời gian luôn đi cùng lifecycle](#thời-gian-luôn-đi-cùng-lifecycle)
+- [Kiểm thử bằng virtual time](#kiểm-thử-bằng-virtual-time)
+- [Những bẫy cần tránh](#những-bẫy-cần-tránh)
+- [Lộ trình trong nhóm](#lộ-trình-trong-nhóm)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
 
-## Phạm vi dự kiến
+## Tách thời gian nghiệp vụ khỏi scheduling
 
-Nhóm này kết nối event loop, scheduler và các operator thời gian để kiểm soát execution.
+“Chỉ tìm kiếm sau 300 ms không có input mới” là một quy tắc nghiệp vụ. `debounceTime(300)` giữ giá trị mới nhất và chỉ giao nó khi có khoảng lặng đủ dài. Ngược lại, “giao notification sau call stack hiện tại” là một quyết định scheduling: bạn vẫn giữ các notification, nhưng đổi thời điểm downstream nhận chúng.
 
-## Các bài trong nhóm
+| Câu hỏi cần trả lời | Công cụ phù hợp | Điều bạn đang quyết định |
+| --- | --- | --- |
+| Khi nào tạo một tick? | `timer`, `interval` | Thời điểm source phát |
+| Giá trị nào được giữ khi event đến dồn dập? | `debounceTime`, `throttleTime`, `auditTime` | Chính sách chọn và giao giá trị |
+| Bao lâu không có dữ liệu thì coi là lỗi? | `timeout` | Deadline chờ notification |
+| Notification chạy ngay hay ở lượt sau? | `observeOn` cùng scheduler | Ranh giới thực thi downstream |
+| Kiểm thử các mốc ấy mà không chờ thật thế nào? | `TestScheduler` | Clock và hàng đợi virtual time |
 
-- **[Mô hình Scheduler](/docs/thoi-gian-schedulers/scheduler-model)** — Vai trò của Scheduler trong việc lập lịch công việc.
-- **[Sync và async scheduling](/docs/thoi-gian-schedulers/sync-async-scheduling)** — So sánh thực thi đồng bộ, microtask và macrotask.
-- **[Time-based operators](/docs/thoi-gian-schedulers/time-based-operators)** — Tạo và điều khiển stream phụ thuộc thời gian.
-- **[Debounce, throttle và audit](/docs/thoi-gian-schedulers/debounce-throttle-audit)** — Chọn chiến lược giới hạn tần suất emission.
-- **[Virtual time](/docs/thoi-gian-schedulers/virtual-time)** — Mô phỏng thời gian để kiểm thử nhanh và xác định.
+Hai lớp này phối hợp với nhau: operator thời gian dùng scheduler để đo thời gian và lập lịch công việc. Ví dụ, `debounceTime(300)` mặc định dùng `asyncScheduler`; truyền scheduler khác vào không biến debounce thành throttle. Quy tắc “giữ giá trị mới nhất sau khoảng lặng” vẫn do operator quyết định.
+
+Mặc định, mình sẽ chọn **operator diễn đạt đúng ý định trước**, rồi giữ scheduler mặc định. Chỉ đổi scheduler khi bạn chỉ rõ được ranh giới thực thi cần thay đổi hoặc đang viết test.
+
+## Observable có thể phát ngay khi subscribe
+
+Đừng bắt đầu từ giả định “RxJS là async”. `of()` phát đồng bộ theo mặc định, nên callback có thể chạy trước dòng ngay sau `subscribe()`:
+
+```ts
+import { of } from 'rxjs';
+
+console.log('trước');
+
+of('A').subscribe({
+  next: (value) => console.log('next:', value),
+  complete: () => console.log('complete'),
+});
+
+console.log('sau');
+```
+
+Kết quả:
+
+```text
+trước
+next: A
+complete
+sau
+```
+
+Giờ đặt một ranh giới scheduling trước Observer:
+
+```ts
+import { asyncScheduler, observeOn, of, tap } from 'rxjs';
+
+console.log('trước');
+
+of('A').pipe(
+  tap((value) => console.log('upstream:', value)),
+  observeOn(asyncScheduler),
+).subscribe({
+  next: (value) => console.log('next:', value),
+  complete: () => console.log('complete'),
+});
+
+console.log('sau');
+```
+
+Kết quả:
+
+```text
+trước
+upstream: A
+sau
+next: A
+complete
+```
+
+`of()` và `tap()` vẫn chạy ngay trong call stack gọi `subscribe()`. `observeOn(asyncScheduler)` chỉ lập lịch lại việc giao notification cho phần phía sau nó; cả `next` lẫn `complete` đều tới sau dòng `sau`. Đây là khác biệt cần nhìn ra trước khi chọn scheduler: **source làm việc khi nào** không nhất thiết trùng với **Observer nhận kết quả khi nào**.
+
+## Scheduler điều khiển phần nào của pipeline
+
+Bạn có thể hình dung scheduler như một bộ điều phối có đồng hồ: nó giữ công việc đang chờ, biết khi nào công việc đến hạn và dùng một cơ chế để chạy công việc đó. Đồng hồ có thể là thời gian thật hoặc virtual time. Nhưng bộ điều phối này không tự tạo một thread mới cho JavaScript.
+
+### Ba điểm đặt scheduling
+
+| API | Phần được điều phối | Dùng khi |
+| --- | --- | --- |
+| `scheduled(input, scheduler)` | Subscription và emission của input được chuyển thành Observable | Muốn scheduler tham gia ngay từ việc tiêu thụ array, iterable hoặc input khác |
+| `subscribeOn(scheduler)` | Hành động subscribe vào source | Muốn dời thời điểm source setup bắt đầu |
+| `observeOn(scheduler)` | Notification đi xuống downstream | Muốn đặt một ranh giới thực thi giữa hai đoạn pipeline |
+
+Nếu công việc nặng nằm trước `observeOn()`, nó vẫn chạy trước ranh giới ấy. Dời kết quả sang timer không làm phần tính toán trước đó nhẹ đi. Tương tự, `subscribeOn()` không dời một Promise hoặc request đã được khởi tạo ngoài Observable; side effect muốn lazy phải được tạo lúc source thực sự được subscribe.
+
+Với code mới, dùng `scheduled(input, scheduler)` thay cho scheduler argument deprecated của các overload như `of(...values, scheduler)` hoặc `from(input, scheduler)`. Không phải mọi scheduler argument đều deprecated: tham số scheduler của `debounceTime` hay `timer` vẫn là API hợp lệ trong RxJS 7.8.2.
+
+### Bốn scheduler thường gặp
+
+Bảng này mô tả trường hợp delay bằng `0`. Khi delay dương, `queueScheduler`, `asapScheduler` và `animationFrameScheduler` dùng cơ chế timer thay vì hành vi không delay bên dưới.
+
+| Scheduler | Ranh giới thực thi khi không delay | Khi nên cân nhắc |
+| --- | --- | --- |
+| `queueScheduler` | Đồng bộ; action lồng nhau xếp vào hàng đợi FIFO | Tránh đệ quy lồng stack mà vẫn giữ execution đồng bộ |
+| `asapScheduler` | Sau code đồng bộ hiện tại; implementation mặc định 7.8.2 dùng microtask | Defer sớm ra khỏi call stack hiện tại |
+| `asyncScheduler` | Bất đồng bộ qua cơ chế timer của event loop | Delay và công việc theo thời gian |
+| `animationFrameScheduler` | Trước repaint kế tiếp trong browser | Cập nhật hình ảnh theo nhịp render |
+
+`queueScheduler` có chữ “queue” nhưng không có nghĩa là async. `animationFrameScheduler` cũng không tự gộp nhiều event thành một: nhiều notification có thể cùng chờ một frame. Nếu cần chỉ giữ một giá trị đại diện, bạn vẫn cần chính sách chọn emission phù hợp.
+
+<Callout type="warn" title="Scheduling không phải parallelism">
+  Một vòng lặp CPU nặng được schedule bằng `asyncScheduler` chỉ bắt đầu muộn hơn; khi chạy, nó vẫn chặn thread đó. Muốn chạy song song, hãy cân nhắc Web Worker hoặc worker thread. Muốn nhường event loop giữa các phần việc, phải thiết kế việc chia nhỏ, không chỉ thêm `observeOn()` ở cuối.
+</Callout>
+
+## Chọn operator theo ý định
+
+Câu hỏi hữu ích hơn “operator nào nhanh hơn?” là “mình chấp nhận bỏ giá trị nào, và khi nào người dùng cần thấy kết quả?”. Các operator dưới đây trả lời những câu hỏi khác nhau.
+
+| Nhu cầu | Chọn trước | Điều cần nhớ |
+| --- | --- | --- |
+| Phát một lần sau khoảng chờ | `timer(dueTime)` | Hoàn tất sau tick nếu không cấu hình chu kỳ |
+| Tạo tick lặp lại | `interval(period)` | Tick đầu tới sau một period; cần quản lý subscription |
+| Dời các giá trị mà không cố ý bỏ bớt | `delay(duration)` | Không dùng để giảm tần suất; error không chờ như giá trị |
+| Chờ người dùng ngừng gõ | `debounceTime(duration)` | Event mới dời thời điểm giao giá trị đang chờ |
+| Phản hồi ngay rồi hạn chế event tiếp theo | `throttleTime(duration)` | Mặc định `leading: true`, `trailing: false` |
+| Lấy giá trị mới nhất cuối cửa sổ đang hoạt động | `auditTime(duration)` | Cửa sổ mở bởi một emission, không phải nhịp tick cố định |
+| Lấy mẫu theo nhịp định kỳ | `sampleTime(period)` | Khác với cửa sổ mở theo event của `auditTime` |
+| Báo lỗi hoặc chuyển fallback khi chờ quá lâu | `timeout(config)` | Phân biệt deadline giá trị đầu với khoảng cách giữa các giá trị |
+
+Với tìm kiếm, `debounceTime` thường đi cùng `distinctUntilChanged` và `switchMap`: một operator giảm input, một operator bỏ truy vấn trùng và một operator thay inner subscription cũ. Debounce **không tự hủy request đang chạy** chỉ vì nó bỏ input mới trong khoảng chờ. Muốn thiết kế cancellation đúng, bạn phải xem cả flattening operator lẫn teardown của request source.
+
+Ngược lại, nếu cần phản hồi ngay khi click nút, chờ khoảng lặng có thể làm UI có cảm giác chậm. Chọn throttle khi bạn thực sự muốn bỏ bớt click; nếu yêu cầu là không nhận thao tác mới trong lúc request chưa xong, hãy xem `exhaustMap` thay vì dùng một duration cố định để đoán thời gian request.
+
+## Đọc một timeline debounce
+
+Đọc theo cột dọc để thấy một input mới có làm deadline đang chờ thay đổi hay không. Sơ đồ sau dùng duration **3 frame**, không phải khoảng chờ được đo từ lúc subscribe cho mọi giá trị.
+
+<MarbleDiagram
+  title="debounceTime(3)"
+  rows={[
+    { label: 'source', marble: '-a-b----c------|', kind: 'source' },
+    { label: 'output', marble: '------b----c---|', kind: 'output' },
+  ]}
+  values={{
+    a: 'Truy vấn đầu',
+    b: 'Truy vấn mới thay a',
+    c: 'Truy vấn ở đợt tiếp theo',
+  }}
+  caption="b đến trước khi a có đủ 3 frame yên lặng, nên chỉ b được giao ở frame 6. c được giao ở frame 11."
+/>
+
+`a` tới ở frame 1, nên thời điểm dự kiến giao là frame 4. Nhưng `b` tới ở frame 3, thay `a` và dời deadline sang frame 6. Không có giá trị mới trước deadline ấy, nên output phát `b`. `c` tới ở frame 8 và được giao ở frame 11; source và output đều complete ở frame 15.
+
+Các ký hiệu `a`, `b`, `c` là giá trị; `-` tiến một frame; `|` là complete. Đây là trục virtual time để suy luận chính sách của operator, không phải lời hứa timer ngoài browser luôn chạy đúng từng millisecond.
+
+## Thời gian luôn đi cùng lifecycle
+
+Thêm timer vào pipeline cũng thêm công việc có thể đang chờ lúc component bị unmount hoặc người dùng rời trang. Bạn cần biết subscription nào sở hữu công việc ấy và teardown có hủy nó hay không.
+
+```ts
+import { timer } from 'rxjs';
+
+const subscription = timer(1000).subscribe({
+  next: () => console.log('đến hạn'),
+  complete: () => console.log('complete'),
+});
+
+subscription.unsubscribe();
+
+// Không log: timer bị hủy trước khi tới hạn.
+// Unsubscribe không gọi callback complete.
+```
+
+Với `debounceTime`, complete và unsubscribe cũng không giống nhau. Nếu source complete trong khi có giá trị đang chờ, operator phát giá trị đó ngay rồi complete. Nếu bạn unsubscribe, giá trị đang chờ bị bỏ và timer được dọn; nếu source error, operator chuyển error mà không flush giá trị đang chờ.
+
+Vì vậy, khi đổi vị trí operator kết thúc stream, hãy kiểm tra liệu nó đang làm source của debounce **complete** hay đang **unsubscribe** khỏi debounce. Hai pipeline nhìn gần giống nhau có thể cho kết quả cuối khác nhau.
+
+<Callout type="warn" title="Hủy notification không đồng nghĩa hủy side effect">
+  Teardown hủy được công việc mà source hoặc operator đã nối vào subscription. Nó không hoàn tác một side effect đã chạy, và không tự dừng một Promise hay request bên ngoài. Với network request, cần source có teardown thực sự, chẳng hạn nối tới `AbortController`.
+</Callout>
+
+## Kiểm thử bằng virtual time
+
+Nếu test phải ngủ 300 ms mỗi lần để kiểm tra debounce, suite vừa chậm vừa dễ bị ảnh hưởng bởi tải máy. Virtual time thay clock thật bằng clock có thể tiến thẳng tới mốc công việc tiếp theo. Bạn kiểm tra **giá trị và frame**, không đo độ chính xác của timer hệ điều hành.
+
+Đoạn dưới là ví dụ cho môi trường Node.js với RxJS và cấu hình chạy TypeScript có sẵn. Nó kiểm tra đúng hai dòng marble ở trên:
+
+```ts
+import { deepStrictEqual } from 'node:assert';
+import { debounceTime } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable }) => {
+  const source$ = cold('-a-b----c------|');
+  const output$ = source$.pipe(debounceTime(3));
+
+  expectObservable(output$).toBe('------b----c---|');
+});
+```
+
+Trong `run()`, mỗi frame tương ứng 1 ms virtual; `debounceTime` dùng scheduler mặc định được điều phối bởi `TestScheduler` trong phạm vi callback. Assertion được thực thi khi `run()` flush công việc. Test không phải chờ thật tới frame 15.
+
+Ví dụ này chỉ dùng các ký hiệu mà cả renderer và `TestScheduler` hiểu cùng cách. Với cú pháp nâng cao như nhóm `(ab)` hoặc token `10ms`, đừng sao chép máy móc giữa sơ đồ và test: cách parser tiến frame có thể khác nhau. Promise native, network thật và công việc không đi qua scheduler được điều phối cũng không tự trở thành virtual chỉ vì bạn đặt code trong `run()`.
+
+## Những bẫy cần tránh
+
+- **Thêm scheduler cho mọi pipeline.** Nếu thứ tự tự nhiên đã đúng, ranh giới mới chỉ làm lifecycle và debugging khó hơn.
+- **Xem `delay(0)` hay timer bằng `0` là chạy ngay.** Callback vẫn phải chờ cơ chế scheduling và tải event loop; “đến hạn” không đồng nghĩa “được chạy chính xác lúc đó”.
+- **Dùng `observeOn()` như rate limiter.** Nó lập lịch lại notification, không tự bỏ bớt chúng để chống quá tải.
+- **Cho rằng debounce sẽ phát đều khi source liên tục bận.** Nếu không có khoảng lặng đủ dài, nó có thể chưa phát giá trị nào; complete là một trường hợp flush riêng.
+- **Đồng nhất `auditTime` với `sampleTime`.** Một bên mở cửa sổ theo emission, bên kia lấy mẫu theo nhịp định kỳ.
+- **Dùng timer thay cho điều kiện hoàn thành request.** Duration cố định không đảm bảo request trước đã xong; hãy biểu diễn concurrency bằng flattening operator.
+- **Test bằng thời gian thật cho mọi thứ.** Dùng virtual time cho chính sách operator; giữ integration test riêng để kiểm tra tương tác với runtime hoặc tài nguyên bên ngoài.
+
+## Lộ trình trong nhóm
+
+Nếu mới học, đọc theo thứ tự các thẻ bên dưới: hiểu bộ điều phối trước, rồi thứ tự thực thi, operator thời gian, chính sách giảm tần suất và cuối cùng virtual time. Nếu đang sửa live search, bạn có thể vào thẳng bài debounce; nếu đang debug thứ tự log, bắt đầu từ sync và async scheduling.
+
+<Cards>
+  <Card title="1. Mô hình Scheduler" href="/docs/thoi-gian-schedulers/scheduler-model" description="Nắm clock, action, hàng đợi và ranh giới giữa scheduled, subscribeOn, observeOn." />
+  <Card title="2. Sync và async scheduling" href="/docs/thoi-gian-schedulers/sync-async-scheduling" description="Đọc thứ tự call stack, microtask, timer và notification downstream." />
+  <Card title="3. Time-based operators" href="/docs/thoi-gian-schedulers/time-based-operators" description="Tạo nhịp, trì hoãn giá trị, đặt deadline và đo thời gian trong stream." />
+  <Card title="4. Debounce, throttle và audit" href="/docs/thoi-gian-schedulers/debounce-throttle-audit" description="Chọn giá trị cần giữ và hiểu cửa sổ thời gian của từng chiến lược." />
+  <Card title="5. Virtual time" href="/docs/thoi-gian-schedulers/virtual-time" description="Tìm hiểu clock mô phỏng để suy luận và kiểm thử mà không chờ timer thật." />
+</Cards>
+
+## Bài tập tự kiểm tra
+
+1. Đổi `asyncScheduler` trong ví dụ log thành `queueScheduler`. Dự đoán vị trí dòng `sau` trước khi chạy, rồi giải thích vì sao queue không tạo ranh giới async khi delay bằng `0`.
+2. Trong test debounce, đổi source thành `-a-b-|`. Viết expectation có `b` và complete cùng frame, rồi giải thích vì sao `b` không phải đợi tới frame 6. Cú pháp nhóm trong test là `(b|)`.
+3. Với một pipeline thật, ghi rõ ba yêu cầu: giá trị nào được giữ, thời điểm nào được giao và ai hủy công việc đang chờ khi người dùng rời trang.
+
+Khi đã giải thích được các mốc của ví dụ trên, chuyển sang [TestScheduler](/docs/testing/test-scheduler) để viết thêm assertion cho error và unsubscribe. Đó là bước giúp quy tắc thời gian của pipeline trở thành thứ có thể kiểm chứng, thay vì chỉ quan sát qua log.
+
+## Nguồn tham khảo
+
+- [RxJS — Scheduler guide](https://rxjs.dev/guide/scheduler): mental model về clock, hàng đợi và execution context; một số ví dụ dùng overload cũ, nên đối chiếu phiên bản khi áp dụng.
+- [RxJS 7.8.2 — `observeOn`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/observeOn.ts): lập lịch lại notification, không thay scheduler nội bộ của source.
+- [RxJS 7.8.2 — `debounceTime`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/debounceTime.ts): khoảng lặng, flush khi complete và cleanup.
+- [RxJS — deprecation của scheduler argument](https://rxjs.dev/deprecations/scheduler-argument): dùng `scheduled` thay các creation overload deprecated.
+- [RxJS — Testing bằng marble](https://rxjs.dev/guide/testing/marble-testing): `TestScheduler.run`, virtual frame và giới hạn với Promise.

@@ -3,8 +3,544 @@ title: RxJS với Node.js
 description: Bọc event, stream và tác vụ bất đồng bộ phía server.
 ---
 
-Trang này sẽ trình bày **RxJS với Node.js** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Một service Node.js có thể vừa nghe event, vừa đọc file, vừa gọi API và xử lý nhiều job cùng lúc. Phần khó không nằm ở từng thao tác, mà ở việc nối chúng lại: lỗi của một job có làm dừng cả worker không, ai đóng file, và khi nhận `SIGTERM` thì tác vụ nào còn được chạy? RxJS giúp bạn mô tả các quy tắc đó trong một pipeline, nhưng không thay thế cơ chế backpressure hay quản lý tài nguyên của Node.js.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi và điều kiện">
+  Ví dụ dùng JavaScript ESM, Node.js 20 trở lên và RxJS 7.8.x. Bạn cần biết `Observable`, `subscribe`, `pipe` và `mergeMap`. Mỗi code block là một ví dụ độc lập, trừ nơi ghi rõ dùng lại hàm ở phần trước. Các số về concurrency và timeout chỉ là giá trị minh họa, không phải cấu hình khuyến nghị cho mọi service.
 </Callout>
+
+## Mục lục
+
+- [Khi nào nên dùng RxJS phía server](#khi-nào-nên-dùng-rxjs-phía-server)
+- [Chuẩn bị để chạy ví dụ](#chuẩn-bị-để-chạy-ví-dụ)
+- [Chuyển EventEmitter thành Observable](#chuyển-eventemitter-thành-observable)
+  - [Listener và vòng đời subscription](#listener-và-vòng-đời-subscription)
+  - [Event error không tự đi vào error channel](#event-error-không-tự-đi-vào-error-channel)
+- [Bọc Promise và callback](#bọc-promise-và-callback)
+  - [Tạo Promise khi subscribe bằng defer](#tạo-promise-khi-subscribe-bằng-defer)
+  - [Bọc callback error first bằng bindNodeCallback](#bọc-callback-error-first-bằng-bindnodecallback)
+- [Đọc Node.js stream đúng cách](#đọc-nodejs-stream-đúng-cách)
+  - [Giữ pipeline native khi cần backpressure](#giữ-pipeline-native-khi-cần-backpressure)
+  - [Dùng async iterable để đưa chunk vào RxJS](#dùng-async-iterable-để-đưa-chunk-vào-rxjs)
+- [Xử lý batch với concurrency giới hạn](#xử-lý-batch-với-concurrency-giới-hạn)
+- [Hủy I/O thật bằng AbortController](#hủy-io-thật-bằng-abortcontroller)
+- [Shutdown worker và vị trí takeUntil](#shutdown-worker-và-vị-trí-takeuntil)
+  - [Dừng nhận job rồi chờ drain](#dừng-nhận-job-rồi-chờ-drain)
+  - [Dừng ngay cả inner subscription](#dừng-ngay-cả-inner-subscription)
+- [Kiểm tra cleanup và các bẫy thường gặp](#kiểm-tra-cleanup-và-các-bẫy-thường-gặp)
+- [Đọc tiếp](#đọc-tiếp)
+- [Tài liệu tham khảo](#tài-liệu-tham-khảo)
+
+## Khi nào nên dùng RxJS phía server
+
+Nếu chỉ đọc một file rồi trả kết quả, mình chọn `async/await`. Nếu cần copy hoặc nén file lớn, mình chọn `node:stream/promises.pipeline`. RxJS đáng dùng khi bạn phải phối hợp nhiều nguồn event, áp dụng cùng một chính sách lỗi cho nhiều tác vụ, hoặc quản lý một chuỗi có nhiều subscription con.
+
+| Nhu cầu | Lựa chọn mặc định | RxJS giúp gì khi cần thêm |
+| --- | --- | --- |
+| Một request hoặc một lần đọc file | Promise và `async/await` | Ghép vào pipeline có timeout, retry hoặc cancellation |
+| Nghe nhiều event liên quan | `EventEmitter` | Filter, gom nhóm, kết hợp notifier và quản lý listener |
+| Đọc, biến đổi rồi ghi file lớn | Node.js stream và `pipeline` | Điều phối thời điểm bắt đầu và theo dõi kết quả |
+| Xử lý một batch hữu hạn | Promise hoặc RxJS tùy độ phức tạp | `mergeMap` giới hạn tác vụ đang hoạt động, xử lý lỗi từng job |
+| Tính toán CPU nặng | `worker_threads` hoặc tiến trình riêng | Điều phối job và kết quả, không thay thế thread |
+
+Hai ranh giới cần giữ rõ: Observable không tự làm I/O trở thành cancellable, và scheduler của RxJS không tự đưa code sang thread khác. Một `map` chạy vòng lặp CPU nặng vẫn có thể chặn event loop, dù pipeline trông bất đồng bộ.
+
+## Chuẩn bị để chạy ví dụ
+
+Trong một thư mục thử nghiệm Node.js, cài RxJS nếu chưa có:
+
+```bash
+npm install rxjs@7.8.2
+```
+
+Lưu code vào file `.mjs`, chẳng hạn `node-events.mjs`, rồi chạy:
+
+```bash
+node node-events.mjs
+```
+
+Đuôi `.mjs` cho phép dùng `import` và top-level `await` mà không cần đổi `package.json`. Các ví dụ đọc `./package.json` giả định bạn chạy từ thư mục chứa file đó. Nếu đưa code vào một service đang có, dùng cấu hình module và cách chạy của service, không cần tạo project mới.
+
+## Chuyển EventEmitter thành Observable
+
+### Listener và vòng đời subscription
+
+`fromEvent` hỗ trợ `EventEmitter` của Node.js. Mỗi subscription đăng ký một listener; unsubscribe gỡ listener của subscription đó, không xóa listener của các thành phần khác.
+
+```js
+import { EventEmitter } from 'node:events';
+import { filter, fromEvent, map } from 'rxjs';
+
+const bus = new EventEmitter();
+
+const jobs$ = fromEvent(bus, 'job').pipe(
+  filter((job) => job.enabled),
+  map((job) => job.id),
+);
+
+console.log('Trước subscribe:', bus.listenerCount('job'));
+
+const subscription = jobs$.subscribe({
+  next: (id) => console.log('Job:', id),
+  error: (error) => console.error('Pipeline lỗi:', error.message),
+});
+
+bus.emit('job', { id: 'a', enabled: true });
+bus.emit('job', { id: 'b', enabled: false });
+
+console.log('Đang subscribe:', bus.listenerCount('job'));
+subscription.unsubscribe();
+console.log('Sau unsubscribe:', bus.listenerCount('job'));
+
+bus.emit('job', { id: 'c', enabled: true }); // Không còn được xử lý.
+```
+
+Kết quả:
+
+```text
+Trước subscribe: 0
+Job: a
+Đang subscribe: 1
+Sau unsubscribe: 0
+```
+
+`emit()` gọi listener đồng bộ. Trong ví dụ, `Job: a` xuất hiện trước khi `emit()` trả về. Event phát trước subscribe không được replay; hai lần subscribe vào `jobs$` sẽ tạo hai listener. Nếu nhiều consumer cần dùng chung listener và bước xử lý, cân nhắc `share()`.
+
+Một event phát nhiều argument, chẳng hạn `bus.emit('job', id, payload)`, được `fromEvent` chuyển thành một array argument. Đừng giả định luôn nhận được một object: tốt nhất thống nhất payload ở boundary của ứng dụng.
+
+### Event error không tự đi vào error channel
+
+Với `fromEvent(bus, 'job')`, RxJS chỉ nghe event `job`. Event có tên `error` trên `bus` không tự trở thành notification `error` của Observable này. Ngay cả `fromEvent(bus, 'error')` cũng phát object lỗi bằng `next`, chứ không tự terminate.
+
+<Callout type="warn" title="Quy tắc riêng của EventEmitter">
+  `EventEmitter` phát `error` mà không có listener xử lý sẽ ném lỗi; nếu không được bắt, lỗi có thể làm tiến trình dừng. Callback `error` trong `subscribe` của một stream nghe `job` không bảo vệ bạn khỏi tình huống này. Thành phần sở hữu emitter phải có chính sách xử lý `error` cho toàn bộ vòng đời của nó.
+</Callout>
+
+Khi một emitter đại diện cho một phiên làm việc có event kết thúc, bạn có thể viết adapter rõ ràng. Trong ví dụ sau, **`message` và `end` là tên event do ứng dụng quy định**, không phải contract của mọi Node.js stream:
+
+```js
+import { EventEmitter } from 'node:events';
+import { Observable } from 'rxjs';
+
+function sessionMessages$(session) {
+  return new Observable((subscriber) => {
+    const onMessage = (message) => subscriber.next(message);
+    const onError = (error) => subscriber.error(error);
+    const onEnd = () => subscriber.complete();
+
+    session.on('message', onMessage);
+    session.on('error', onError);
+    session.on('end', onEnd);
+
+    return () => {
+      session.off('message', onMessage);
+      session.off('error', onError);
+      session.off('end', onEnd);
+    };
+  });
+}
+
+const session = new EventEmitter();
+const subscription = sessionMessages$(session).subscribe({
+  next: (message) => console.log(message),
+  error: (error) => console.error('Session lỗi:', error.message),
+  complete: () => console.log('Session kết thúc'),
+});
+
+session.emit('message', 'hello');
+session.emit('end'); // Complete và gỡ cả ba listener.
+console.log(subscription.closed); // true
+```
+
+Adapter này chỉ sở hữu các listener nó tạo, không tự đóng `session`. Sau teardown, listener `error` của adapter cũng đã bị gỡ. Nếu emitter còn tiếp tục hoạt động và có thể phát lỗi, owner vẫn cần listener xử lý lỗi riêng; nếu subscription sở hữu tài nguyên, teardown phải có thêm thao tác đóng tài nguyên theo API của nó.
+
+## Bọc Promise và callback
+
+### Tạo Promise khi subscribe bằng defer
+
+`from(readFile(...))` nhận một Promise đã được tạo. Lệnh đọc file bắt đầu ngay lúc gọi `readFile`, không đợi subscribe. Nếu muốn mỗi subscription tạo một thao tác mới, dùng `defer`:
+
+```js
+import { readFile } from 'node:fs/promises';
+import { defer, lastValueFrom, map } from 'rxjs';
+
+function readJson$(path) {
+  return defer(() => readFile(path, 'utf8')).pipe(
+    map((text) => JSON.parse(text)),
+  );
+}
+
+try {
+  const pkg = await lastValueFrom(readJson$('./package.json'));
+  console.log('Tên package:', pkg.name ?? '(chưa đặt tên)');
+} catch (error) {
+  console.error('Đọc JSON thất bại:', error.message);
+  process.exitCode = 1;
+}
+```
+
+`defer` chấp nhận Promise nên không cần bọc thêm `from` trong ví dụ này. Lỗi đọc file và lỗi `JSON.parse` đều đi vào error channel rồi thành Promise rejection ở `lastValueFrom`.
+
+Khác biệt này còn ảnh hưởng đến retry: `retry` resubscribe vào `defer` sẽ gọi lại hàm tạo Promise. Resubscribe vào `from` của một Promise đã reject chỉ quan sát lại lỗi cũ, không tạo request mới.
+
+<Callout type="warn" title="Lazy không đồng nghĩa với cancellable">
+  `defer` quyết định lúc bắt đầu; nó không cung cấp cách hủy Promise. Unsubscribe ngừng chuyển kết quả xuống consumer nhưng thao tác đọc file hoặc request đã bắt đầu có thể vẫn chạy. Muốn hủy thật, bạn phải nối teardown với API hủy mà nguồn hỗ trợ, chẳng hạn `AbortSignal`.
+</Callout>
+
+`lastValueFrom` phù hợp ở boundary cần trả Promise và có nguồn chắc chắn kết thúc. Đừng dùng nó trên `fromEvent` không có điều kiện dừng: Promise có thể chờ mãi. Nếu nguồn complete mà không phát giá trị, `lastValueFrom` reject với `EmptyError` trừ khi bạn cung cấp giá trị mặc định.
+
+### Bọc callback error first bằng bindNodeCallback
+
+Với API cũ dùng callback dạng `(error, result)`, `bindNodeCallback` chuyển argument lỗi thành error channel. Một result đi ra như một giá trị; nhiều result đi ra như array.
+
+```js
+import { readFile } from 'node:fs';
+import { bindNodeCallback, lastValueFrom } from 'rxjs';
+
+const readText$ = bindNodeCallback((path, callback) => {
+  readFile(path, 'utf8', callback);
+});
+
+try {
+  const text = await lastValueFrom(readText$('./package.json'));
+  console.log('Số ký tự:', text.length);
+} catch (error) {
+  console.error('Callback báo lỗi:', error.message);
+  process.exitCode = 1;
+}
+```
+
+Hàm gốc được gọi khi Observable trả về được subscribe lần đầu. Trong RxJS 7, nhiều subscriber vào **cùng Observable trả về từ một lần gọi** `readText$(path)` dùng chung lần gọi callback và kết quả qua `AsyncSubject`; gọi `readText$(path)` lại sẽ tạo instance mới. Vì vậy đừng mặc định mọi adapter callback đều có cùng hành vi cold như `defer`.
+
+Nếu API là method cần `this`, bọc bằng arrow function gọi method trên owner hoặc bind đúng context. `bindNodeCallback` không tự gọi `cancel()` trên handle của API khi unsubscribe. Khi cần cancellation, custom Observable với teardown thường rõ hơn. Với API đã có phiên bản Promise, mình ưu tiên `defer` như phần trên.
+
+## Đọc Node.js stream đúng cách
+
+### Giữ pipeline native khi cần backpressure
+
+Một `Readable` có các event `data`, `end`, `error`, `close`, nhưng chuyển riêng `data` sang Observable chưa đủ để quản lý nó. `fromEvent(readable, 'data')` đưa stream vào flowing mode; Observable đó không tự complete ở `end`, không tự xử lý `error`, và không tự pause khi consumer chậm. `close` cũng không có nghĩa dữ liệu đã được đọc hết: stream có thể đóng sớm do destroy hoặc lỗi.
+
+Nếu mục tiêu là đọc → biến đổi → ghi, hãy để Node.js quản lý backpressure:
+
+```js
+import { createReadStream, createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
+
+try {
+  await pipeline(
+    createReadStream('./package.json'),
+    createGzip(),
+    createWriteStream('./package.json.gz'),
+  );
+  console.log('Đã ghi package.json.gz');
+} catch (error) {
+  console.error('Pipeline stream thất bại:', error.message);
+  process.exitCode = 1;
+}
+```
+
+Ví dụ tạo hoặc ghi đè `package.json.gz` trong thư mục chạy. `pipeline` điều phối stream, xử lý backpressure giữa các tầng và propagate lỗi. Nếu ghi trực tiếp vào `Writable` thay vì dùng `pipeline`, khi `write()` trả `false` bạn phải đợi `drain` trước khi tiếp tục ghi; `subscribe(chunk => writable.write(chunk))` bỏ qua quy tắc này.
+
+Bạn có thể dùng RxJS để điều phối một lần chạy `pipeline`, nhưng phải tạo stream mới bên trong `defer` mỗi lần chạy. Không resubscribe vào các stream đã được consume hoặc destroy. Nếu cần hủy cả pipeline, Promise API của `pipeline` hỗ trợ option `{ signal }`; hãy nối signal với teardown thay vì chỉ unsubscribe một Promise wrapper.
+
+### Dùng async iterable để đưa chunk vào RxJS
+
+`Readable` của Node.js là async iterable, và RxJS 7 nhận async iterable qua `from`. Với xử lý đồng bộ trên từng chunk, đây là boundary gọn hơn việc tự ghép bốn event:
+
+```js
+import { createReadStream } from 'node:fs';
+import { defer, finalize, from, lastValueFrom, reduce } from 'rxjs';
+
+function fileChunks$(path) {
+  return defer(() => {
+    const readable = createReadStream(path);
+
+    return from(readable).pipe(
+      // Subscription này sở hữu stream nên được phép destroy nó.
+      finalize(() => readable.destroy()),
+    );
+  });
+}
+
+try {
+  const bytes = await lastValueFrom(
+    fileChunks$('./package.json').pipe(
+      reduce((total, chunk) => total + chunk.length, 0),
+    ),
+  );
+  console.log('Số byte:', bytes);
+} catch (error) {
+  console.error('Đọc stream thất bại:', error.message);
+  process.exitCode = 1;
+}
+```
+
+Mỗi subscription tạo một `Readable` mới. Không đặt encoding nên chunk là `Buffer`, `length` đếm byte. Iterator kết thúc khi đọc hết file và propagate lỗi đọc; seed `0` của `reduce` giúp file rỗng vẫn cho kết quả `0`. `finalize` đóng stream ở cả complete, error và unsubscribe; `destroy()` không đợi file descriptor đóng xong ngay trong cùng call stack.
+
+Node.js mặc định destroy `Readable` khi thoát sớm khỏi async iteration. Tuy vậy, `from(asyncIterable)` không có một API hủy chung cho mọi iterator: khi đang chờ `next()`, unsubscribe không bảo đảm đánh thức tác vụ đang chờ. `finalize(() => readable.destroy())` ở đây chủ động đóng stream mà subscription sở hữu. Đừng áp dụng mẫu destroy này cho stream dùng chung giữa nhiều consumer.
+
+<Callout type="warn" title="Async iterable chưa giải quyết toàn bộ backpressure">
+  `from(readable)` lấy chunk qua iterator, nhưng không chờ Promise mà callback `next` trả về, cũng không chờ mọi inner của `concatMap` hoặc `mergeMap` xử lý xong mới lấy chunk tiếp. Consumer bất đồng bộ chậm vẫn có thể làm queue tăng. Với xử lý từng chunk cần chờ thật, dùng `for await...of` có `await` trong vòng lặp hoặc giữ `pipeline` native.
+</Callout>
+
+Chunk không phải một dòng JSON hay một message hoàn chỉnh. Một dòng có thể bị cắt qua hai chunk, và một chunk có thể chứa nhiều dòng. Nếu xử lý NDJSON, cần lớp tách dòng có giữ phần dư, chẳng hạn `readline`, trước khi parse; `JSON.parse(chunk.toString())` không phải cách đọc NDJSON an toàn.
+
+## Xử lý batch với concurrency giới hạn
+
+Giả sử bạn có một batch nhỏ, đã nằm trong bộ nhớ. Bạn muốn xử lý song song tối đa hai job và một job lỗi không làm bỏ các job còn lại:
+
+```js
+import { setTimeout as sleep } from 'node:timers/promises';
+import { catchError, defer, from, map, mergeMap, of } from 'rxjs';
+
+async function runJob(id) {
+  await sleep(100); // Mô phỏng I/O, không phải benchmark.
+  if (id === 'b') throw new Error('Dữ liệu job không hợp lệ');
+  return { id, saved: true };
+}
+
+const jobIds = ['a', 'b', 'c', 'd'];
+
+from(jobIds).pipe(
+  mergeMap(
+    (id) => defer(() => runJob(id)).pipe(
+      map((result) => ({ id, ok: true, result })),
+      catchError((error) => of({ id, ok: false, message: error.message })),
+    ),
+    2,
+  ),
+).subscribe({
+  next: (outcome) => console.log(outcome),
+  error: (error) => {
+    console.error('Batch lỗi:', error.message);
+    process.exitCode = 1;
+  },
+  complete: () => console.log('Batch đã xử lý hết'),
+});
+```
+
+`mergeMap(..., 2)` giới hạn hai inner subscription đang hoạt động. Vì `runJob` được gọi trong `defer`, tác vụ chỉ bắt đầu khi có slot. Nếu bạn tạo sẵn tất cả Promise, chẳng hạn `jobIds.map(runJob)`, rồi mới đưa chúng vào RxJS thì I/O đã khởi chạy hết; giới hạn concurrency đến quá muộn.
+
+`catchError` nằm **trong inner** để lỗi của `b` thành một outcome và slot được giải phóng. Đặt nó ngoài `mergeMap` nghĩa là một lỗi terminate chuỗi đang xử lý rồi chuyển sang fallback; đó không phải chính sách “tiếp tục job kế tiếp”. Kết quả của `mergeMap` theo thứ tự hoàn thành, không bảo đảm theo thứ tự input. Nếu cần giữ thứ tự xử lý, dùng `concatMap`; nếu cần vừa song song vừa xuất đúng thứ tự, cần đánh số và buffer kết quả có giới hạn.
+
+Concurrency chỉ giống số quầy phục vụ, không phải sức chứa phòng chờ. `from(jobIds)` phát array đồng bộ, nên job chưa có slot nằm trong queue nội bộ. Với nguồn vô hạn hoặc broker gửi nhanh hơn tốc độ xử lý, bạn vẫn cần giới hạn ingress: prefetch, pause/resume hoặc queue bên ngoài. Không dùng `throttleTime` để “giảm tải” các job bắt buộc xử lý vì nó bỏ giá trị.
+
+Nếu thêm retry, chỉ retry lỗi transient và kiểm tra idempotency của thao tác ghi. Retry sau khi server đã ghi nhưng response bị mất có thể tạo bản ghi trùng; unsubscribe cũng không rollback một giao dịch đã commit.
+
+## Hủy I/O thật bằng AbortController
+
+Với request HTTP, teardown nên gọi `abort()` trên controller của **chính subscription đó**. Không dùng chung một controller cho nhiều subscription, vì hủy một request sẽ hủy cả những request khác dùng cùng signal.
+
+```js
+import { Observable, timeout } from 'rxjs';
+
+function fetchJson$(url) {
+  return new Observable((subscriber) => {
+    const controller = new AbortController();
+
+    fetch(url, { signal: controller.signal })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return response.json();
+      })
+      .then((data) => {
+        subscriber.next(data);
+        subscriber.complete();
+      })
+      .catch((error) => subscriber.error(error));
+
+    return () => controller.abort();
+  });
+}
+
+const subscription = fetchJson$('http://localhost:3000/health').pipe(
+  timeout({ first: 2000 }),
+).subscribe({
+  next: (data) => console.log('Health:', data),
+  error: (error) => console.error('Health check thất bại:', error.message),
+});
+
+// Owner có thể hủy sớm: subscription.unsubscribe().
+```
+
+Đây là ví dụ cần một server có endpoint `/health` trả JSON. HTTP status lỗi được đổi thành error vì `fetch` không tự reject với `404` hoặc `500`. Lỗi network và lỗi parse JSON cũng đi vào cùng channel.
+
+Khi timeout trước emission đầu tiên, operator unsubscribe upstream; teardown gọi `abort()` nên request hoặc việc đọc body đang chờ được yêu cầu hủy. Nếu Promise reject sau unsubscribe, `subscriber` đã đóng nên consumer không nhận thêm lỗi. Khi hoàn thành bình thường, teardown vẫn chạy; gọi `abort()` sau khi dữ liệu đã đọc xong không thu hồi kết quả.
+
+Unsubscribe trực tiếp không gọi callback `complete` của observer, nhưng vẫn chạy teardown. `timeout` thì phát lỗi timeout xuống consumer. Cả hai đều có thể hủy I/O trong ví dụ này vì adapter đã nối cleanup với `AbortController`, không phải vì Promise tự cancellable.
+
+<Callout type="warn" title="Hủy phía client không phải rollback phía server">
+  Abort không bảo đảm server chưa thực hiện side effect. Với request ghi, hãy dùng idempotency key hoặc thiết kế nghiệp vụ phù hợp. Đồng thời chỉ gọi URL đã được kiểm soát; không đưa URL tùy ý từ người dùng vào một backend fetch mà thiếu chính sách chống SSRF.
+</Callout>
+
+Không viết `new Observable(async (subscriber) => ...)`: constructor cần trả teardown đồng bộ, còn `async` trả Promise. Giữ controller và teardown trong scope đồng bộ như trên, rồi đưa Promise rejection vào `subscriber.error`.
+
+## Shutdown worker và vị trí takeUntil
+
+`SIGTERM` thường là yêu cầu cho service dừng có kiểm soát, không nhất thiết là “hủy mọi thứ ngay”. Trước khi đặt `takeUntil`, bạn cần quyết định muốn drain hay cancel. Notifier phải **phát giá trị**; chỉ complete notifier không khiến `takeUntil` dừng nguồn.
+
+### Dừng nhận job rồi chờ drain
+
+Hàm dưới đây là khung tích hợp vào worker. `jobs$` do tầng ingress cung cấp; `handleJob(job)` trả Promise của một thao tác có thời gian kết thúc hữu hạn.
+
+```js
+import {
+  catchError,
+  defer,
+  finalize,
+  fromEvent,
+  merge,
+  mergeMap,
+  of,
+  take,
+  takeUntil,
+} from 'rxjs';
+
+function startWorker(jobs$, handleJob) {
+  const shutdown$ = merge(
+    fromEvent(process, 'SIGINT'),
+    fromEvent(process, 'SIGTERM'),
+  ).pipe(take(1));
+
+  return jobs$.pipe(
+    // Signal complete outer trước, không hủy inner đang làm việc.
+    takeUntil(shutdown$),
+    mergeMap(
+      (job) => defer(() => handleJob(job)).pipe(
+        catchError((error) => {
+          console.error('Job thất bại:', job.id, error.message);
+          // Minh họa outcome; chưa phải thao tác nack trên broker.
+          return of({ id: job.id, ok: false });
+        }),
+      ),
+      4,
+    ),
+    finalize(() => console.log('Worker pipeline đã đóng')),
+  ).subscribe({
+    next: (result) => console.log('Kết quả:', result),
+    error: (error) => {
+      console.error('Worker lỗi:', error.message);
+      process.exitCode = 1;
+    },
+    complete: () => console.log('Đã drain xong'),
+  });
+}
+
+// Tầng ứng dụng gọi startWorker(jobs$, handleJob).
+// Subscription trả về thuộc sở hữu của tầng lifecycle ứng dụng.
+```
+
+Đặt `takeUntil` **trước** `mergeMap` khiến signal complete outer. `mergeMap` tiếp tục các inner đang chạy và xử lý cả job đã được buffer bên trong nó trước signal, rồi mới complete output. Đây là drain toàn bộ phần đã nhận vào operator, không chỉ chờ những job đang chạy.
+
+Unsubscribe ingress phải được adapter của `jobs$` nối với thao tác dừng nhận hoặc gỡ listener phù hợp. Việc gỡ listener không tự đóng broker connection hoặc HTTP server. Tầng lifecycle còn cần đóng các tài nguyên đó sau drain và thực hiện ack/nack đúng contract của broker; outcome `{ ok: false }` không thay cho nack.
+
+Khi đăng ký listener signal, bạn thay đổi hành vi mặc định của Node.js cho signal đó. Worker hoàn thành cũng không bảo đảm process thoát nếu còn socket hoặc timer mở. Cần có deadline shutdown; nếu hết deadline thì unsubscribe pipeline và đóng tài nguyên còn lại theo chính sách đã chọn. Không gọi `process.exit()` ngay khi nhận signal nếu vẫn muốn chờ job hoặc flush log.
+
+### Dừng ngay cả inner subscription
+
+Nếu muốn ngừng cả phần chờ và inner, đổi vị trí operator:
+
+```js
+// Fragment thay cho thứ tự operator trong startWorker ở trên.
+jobs$.pipe(
+  mergeMap((job) => defer(() => handleJob(job)), 4),
+  takeUntil(shutdown$),
+);
+```
+
+Lúc này notifier complete output và unsubscribe cả outer lẫn inner; các job còn buffer bị bỏ khỏi pipeline. Nhưng nếu `handleJob` trả Promise không có API hủy thì công việc thực vẫn có thể chạy tiếp. Muốn dừng request thật, dùng một inner Observable có teardown như `fetchJson$`, hoặc adapter hủy tương đương cho API của bạn.
+
+Đọc theo cột dọc để thấy inner nào còn tồn tại khi signal đến. Các frame dưới đây là thời gian ảo minh họa, không phải giây:
+
+<MarbleDiagram
+  title="mergeMap(work$) → takeUntil(shutdown$)"
+  rows={[
+    { label: 'jobs', marble: '-a---b---c--|', kind: 'source' },
+    { label: 'shutdown$', marble: '-------s----', kind: 'source' },
+    { label: 'work A', marble: '-^--x|------', kind: 'inner' },
+    { label: 'work B', marble: '-----^-!----', kind: 'inner' },
+    { label: 'output', marble: '----x--|----', kind: 'output' },
+  ]}
+  values={{
+    a: 'job A ở frame 1',
+    b: 'job B ở frame 5',
+    c: 'job C ở frame 9, sau shutdown',
+    s: 'signal shutdown ở frame 7',
+    x: 'kết quả của A ở frame 4',
+  }}
+  caption="A đã phát kết quả và complete; B bị unsubscribe ở frame 7, cùng lúc output complete. C không còn được nhận."
+/>
+
+A subscribe ở frame 1, phát `x` ở frame 4 rồi complete ở frame 5. B subscribe ở frame 5 nhưng bị unsubscribe ở frame 7 nên không có kết quả xuống output. Nếu đặt `takeUntil` trước `mergeMap`, outer vẫn dừng ở frame 7 nhưng B được tiếp tục cho tới khi nó kết thúc; output sẽ chờ B và mọi job đã buffer. Dấu `!` chỉ chứng minh subscription bị hủy, không chứng minh side effect của producer đã dừng.
+
+## Kiểm tra cleanup và các bẫy thường gặp
+
+Một phép kiểm tra nhỏ với `node:assert` giúp phát hiện listener bị giữ lại, không cần khởi động server:
+
+```js
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { fromEvent, Subject, takeUntil } from 'rxjs';
+
+const bus = new EventEmitter();
+const stop$ = new Subject();
+const received = [];
+let completed = false;
+
+fromEvent(bus, 'job').pipe(takeUntil(stop$)).subscribe({
+  next: (job) => received.push(job),
+  complete: () => { completed = true; },
+});
+
+assert.equal(bus.listenerCount('job'), 1);
+bus.emit('job', 'a');
+stop$.next();
+stop$.complete();
+bus.emit('job', 'b');
+
+assert.deepEqual(received, ['a']);
+assert.equal(completed, true);
+assert.equal(bus.listenerCount('job'), 0);
+console.log('Cleanup OK');
+```
+
+Với code có I/O, thêm integration test vào chính adapter, không chỉ test operator:
+
+| Tình huống thử | Điều cần xác nhận |
+| --- | --- |
+| Subscribe, unsubscribe, subscribe lại vào event stream | Listener trở về baseline sau mỗi vòng; không có xử lý trùng |
+| File không tồn tại hoặc JSON không hợp lệ | Lỗi tới error handler hoặc Promise rejection, không treo |
+| File rỗng | Tổng byte là `0`, stream được đóng |
+| Unsubscribe khi đọc file lớn | `Readable` được destroy và sau đó nhận `close` |
+| Batch có một job lỗi | Có outcome lỗi, job khác vẫn chạy; số tác vụ active không vượt giới hạn |
+| Request bị timeout | Consumer nhận lỗi timeout và adapter gọi abort; không có emission muộn |
+| Shutdown trước `mergeMap` | Ngừng nhận mới, drain cả inner lẫn queue đã nhận |
+| Shutdown sau `mergeMap` | Inner bị unsubscribe; xác minh riêng API hủy của producer có được gọi |
+
+`TestScheduler` hữu ích cho vị trí notifier và vòng đời inner; nó không tự điều khiển network, filesystem hoặc thời gian hoàn thành của native Promise. Dùng server local hoặc fake transport có ghi nhận signal để kiểm tra adapter `fetchJson$`.
+
+Đừng đặt callback `async` trong `subscribe` rồi cho rằng RxJS chờ nó. `subscribe` không await Promise trả về, nên tốc độ nguồn không bị giới hạn và rejection cần được xử lý riêng. Đưa tác vụ bất đồng bộ vào `defer` và flatten bằng operator phù hợp, hoặc dùng `for await...of` khi cần pull có chờ từng bước.
+
+Nếu thấy `MaxListenersExceededWarning`, kiểm tra xem setup có bị gọi lặp và subscription có được gỡ không trước khi tăng giới hạn listener. Warning đó là tín hiệu cần điều tra, không phải bằng chứng tuyệt đối của memory leak; nhưng tăng giới hạn không sửa được lifecycle sai.
+
+## Đọc tiếp
+
+<Cards>
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Phân biệt complete, unsubscribe và cleanup tài nguyên." />
+  <Card title="mergeMap" href="/docs/higher-order-observables/merge-map" description="Hiểu concurrency, thứ tự kết quả và các inner đang chạy." />
+  <Card title="Catch error" href="/docs/loi-hoan-tat/catch-error" description="Chọn ranh giới lỗi giữa từng job và toàn pipeline." />
+  <Card title="Integration tests" href="/docs/testing/integration-tests" description="Kiểm tra transport, cancellation và lifecycle thực." />
+</Cards>
+
+## Tài liệu tham khảo
+
+- [RxJS: fromEvent](https://rxjs.dev/api/index/function/fromEvent) — chuyển event thành Observable và contract của event target.
+- [RxJS 7.8.2: bindCallbackInternals](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/bindCallbackInternals.ts) — lazy invocation, error-first callback và chia sẻ kết quả bằng `AsyncSubject`.
+- [RxJS 7.8.2: innerFrom](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/innerFrom.ts) — cách consume Promise và async iterable.
+- [Node.js: EventEmitter và error events](https://nodejs.org/docs/latest-v22.x/api/events.html#error-events) — hậu quả khi không có listener cho `error`.
+- [Node.js: stream](https://nodejs.org/docs/latest-v22.x/api/stream.html) — `pipeline`, backpressure và async iteration trên `Readable`.
+- [Node.js: AbortController](https://nodejs.org/docs/latest-v22.x/api/globals.html#class-abortcontroller) — `AbortSignal` và cơ chế yêu cầu hủy.
+- [Node.js: signal events](https://nodejs.org/docs/latest-v22.x/api/process.html#signal-events) — hành vi của `SIGINT`, `SIGTERM` và listener trên `process`.

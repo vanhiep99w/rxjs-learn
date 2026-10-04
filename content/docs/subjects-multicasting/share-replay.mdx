@@ -3,8 +3,526 @@ title: Operator shareReplay
 description: Chia sẻ kết quả có replay và kiểm soát cache lifecycle.
 ---
 
-Trang này sẽ trình bày **Operator shareReplay** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Giả sử header và trang hồ sơ cùng đọc thông tin người dùng từ một HTTP Observable. Nếu mỗi nơi subscribe vào source cold, bạn có thể gửi hai request giống nhau. Khi panel mở sau request đầu, bạn còn muốn nó nhận ngay kết quả đã có thay vì gọi API lần nữa. `shareReplay` giải quyết cả hai việc: dùng chung execution upstream và replay một buffer cho subscriber đến muộn.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Nhưng “có replay” không đồng nghĩa với “cache luôn mới”. Điều cần chốt trước khi dùng là: khi không còn ai đọc, khi source complete, và khi source error, kết nối cùng buffer sẽ đi đâu?
+
+<Callout type="info" title="Phạm vi">
+  Bài dùng hành vi của **RxJS 7.8.x**, đối chiếu implementation 7.8.2. Bạn nên biết cold Observable, subscription và `ReplaySubject`. Ví dụ TypeScript import từ `rxjs`; các frame trong marble diagram là virtual time, không phải millisecond thực.
 </Callout>
+
+## Mục lục
+
+- [Mental model của shareReplay](#mental-model-của-sharereplay)
+- [API và cấu hình nên dùng](#api-và-cấu-hình-nên-dùng)
+- [Subscriber đến muộn nhận gì](#subscriber-đến-muộn-nhận-gì)
+- [Lifecycle của kết nối và cache](#lifecycle-của-kết-nối-và-cache)
+  - [Source còn chạy và refCount về không](#source-còn-chạy-và-refcount-về-không)
+  - [Source complete giữ lại cache](#source-complete-giữ-lại-cache)
+  - [Source error reset nhưng không tự retry](#source-error-reset-nhưng-không-tự-retry)
+- [Chia sẻ một request hữu hạn](#chia-sẻ-một-request-hữu-hạn)
+- [windowTime không phải TTL refetch](#windowtime-không-phải-ttl-refetch)
+- [Refresh và invalidation rõ ràng](#refresh-và-invalidation-rõ-ràng)
+  - [Refresh bằng trigger](#refresh-bằng-trigger)
+  - [Reset cache sau complete bằng share](#reset-cache-sau-complete-bằng-share)
+- [Những bẫy khi đặt operator](#những-bẫy-khi-đặt-operator)
+  - [Mỗi lần gọi hàm tạo một cache khác](#mỗi-lần-gọi-hàm-tạo-một-cache-khác)
+  - [Vị trí của tap map và catchError](#vị-trí-của-tap-map-và-catcherror)
+  - [take có thể ngắt trước khi source complete](#take-có-thể-ngắt-trước-khi-source-complete)
+  - [Cache có phạm vi và giữ object reference](#cache-có-phạm-vi-và-giữ-object-reference)
+- [Chọn shareReplay hay cách khác](#chọn-sharereplay-hay-cách-khác)
+- [Kiểm thử bằng TestScheduler](#kiểm-thử-bằng-testscheduler)
+- [Checklist trước khi dùng](#checklist-trước-khi-dùng)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Mental model của shareReplay
+
+`shareReplay` là operator nhận một Observable có sẵn. Subscriber đầu tiên khiến nó tạo `ReplaySubject` nội bộ và subscribe vào source; các subscriber tiếp theo đọc qua cùng Subject đó. Khi một value đi qua, Subject chuyển nó cho người đang đọc và giữ value trong buffer để replay sau này.
+
+Bạn có thể hình dung một request tạo ra bản kết quả dùng chung trên bàn: người đến sau đọc bản đang có, không nhờ chạy lại request. Phép so sánh dừng ở đây: bản kết quả chỉ nằm trong bộ nhớ của shared Observable, không tự biết dữ liệu trên server đã đổi và không sống qua reload.
+
+```text
+source$ ── một subscription upstream ──► ReplaySubject nội bộ
+                                             ├──► consumer A
+                                             ├──► consumer B
+                                             └──► consumer đến muộn: buffer + value mới
+```
+
+Gọi `.pipe(shareReplay(...))` chưa khởi động source. Nó vẫn lazy: phải có subscriber đầu tiên. Sharing cũng không tạo thread, không clone value, và không biến một nguồn hot thành nguồn có thể phát lại mọi event trước khi kết nối. Buffer chỉ biết những value đã thực sự đi qua subscription upstream.
+
+Mình thường chọn `shareReplay({ bufferSize: 1, refCount: true })` cho dữ liệu đọc chung trong UI. Đây là điểm bắt đầu, không phải chính sách cache hoàn chỉnh: source đã complete vẫn có thể giữ kết quả rất lâu.
+
+## API và cấu hình nên dùng
+
+Hai dạng gọi public của RxJS 7.8.x có thể đọc như sau:
+
+```ts
+import { shareReplay } from 'rxjs';
+
+// Dạng config: nên viết rõ lifecycle.
+shareReplay({ bufferSize: 1, refCount: true });
+
+// Dạng positional: refCount mặc định false.
+shareReplay(1);
+shareReplay(3, 5000);
+```
+
+| Cấu hình | Kiểu | Mặc định | Tác động |
+| --- | --- | --- | --- |
+| `bufferSize` | `number` | `Infinity` | Số value tối đa giữ để replay, không giới hạn số value consumer đang nghe nhận được |
+| `windowTime` | `number` | `Infinity` | Tuổi tối đa của value được replay; đơn vị ms với đồng hồ mặc định |
+| `refCount` | `boolean` | `false` trong implementation và dạng positional | Nếu `true`, ngắt và reset khi consumer cuối rời đi lúc source chưa kết thúc |
+| `scheduler` | `SchedulerLike` | Đồng hồ mặc định của `ReplaySubject` | Cung cấp `now()` để tính tuổi buffer; không tự schedule việc replay |
+
+Trong overload config, TypeScript yêu cầu trường `refCount`; hãy truyền nó rõ ràng thay vì dựa vào default runtime. `bufferSize` và `windowTime` cùng áp dụng: một value phải nằm trong số lượng cho phép **và** chưa hết tuổi mới được replay.
+
+Replay diễn ra đồng bộ ngay trong `subscribe()`, theo thứ tự cũ đến mới. Truyền `scheduler` ở đây không làm replay trở thành async; nếu cần đổi nơi xử lý notification, đó là bài toán của operator như `observeOn`.
+
+<Callout type="warn" title="shareReplay() không phải cấu hình an toàn cho mọi stream">
+  Không truyền tham số nghĩa là buffer không giới hạn số lượng và thời gian, đồng thời `refCount` là `false`. Với nguồn dài hạn, bạn có thể giữ cả một lịch sử trong RAM và để producer chạy dù không còn consumer. `shareReplay(1)` giới hạn lịch sử nhưng vẫn không ngắt nguồn khi số người đọc về 0.
+</Callout>
+
+Trong RxJS 7.8.x, `ReplaySubject` chuẩn hóa kích thước buffer tối thiểu thành 1. Vì vậy `shareReplay(0)` không phải cách tắt replay; nếu không cần lịch sử, dùng `share()`.
+
+## Subscriber đến muộn nhận gì
+
+Đọc theo cột dọc: source chỉ có một execution, nhưng A và B bắt đầu đọc ở hai thời điểm khác nhau. Diagram dùng buffer một value; C đến sau khi source đã complete.
+
+<MarbleDiagram
+  title="shareReplay({ bufferSize: 1, refCount: true })"
+  rows={[
+    { label: 'source', marble: '--a---b---c-|', kind: 'source' },
+    { label: 'sub A', marble: '^-----------!', kind: 'subscription' },
+    { label: 'sub B', marble: '----^-------!', kind: 'subscription' },
+    { label: 'sub C', marble: '-------------^', kind: 'subscription' },
+    { label: 'A nhận', marble: '--a---b---c-|', kind: 'output' },
+    { label: 'B nhận', marble: '----a-b---c-|', kind: 'output' },
+    { label: 'C nhận', marble: '-------------(c|)', kind: 'output' },
+  ]}
+  values={{ a: 'kết quả đầu', b: 'kết quả cập nhật', c: 'kết quả cuối' }}
+  caption="B nhận a ngay ở frame 4. C nhận c rồi complete ngay ở frame 13, không tạo execution mới. (c|) biểu diễn hai notification trong cùng frame; subscription của C cũng đóng ở frame đó."
+/>
+
+A đăng ký ở frame 0, source phát `a` ở frame 2. B đăng ký ở frame 4 và nhận `a` ngay, không chờ source phát lại; cả hai nhận `b` ở frame 6 và `c` ở frame 10. Frame 12, source complete và các subscription đang nghe đóng, nên dấu `!` ở đây là teardown do complete chứ không phải hủy thủ công.
+
+C đến ở frame 13, khi không còn consumer nào từ execution đầu. Nó vẫn nhận `c` rồi complete đồng bộ. Đây là điểm dễ nhầm nhất: **`refCount: true` không tự xóa cache của source đã complete**.
+
+## Lifecycle của kết nối và cache
+
+Trong implementation 7.8.2, `shareReplay` được xây trên `share` với cấu hình tương đương:
+
+```ts
+import { ReplaySubject, share } from 'rxjs';
+
+// Minh họa chính sách nội bộ của shareReplay({ bufferSize: 1, refCount: true }).
+share({
+  connector: () => new ReplaySubject(1),
+  resetOnError: true,
+  resetOnComplete: false,
+  resetOnRefCountZero: true,
+});
+```
+
+Reset nghĩa là bỏ trạng thái sharing hiện tại để lần subscribe sau có Subject mới và subscription upstream mới. Nó không có nghĩa những value đã gửi tới consumer bị thu hồi.
+
+| Tình huống | `refCount: true` | `refCount: false` |
+| --- | --- | --- |
+| Chưa có subscriber đầu tiên | Chưa kết nối source | Chưa kết nối source |
+| Vẫn còn ít nhất một consumer | Dùng chung kết nối và buffer | Dùng chung kết nối và buffer |
+| Không còn consumer, source vẫn hoạt động | Ngắt upstream và reset buffer | Giữ upstream và buffer; source tiếp tục chạy |
+| Source complete | Giữ trạng thái complete và buffer còn hợp lệ | Giữ trạng thái complete và buffer còn hợp lệ |
+| Source error | Gửi error tới consumer hiện tại, reset để lần subscribe sau chạy lại | Cùng chính sách reset khi error |
+
+### Source còn chạy và refCount về không
+
+Với `interval`, “không ai đọc” không đồng nghĩa “timer tự dừng”. Nếu dùng `refCount: true`, consumer cuối unsubscribe khiến sharing ngắt subscription upstream. Lần subscribe tiếp theo tạo một execution mới của cold `interval`, nên bộ đếm bắt đầu lại.
+
+Diagram sau chỉ vẽ những emission thực sự đi qua hai execution; khoảng trống từ frame 5 đến 8 không có kết nối upstream.
+
+<MarbleDiagram
+  title="shareReplay({ bufferSize: 1, refCount: true })"
+  rows={[
+    { label: 'upstream 1', marble: '^----!', kind: 'subscription' },
+    { label: 'source 1', marble: '--a-b', kind: 'source' },
+    { label: 'upstream 2', marble: '--------^----!', kind: 'subscription' },
+    { label: 'source 2', marble: '----------a-b', kind: 'source' },
+    { label: 'sub A', marble: '^----!', kind: 'subscription' },
+    { label: 'sub B', marble: '--------^----!', kind: 'subscription' },
+    { label: 'A nhận', marble: '--a-b', kind: 'output' },
+    { label: 'B nhận', marble: '----------a-b', kind: 'output' },
+  ]}
+  values={{ a: 'tick 0 của mỗi execution', b: 'tick 1 của mỗi execution' }}
+  caption="A rời ở frame 5 khi source chưa complete: upstream bị ngắt, buffer bị reset. B đến ở frame 8 không nhận b cũ; execution mới phát tick 0 ở frame 10."
+/>
+
+Với `refCount: false`, upstream thứ nhất không bị ngắt ở frame 5. Source tiếp tục cập nhật buffer trong khoảng không có consumer; B sẽ nhận value mới nhất ngay khi vào, rồi các tick tiếp theo. Chỉ chọn chính sách này nếu có chủ đích giữ producer sống, và đã có cách kết thúc nó.
+
+Ngắt subscription chỉ chạy teardown mà source cung cấp. Timer có thể được dừng, HTTP adapter có thể abort request, nhưng một Promise đã chạy không tự được hủy chỉ vì bạn unsubscribe.
+
+### Source complete giữ lại cache
+
+Một source hữu hạn thường phát một response rồi complete. Khi `shareReplay` đã quan sát `complete`, nó giữ Subject đã kết thúc, không kết nối lại chỉ vì consumer mới đến. Điều này đúng với cả hai giá trị `refCount`.
+
+Không cần kết nối upstream sống để giữ cache. Subscription upstream đã teardown nhưng buffer vẫn được giữ chừng nào shared Observable và trạng thái của nó còn reachable. Nếu source complete mà chưa phát value nào, subscriber mới chỉ nhận complete; `shareReplay` không tạo seed value.
+
+### Source error reset nhưng không tự retry
+
+Khi source error, consumer hiện tại nhận error và subscription của họ đóng. `shareReplay` reset trạng thái nội bộ, nên **một lần subscribe mới** có thể tạo execution mới, không nhận lại cache của execution đã lỗi.
+
+Ví dụ đồng bộ này cho thấy reset không tự phát sinh lần thử thứ hai:
+
+```ts
+import { defer, of, shareReplay, throwError } from 'rxjs';
+
+let attempts = 0;
+const result$ = defer(() => {
+  attempts += 1;
+  return attempts === 1
+    ? throwError(() => new Error('temporary failure'))
+    : of('ok');
+}).pipe(shareReplay({ bufferSize: 1, refCount: true }));
+
+result$.subscribe({ error: () => console.log('A: error') });
+console.log('attempts:', attempts); // 1, chưa tự retry
+result$.subscribe((value) => console.log('B:', value));
+result$.subscribe((value) => console.log('C:', value));
+console.log('attempts:', attempts);
+
+// A: error
+// attempts: 1
+// B: ok
+// C: ok
+// attempts: 2
+```
+
+Nếu muốn các consumer đang nghe tiếp tục qua lỗi tạm thời, đặt `retry` trước sharing. Reset của `shareReplay` chỉ chuẩn bị cho lần subscribe sau, không hồi sinh subscription đã error.
+
+## Chia sẻ một request hữu hạn
+
+Ví dụ này giả lập request cold bằng `defer` và `timer`, để bạn quan sát số lần source chạy mà không cần server. A và B đọc cùng Observable; C đến sau khi response đã complete.
+
+```ts
+import { defer, finalize, map, shareReplay, timer } from 'rxjs';
+
+let requests = 0;
+const user$ = defer(() => {
+  const requestId = ++requests;
+  console.log('start request', requestId);
+
+  return timer(10).pipe(
+    map(() => ({ id: 42, name: 'Lan' })),
+    finalize(() => console.log('end request', requestId)),
+  );
+}).pipe(shareReplay({ bufferSize: 1, refCount: true }));
+
+user$.subscribe((user) => console.log('A:', user.name));
+user$.subscribe((user) => console.log('B:', user.name));
+
+setTimeout(() => {
+  user$.subscribe((user) => console.log('C:', user.name));
+  console.log('requests:', requests);
+}, 30);
+
+// start request 1
+// A: Lan
+// B: Lan
+// end request 1
+// C: Lan
+// requests: 1
+```
+
+Các khoảng 10 ms và 30 ms chỉ để minh họa thứ tự; timer thực không cam kết chạy đúng thời điểm tuyệt đối. `finalize` nằm trước sharing nên log lifecycle của execution upstream, không phải của từng consumer. C nhận kết quả đồng bộ trong `subscribe()` vì response đã nằm trong buffer.
+
+Nếu A và B đều rời trước response, `refCount: true` ngắt timer giả lập; C sẽ khởi động request mới. Với HTTP thực, hãy kiểm tra adapter có teardown/abort đúng không. Đừng suy luận rằng mọi side effect bên ngoài đều bị hoàn tác khi hủy subscription.
+
+## windowTime không phải TTL refetch
+
+Giả sử bạn dùng:
+
+```ts
+shareReplay({ bufferSize: 1, windowTime: 5000, refCount: true });
+```
+
+Một response được phát lúc `t = 0`, source complete ngay sau đó. Subscriber đến khi response đã đủ 5000 ms tuổi sẽ không nhận value ấy, vì buffer đã hết hạn. Nhưng Subject vẫn mang trạng thái complete, nên subscriber chỉ nhận complete, **không có request mới**.
+
+`windowTime` chỉ giới hạn tuổi của value được replay. Nó không reset trạng thái complete, không tạo refresh trigger, và không gửi một “cache expired” event. `ReplaySubject` trim buffer khi có `next` hoặc subscribe, không đặt timer riêng để xóa đúng thời điểm hết hạn; object cũ có thể vẫn được giữ cho tới lần trim sau.
+
+Với source còn hoạt động, buffer hết hạn cũng không làm source restart. Subscriber mới đợi value tương lai từ cùng upstream hiện tại. Tuổi buffer tính từ lúc value được phát, không tính từ lần người dùng đọc cache gần nhất.
+
+<Callout type="warn" title="Phân biệt hai yêu cầu">
+  “Không replay value quá cũ” dùng `windowTime`. “Sau một khoảng thời gian, lần đọc tiếp theo phải gọi API lại” cần reset hoặc invalidation riêng. Dùng `windowTime` thay cho TTL refetch có thể khiến UI không có dữ liệu vì chỉ nhận complete.
+</Callout>
+
+## Refresh và invalidation rõ ràng
+
+### Refresh bằng trigger
+
+Nếu dữ liệu có thể đổi trong lúc UI đang mở, mình ưu tiên một trigger refresh rõ ràng. Ví dụ dưới đây chạy trong browser có `/api/profile` trả JSON; đây là API giả định để minh họa cấu trúc, không phải endpoint của site tài liệu.
+
+```ts
+import { Subject, shareReplay, startWith, switchMap } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+interface Profile {
+  id: number;
+  name: string;
+}
+
+const refresh = new Subject<void>();
+
+const profile$ = refresh.pipe(
+  startWith(undefined),
+  switchMap(() => ajax.getJSON<Profile>('/api/profile')),
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+const header = profile$.subscribe({
+  next: (profile) => console.log('header:', profile.name),
+  error: (error) => console.error('profile failed:', error),
+});
+const page = profile$.subscribe({
+  next: (profile) => console.log('page:', profile.name),
+  error: (error) => console.error('profile failed:', error),
+});
+
+// Gọi từ handler sau khi lưu hồ sơ thành công:
+refresh.next();
+
+// Gọi khi owner của cả hai consumer bị hủy:
+header.unsubscribe();
+page.unsubscribe();
+refresh.complete();
+```
+
+`startWith` tạo lần load đầu, `switchMap` hủy request cũ khi có refresh mới, còn sharing nằm ngoài để các consumer dùng chung cả chuỗi refresh. Outer `refresh` chưa complete nên kết quả HTTP complete không khiến toàn bộ `profile$` complete. Vì vậy khi mọi consumer rời đi, `refCount: true` reset; consumer mới sẽ bắt đầu lại từ `startWith`.
+
+Trong khi refresh đang chạy, buffer vẫn chứa response trước đó: người đến muộn có thể nhận dữ liệu cũ rồi response mới. Nếu yêu cầu phải xóa dữ liệu cũ ngay khi refresh, hãy mô hình hóa trạng thái `loading`/`ready`/`error` thay vì chỉ replay response.
+
+Ví dụ cố ý để error đi ra ngoài. Nếu request lỗi, các consumer đang nghe đóng; họ cần subscribe lại để hoạt động tiếp. Trong UI cần refresh lâu dài, thường nên bắt lỗi **bên trong** `switchMap` và phát một error state có kiểu rõ ràng để giữ outer stream sống. Đừng biến lỗi thành một “response thành công” giả rồi cache nó mà không có chính sách phục hồi.
+
+### Reset cache sau complete bằng share
+
+Nếu cần TTL cho một request hữu hạn, `share` cho bạn quyền cấu hình reset mà `shareReplay` không expose. Ví dụ cache response 30 giây tính từ lúc source complete:
+
+```ts
+import { ReplaySubject, defer, share, timer } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+interface Settings {
+  locale: string;
+}
+
+const settings$ = defer(() => ajax.getJSON<Settings>('/api/settings')).pipe(
+  share({
+    connector: () => new ReplaySubject<Settings>(1),
+    resetOnError: true,
+    resetOnComplete: () => timer(30_000),
+    resetOnRefCountZero: true,
+  }),
+);
+```
+
+Trong 30 giây sau complete, subscriber mới nhận cache và complete ngay. Khi notifier `timer` phát, state sharing bị reset; lần subscribe sau đó khởi động request mới. Reset này không tự gửi request ở giây thứ 30 và không cập nhật những subscription đã complete. Đây là cache “đọc sau hạn thì fetch lại”, không phải polling.
+
+Nếu consumer cuối rời trước khi request complete, `resetOnRefCountZero: true` ngắt request và reset ngay. Nếu bạn cần stale-while-revalidate, cache theo key, deduplicate nhiều resource hoặc invalidation theo mutation, hãy thiết kế lớp cache riêng; một buffer replay không bao hết những yêu cầu đó.
+
+## Những bẫy khi đặt operator
+
+### Mỗi lần gọi hàm tạo một cache khác
+
+Hai consumer chỉ chia sẻ khi họ subscribe vào **cùng shared Observable instance**. Đặt sharing trong một factory được gọi hai lần tạo ra hai state độc lập:
+
+```ts
+import { defer, of, shareReplay } from 'rxjs';
+
+const load$ = defer(() => {
+  console.log('load');
+  return of({ theme: 'dark' });
+});
+
+// Mỗi lời gọi tạo một pipeline và cache mới.
+const getSettings = () => load$.pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+getSettings().subscribe(); // load
+getSettings().subscribe(); // load
+
+// Giữ một instance dùng chung trong owner phù hợp.
+const settings$ = load$.pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+settings$.subscribe(); // load
+settings$.subscribe(); // dùng cache, không log load
+```
+
+Để chia sẻ trong service hoặc component owner, giữ Observable trong một field hoặc biến ổn định. Nếu fetch theo ID, một biến duy nhất không tự trở thành cache theo ID; phải xác định key, eviction và invalidation rõ ràng.
+
+### Vị trí của tap map và catchError
+
+Operator trước sharing thuộc execution upstream; operator sau sharing chạy trong từng subscription consumer, kể cả khi notification đến từ replay.
+
+```ts
+import { defer, map, of, shareReplay, tap } from 'rxjs';
+
+const price$ = defer(() => of(100)).pipe(
+  tap(() => console.log('upstream')),
+  map((price) => price * 1.1),
+  shareReplay({ bufferSize: 1, refCount: true }),
+  tap(() => console.log('consumer')),
+);
+
+price$.subscribe(); // upstream, consumer
+price$.subscribe(); // consumer
+```
+
+Đặt phép tính đắt mà mọi consumer cần trước sharing; đặt xử lý riêng của mỗi consumer sau sharing. `tap` sau sharing không còn là nơi đáng tin để đếm request. Tương tự, `finalize` sau sharing đo teardown của từng consumer, không chứng minh upstream đã ngắt.
+
+Với `catchError`, vị trí còn thay đổi thứ được cache. Nếu `source$.pipe(catchError(() => of(fallback)), shareReplay(...))`, fallback là một value bình thường và source thay thế complete thành công, nên fallback có thể bị giữ lâu dài. Nếu bắt lỗi sau sharing, sharing vẫn thấy error và reset; fallback chỉ thuộc consumer đó. Chọn theo yêu cầu nghiệp vụ, không chỉ để “UI hết báo lỗi”.
+
+### take có thể ngắt trước khi source complete
+
+`take(1)` sau sharing có thể khiến consumer đóng ngay trong xử lý `next`, trước khi thông báo `complete` của source tới `shareReplay`. Nếu đó là consumer cuối và `refCount: true`, upstream bị ngắt và buffer reset lúc source vẫn được xem là đang hoạt động. Vì vậy “request thường complete ngay sau response” chưa đủ để kết luận cache sẽ được giữ trong mọi pipeline.
+
+```ts
+import { defer, of, shareReplay, take } from 'rxjs';
+
+let runs = 0;
+const result$ = defer(() => of(++runs)).pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+result$.pipe(take(1)).subscribe(console.log); // 1
+result$.pipe(take(1)).subscribe(console.log); // 2
+```
+
+Ở đây consumer duy nhất rời trong `next`, nên lần thứ hai tạo execution mới. `firstValueFrom(result$)` cũng unsubscribe sau value đầu, vì thế có thể tạo tình huống tương tự. Nếu còn consumer khác ở lại tới source complete, kết quả có thể khác.
+
+Ngược lại, `take(n)` trước sharing giới hạn source chung, còn `take(n)` sau sharing chỉ giới hạn consumer đó. Đừng dời `take` chỉ để giữ cache nếu nó làm thay đổi ý nghĩa stream; viết test đúng với pipeline thật trước.
+
+### Cache có phạm vi và giữ object reference
+
+Buffer giữ object reference, không snapshot hay deep clone. Nếu consumer sửa object nhận được, consumer khác hoặc lần replay sau có thể nhìn thấy object đã bị sửa. Dùng dữ liệu immutable và biến đổi ra object mới khi cần state riêng.
+
+`bufferSize: 1` cũng không có nghĩa tốn ít RAM: một value có thể chứa cả danh sách lớn. Object được buffer giữ vẫn reachable dù subscription upstream đã complete, nếu shared Observable còn được giữ bởi owner sống lâu.
+
+Trong ứng dụng nhiều user hoặc SSR, đừng đặt cache dữ liệu cá nhân ở module global dùng chung request. Phạm vi cache phải khớp user/tenant và vòng đời đăng nhập; logout, đổi tenant hay đổi quyền phải có invalidation rõ ràng. Chỉ tạo Observable mới không dừng các consumer còn bám instance cũ: owner phải teardown chúng nếu dữ liệu cũ không còn được phép dùng.
+
+## Chọn shareReplay hay cách khác
+
+| Nhu cầu | Lựa chọn mình ưu tiên | Vì sao |
+| --- | --- | --- |
+| Cùng nghe event tương lai, không cần lịch sử | `share()` | Không replay event đã qua; mặc định reset khi error, complete và refCount về 0 |
+| Chia sẻ kết quả và replay buffer với lifecycle chuẩn | `shareReplay` với config rõ ràng | Ngắn, nhưng nhớ chính sách giữ cache sau complete |
+| Replay nhưng cần reset khi complete hoặc reset trễ | `share({ connector: () => new ReplaySubject(...), ... })` | Tùy chỉnh chính sách reset trực tiếp |
+| Chủ động gọi `next` để cập nhật state có seed | `BehaviorSubject` | Đây là state writable, không chỉ sharing execution |
+| Chủ động phát lịch sử ngắn, chưa có seed | `ReplaySubject` | Bạn sở hữu producer và vòng đời Subject |
+| Mỗi consumer cần execution độc lập | Không sharing | Không thêm state cache hoặc gộp side effect ngoài ý muốn |
+
+Không nên replay một command như “gửi thanh toán” hay event click chỉ vì muốn giảm request trùng. Người đến muộn có thể xử lý lại command cũ, trong khi cache không thay thế idempotency phía server. Dùng sharing để chia sẻ **kết quả đọc**, không dùng nó làm cam kết một mutation chỉ xảy ra một lần.
+
+## Kiểm thử bằng TestScheduler
+
+Test nên kiểm tra cả output lẫn subscription upstream: output đúng chưa chứng minh source chỉ chạy một lần. Ví dụ dưới đây chạy với RxJS 7.8.x trong Node; không dùng timer thực.
+
+```ts
+import assert from 'node:assert/strict';
+import { shareReplay } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = () => new TestScheduler((actual, expected) => {
+  assert.deepEqual(actual, expected);
+});
+
+// Replay lúc đang chạy và sau complete, chỉ một upstream subscription.
+scheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source$ = cold('--a---b---c-|');
+  const shared$ = source$.pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+
+  expectObservable(shared$).toBe('--a---b---c-|');
+  expectObservable(shared$, '----^').toBe('----a-b---c-|');
+  expectObservable(shared$, '-------------^').toBe('-------------(c|)');
+  expectSubscriptions(source$.subscriptions).toBe('^-----------!');
+});
+
+// Consumer cuối rời trước complete: ngắt, reset, rồi source chạy lại.
+scheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source$ = cold('--a-b----|');
+  const shared$ = source$.pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+
+  expectObservable(shared$, '^----!').toBe('--a-b');
+  expectObservable(shared$, '--------^----!').toBe('----------a-b');
+  expectSubscriptions(source$.subscriptions).toBe([
+    '^----!',
+    '--------^----!',
+  ]);
+});
+
+// windowTime hết hạn sau complete: chỉ complete, không subscribe source lại.
+scheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source$ = cold('-a|');
+  const shared$ = source$.pipe(
+    shareReplay({
+      bufferSize: 1,
+      windowTime: 3,
+      refCount: true,
+    }),
+  );
+
+  expectObservable(shared$).toBe('-a|');
+  expectObservable(shared$, '-----^').toBe('-----|');
+  expectSubscriptions(source$.subscriptions).toBe('^-!');
+});
+
+// Error reset: lần subscribe sau có execution mới và nhận lại error của nó.
+scheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source$ = cold('--a-#');
+  const shared$ = source$.pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+
+  expectObservable(shared$).toBe('--a-#');
+  expectObservable(shared$, '------^').toBe('--------a-#');
+  expectSubscriptions(source$.subscriptions).toBe([
+    '^---!',
+    '------^---!',
+  ]);
+});
+```
+
+Trong `run`, clock mặc định của `ReplaySubject` được RxJS điều khiển bằng virtual time, nên test `windowTime` không phụ thuộc thời gian máy chạy. Notification marbles và subscription marbles là hai thứ riêng: đừng đưa hàng visual chứa cả `^` và value vào `cold()`.
+
+Nếu muốn kiểm tra `refCount: false`, đổi cấu hình ở test ngắt sớm: upstream thứ nhất sẽ tiếp tục tới complete và B có thể nhận buffer từ execution ấy, thay vì thấy execution mới bắt đầu. Thêm test với `take(1)` hoặc `firstValueFrom` nếu consumer thực của bạn dùng chúng.
+
+## Checklist trước khi dùng
+
+- Các consumer có thực sự giữ cùng Observable instance, hay mỗi lần gọi hàm lại tạo một cache mới?
+- Buffer cần bao nhiêu value, mỗi value lớn tới đâu, và có yêu cầu về độ mới không?
+- Source vô hạn có dừng khi không ai đọc không? Teardown của source làm được gì?
+- Source complete có được phép giữ kết quả cho lần đọc sau không?
+- Refresh, logout, đổi key hoặc đổi tenant sẽ invalidation bằng cách nào?
+- Fallback có đang bị cache như thành công không? Sau error, ai chịu trách nhiệm subscribe lại?
+- Test đã kiểm tra số subscription upstream, consumer đến muộn và consumer rời trước complete chưa?
+
+Hãy bắt đầu bằng test cho ba tình huống của chính pipeline bạn: người thứ hai đến khi source còn chạy, đến sau complete, và đến sau khi consumer cuối rời trước complete. Ba tình huống ấy thường bộc lộ ngay sự khác nhau giữa “share kết quả” và “giữ một cache lâu dài”.
+
+## Nguồn tham khảo
+
+- [RxJS API: shareReplay](https://rxjs.dev/api/operators/shareReplay) — overload và ví dụ reference counting.
+- [Implementation shareReplay 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — các default và ba chính sách reset.
+- [Implementation share 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/share.ts) — điều kiện reset khi refCount về 0 và notifier reset.
+- [Implementation ReplaySubject 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/ReplaySubject.ts) — replay đồng bộ, trim buffer và timestamp provider.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Operator share" href="/docs/subjects-multicasting/share" description="Chia sẻ execution và tùy chỉnh reset mà không mặc định giữ lịch sử." />
+  <Card title="ReplaySubject" href="/docs/subjects-multicasting/replay-subject" description="Hiểu buffer đứng phía sau shareReplay và thời điểm replay." />
+  <Card title="Cache cũ với shareReplay" href="/docs/troubleshooting/share-replay-stale-cache" description="Đi tiếp tới chẩn đoán stale cache và phạm vi invalidation." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm chứng output và subscription bằng virtual time." />
+</Cards>

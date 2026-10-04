@@ -3,8 +3,652 @@ title: Combination operators
 description: Kết hợp nhiều stream theo thứ tự và thời điểm emission.
 ---
 
-Trang này sẽ trình bày **Combination operators** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn có stream bộ lọc, stream dữ liệu và stream click nút tìm kiếm. Ghép chúng bằng `combineLatest` thì đổi bộ lọc cũng tạo output; dùng `withLatestFrom` thì chỉ click mới tạo output. Cùng nhận nhiều Observable, nhưng chọn sai operator có thể khiến request chạy lúc người dùng chưa yêu cầu, hoặc khiến UI chờ mãi mà không có dữ liệu.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Trang này giúp bạn chọn theo ba câu hỏi: **ai kích hoạt output, lấy value nào, và khi nào kết thúc?** Mình sẽ so sánh sáu API thường gặp: `merge`, `concat`, `combineLatest`, `withLatestFrom`, `zip` và `forkJoin`, rồi dùng `race` khi chỉ cần một source thắng.
+
+<Callout type="info" title="Phạm vi và phiên bản">
+  Ví dụ dùng API RxJS 7.8.2 và import từ `rxjs`. Bạn cần biết `next`, `complete`, `error`, subscription và `pipe()`. Phần lớn API kết hợp ở đây là creation functions; riêng `withLatestFrom` là pipeable operator. Các timeline dùng `MarbleDiagram` đã được đăng ký trong dự án.
 </Callout>
+
+## Mục lục
+
+- [Mental model của việc kết hợp stream](#mental-model-của-việc-kết-hợp-stream)
+  - [Ghép sự kiện khác ghép state](#ghép-sự-kiện-khác-ghép-state)
+  - [Creation function và pipeable operator](#creation-function-và-pipeable-operator)
+- [Bảng chọn nhanh](#bảng-chọn-nhanh)
+- [merge chuyển tiếp mọi emission](#merge-chuyển-tiếp-mọi-emission)
+- [concat subscribe từng source theo thứ tự](#concat-subscribe-từng-source-theo-thứ-tự)
+- [combineLatest tính lại từ state mới nhất](#combinelatest-tính-lại-từ-state-mới-nhất)
+  - [Đợi đủ value đầu tiên](#đợi-đủ-value-đầu-tiên)
+  - [Seed phải có ý nghĩa nghiệp vụ](#seed-phải-có-ý-nghĩa-nghiệp-vụ)
+- [withLatestFrom để một source làm trigger](#withlatestfrom-để-một-source-làm-trigger)
+  - [Trigger đến sớm không được xếp hàng](#trigger-đến-sớm-không-được-xếp-hàng)
+- [zip ghép theo số thứ tự emission](#zip-ghép-theo-số-thứ-tự-emission)
+- [forkJoin lấy kết quả cuối của các source hữu hạn](#forkjoin-lấy-kết-quả-cuối-của-các-source-hữu-hạn)
+  - [Source không complete hoặc complete rỗng](#source-không-complete-hoặc-complete-rỗng)
+  - [Giữ kết quả từng nhánh khi có lỗi](#giữ-kết-quả-từng-nhánh-khi-có-lỗi)
+- [race chọn source phản hồi trước](#race-chọn-source-phản-hồi-trước)
+- [Completion error và teardown](#completion-error-và-teardown)
+- [Ví dụ hoàn chỉnh tính giá và xác nhận đơn](#ví-dụ-hoàn-chỉnh-tính-giá-và-xác-nhận-đơn)
+- [Kiểm chứng timeline bằng TestScheduler](#kiểm-chứng-timeline-bằng-testscheduler)
+- [Ranh giới với higher-order operators](#ranh-giới-với-higher-order-operators)
+- [Những bẫy thường gặp](#những-bẫy-thường-gặp)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Mental model của việc kết hợp stream
+
+Operator kết hợp không tự biết “hai value này thuộc cùng một đơn hàng”. Nó chỉ biết policy mà bạn chọn: chuyển tiếp theo thời điểm đến, ghép theo index, lấy latest, hay chờ kết quả cuối. Vì vậy, hãy mô tả yêu cầu bằng một câu trước khi chọn tên API.
+
+### Ghép sự kiện khác ghép state
+
+Giả sử nút refresh và timer đều có thể yêu cầu tải lại dữ liệu. Mỗi emission là một **sự kiện độc lập**; `merge` đưa cả hai vào cùng pipeline, không cần giữ một value từ mỗi nguồn.
+
+Ngược lại, tổng tiền phụ thuộc số lượng và đơn giá hiện tại. Mỗi nguồn đại diện cho **state**; `combineLatest` nhớ latest value của từng nguồn để tính lại khi một bên đổi. Nếu hành động xác nhận cần chụp state hiện tại, dùng click làm trigger với `withLatestFrom`.
+
+`zip` và `forkJoin` trả tuple giống `combineLatest`, nhưng không phải những cách viết khác của cùng phép ghép. `zip` lấy value thứ nhất với thứ nhất, thứ hai với thứ hai; `forkJoin` chỉ lấy value cuối khi mọi nguồn đã xong. Cùng output type không có nghĩa là cùng lifecycle.
+
+### Creation function và pipeable operator
+
+Creation function tạo một Observable kết quả từ các nguồn đã biết:
+
+```ts
+import { combineLatest, concat, forkJoin, merge, of, zip } from 'rxjs';
+
+const a$ = of(1, 2);
+const b$ = of('x', 'y');
+
+const events$ = merge(a$, b$);
+const sequential$ = concat(a$, b$);
+const latest$ = combineLatest([a$, b$]);
+const pairs$ = zip([a$, b$]);
+const final$ = forkJoin({ count: a$, label: b$ });
+```
+
+Không function nào ở trên bắt đầu subscription chỉ vì bạn gọi nó. Khi subscriber đăng ký vào output, function mới subscribe các input theo policy tương ứng. Điều này không làm một producer eager như Promise đã tạo sẵn trở thành lazy.
+
+Nếu đã có một source trong pipeline, bạn có thể dùng các bản pipeable có hậu tố `With`:
+
+```ts
+import { combineLatestWith, concatWith, mergeWith, of, zipWith } from 'rxjs';
+
+const a$ = of(1, 2);
+const b$ = of('x', 'y');
+
+const events$ = a$.pipe(mergeWith(b$));
+const sequential$ = a$.pipe(concatWith(b$));
+const latest$ = a$.pipe(combineLatestWith(b$));
+const pairs$ = a$.pipe(zipWith(b$));
+```
+
+Mình dùng static function khi nhiều nguồn có vai trò ngang nhau, và bản `With` khi nó giúp đọc pipeline từ trái sang phải. `forkJoin` không có bản `forkJoinWith`; `withLatestFrom` vốn là pipeable operator và giữ vai trò trigger riêng cho source đứng trước `pipe()`.
+
+<Callout type="info" title="Tránh nhầm với API cũ">
+  Các bản pipeable tên `merge`, `concat`, `combineLatest`, `zip`, `race` trong `rxjs/operators` là API deprecated của RxJS 7; dùng `mergeWith`, `concatWith`, `combineLatestWith`, `zipWith`, `raceWith` cho code mới. Static functions cùng tên import từ `rxjs` không bị deprecated chỉ vì vậy. Với static `combineLatest` và `forkJoin`, ưu tiên array hoặc object thay cho overload rest arguments deprecated.
+</Callout>
+
+## Bảng chọn nhanh
+
+| Yêu cầu | Chọn | Điều kiện để phát output | Value được giữ |
+| --- | --- | --- | --- |
+| Nhiều nguồn cùng tạo sự kiện độc lập | `merge(a$, b$)` | Bất kỳ source đang subscribe nào phát | Không ghép hoặc buffer value |
+| Chạy nguồn sau khi nguồn trước xong | `concat(a$, b$)` | Source hiện tại phát; source sau phải đợi complete | Không buffer sự kiện đã xảy ra của hot source chưa subscribe |
+| Tính derived state khi bất kỳ input đổi | `combineLatest([a$, b$])` | Mọi source đã phát ít nhất một lần | Một latest value mỗi source |
+| Một hành động lấy state hiện tại | `trigger$.pipe(withLatestFrom(state$))` | Trigger phát sau khi các nguồn phụ đã có value | Latest value của mỗi nguồn phụ |
+| Ghép phần tử thứ n của từng nguồn | `zip([a$, b$])` | Mỗi buffer có ít nhất một value | Các value chưa ghép của từng nguồn |
+| Chờ tất cả tác vụ rồi lấy kết quả cuối | `forkJoin({ a: a$, b: b$ })` | Mỗi source đã phát và tất cả đã complete | Một last value mỗi source |
+| Chỉ theo source phản hồi trước | `race([a$, b$])` | Một source phát trước; terminal notification sớm cũng có thể kết thúc race | Không ghép; unsubscribe các source thua |
+
+Với UI reactive, mặc định mình chọn `combineLatest` cho derived state và `withLatestFrom` cho hành động. Với một nhóm request hữu hạn cần kết quả đầy đủ, chọn `forkJoin`. Đừng chọn `zip` chỉ vì muốn “ghép hai stream”: việc ghép theo số thứ tự phải là yêu cầu thật.
+
+## merge chuyển tiếp mọi emission
+
+`merge` subscribe các nguồn đồng thời theo nghĩa **các subscription cùng hoạt động**, rồi chuyển tiếp từng value khi nó đến. Nó không tạo tuple, không đợi đủ input và không tự tạo thread để chạy JavaScript song song.
+
+Đọc theo cột dọc: output giữ nguyên value của source phát ở cột đó.
+
+<MarbleDiagram
+  title="merge(A, B)"
+  rows={[
+    { label: 'A', marble: '-a---b----|', kind: 'source' },
+    { label: 'B', marble: '---x---y----|', kind: 'source' },
+    { label: 'output', marble: '-a-x-b-y----|', kind: 'output' },
+  ]}
+  values={{ a: 'A lần 1', b: 'A lần 2', x: 'B lần 1', y: 'B lần 2' }}
+  caption="A complete ở frame 10, nhưng output đợi B complete ở frame 12."
+/>
+
+Các emission ở frame 1, 3, 5, 7 đều được chuyển tiếp. A complete không làm output dừng vì B vẫn còn hoạt động; một error từ nguồn đang subscribe thì kết thúc toàn bộ kết quả.
+
+Khi gộp sự kiện khác loại, hãy giữ dấu vết nguồn bằng một tag thay vì đoán qua cấu trúc value:
+
+```ts
+import { map, merge, Subject } from 'rxjs';
+
+const refresh$ = new Subject<void>();
+const reconnect$ = new Subject<void>();
+
+const reload$ = merge(
+  refresh$.pipe(map(() => ({ reason: 'manual' as const }))),
+  reconnect$.pipe(map(() => ({ reason: 'reconnect' as const }))),
+);
+
+const subscription = reload$.subscribe(console.log);
+refresh$.next();   // { reason: 'manual' }
+reconnect$.next(); // { reason: 'reconnect' }
+subscription.unsubscribe();
+```
+
+`merge(a$, b$, c$, 2)` có thể giới hạn hai input subscription cùng lúc. Nguồn tiếp theo đợi một nguồn đang chạy complete. Đó là giới hạn subscription, không phải bảo đảm một Promise đã tạo sẵn chưa chạy; nếu cần giới hạn công việc được tạo từ từng event, xem `mergeMap(project, concurrency)`.
+
+## concat subscribe từng source theo thứ tự
+
+`concat` không chỉ sắp xếp output; nó **trì hoãn subscription** vào nguồn tiếp theo. A phải complete thì B mới được subscribe. Error từ A không được coi là “xong để chuyển sang B”; nó làm output error.
+
+Timeline dưới dùng B là cold Observable: delay của B bắt đầu khi B được subscribe ở frame 4, không phải từ đầu sơ đồ.
+
+<MarbleDiagram
+  title="concat(A, B)"
+  rows={[
+    { label: 'A', marble: '-a--|', kind: 'source' },
+    { label: 'B', marble: '----^-x--y|', kind: 'inner' },
+    { label: 'output', marble: '-a----x--y|', kind: 'output' },
+  ]}
+  values={{ a: 'Kết quả A', x: 'B lần 1', y: 'B lần 2' }}
+  caption="B subscribe ở frame 4, phát x ở frame 6, y ở frame 9 và complete ở frame 10."
+/>
+
+Ở frame 4, completion của A mở subscription vào B ngay. Các value `x`, `y` chỉ có thể xuất hiện sau thời điểm này; output complete cùng B ở frame 10.
+
+Một ứng dụng đơn giản là hiển thị snapshot cache trước, rồi cập nhật từ nguồn mới:
+
+```ts
+import { concat, delay, of } from 'rxjs';
+
+const cached$ = of({ origin: 'cache', items: ['old'] });
+const fresh$ = of({ origin: 'network', items: ['new'] }).pipe(delay(100));
+
+concat(cached$, fresh$).subscribe(console.log);
+
+// Ngay: { origin: 'cache', items: ['old'] }
+// Sau khoảng 100 ms: { origin: 'network', items: ['new'] }
+// Sau đó complete.
+```
+
+`fresh$` ở đây là dữ liệu giả để minh họa timing. Với request Promise thật, dùng `defer(() => fetch(...))` nếu bạn cần request chỉ bắt đầu khi tới lượt subscribe.
+
+<Callout type="warn" title="concat không giữ lại event từ hot source">
+  Nếu A là `interval()` không có ranh giới completion, B không bao giờ được subscribe. Nếu B là `Subject` đã phát trong lúc A còn chạy, `concat` không xếp những event đó vào hàng đợi để phát lại. Dùng replay có chủ đích nếu cần lịch sử; dùng `merge` nếu cả hai nguồn phải được nghe ngay.
+</Callout>
+
+## combineLatest tính lại từ state mới nhất
+
+`combineLatest` nhớ một latest value cho mỗi input. Sau khi mọi nguồn có ít nhất một value, bất kỳ input nào phát cũng tạo output mới. Tuple giữ **thứ tự argument**, không phải thứ tự source phát; dạng object giữ các key bạn đã đặt.
+
+### Đợi đủ value đầu tiên
+
+So sánh cùng hai nguồn trong phần `merge`, nhưng lần này output là tuple. Các ký hiệu `p`, `q`, `r` đại diện cho tuple, không phải value được chuyển tiếp nguyên trạng.
+
+<MarbleDiagram
+  title="combineLatest([A, B])"
+  rows={[
+    { label: 'A', marble: '-a---b----|', kind: 'source' },
+    { label: 'B', marble: '---x---y----|', kind: 'source' },
+    { label: 'output', marble: '---p-q-r----|', kind: 'output' },
+  ]}
+  values={{ a: 'A lần 1', b: 'A lần 2', x: 'B lần 1', y: 'B lần 2', p: '[a, x]', q: '[b, x]', r: '[b, y]' }}
+  caption="B phát x ở frame 3 thì mới đủ input. Sau đó cả A lẫn B đều có thể kích hoạt output."
+/>
+
+A phát `a` ở frame 1 nhưng chưa có B nên output im lặng. B phát `x` ở frame 3 tạo `[a, x]`; A phát `b` ở frame 5 tạo `[b, x]`; B phát `y` ở frame 7 tạo `[b, y]`. Completion ở frame 10 của A không tạo thêm output; latest `b` vẫn dùng được nếu B còn phát sau đó.
+
+Trước khi mọi nguồn có value, `combineLatest` chỉ giữ latest, không giữ toàn bộ lịch sử của nguồn nhanh. Ví dụ đồng bộ sau thường làm người mới bất ngờ:
+
+```ts
+import { combineLatest, of } from 'rxjs';
+
+combineLatest([of(1, 2, 3), of('x', 'y')]).subscribe(console.log);
+
+// [3, 'x']
+// [3, 'y']
+```
+
+Subscription vào input được thiết lập theo thứ tự. Nguồn thứ nhất đã phát hết `1, 2, 3` trước khi nguồn thứ hai bắt đầu, nên chỉ `3` còn là latest. Đây không phải phép tích Descartes, cũng không phải phép ghép theo index.
+
+### Seed phải có ý nghĩa nghiệp vụ
+
+DOM event thường chưa có value cho tới khi người dùng thao tác. Nếu form cần tính ngay từ giá trị mặc định, `startWith` hoặc `BehaviorSubject` cung cấp initial state:
+
+```ts
+import { combineLatest, map, startWith, Subject } from 'rxjs';
+
+const quantityChanges$ = new Subject<number>();
+const priceChanges$ = new Subject<number>();
+
+const total$ = combineLatest({
+  quantity: quantityChanges$.pipe(startWith(1)),
+  price: priceChanges$.pipe(startWith(100_000)),
+}).pipe(map(({ quantity, price }) => quantity * price));
+
+const subscription = total$.subscribe(console.log);
+// 100000
+quantityChanges$.next(2); // 200000
+priceChanges$.next(90_000); // 180000
+subscription.unsubscribe();
+```
+
+Seed `1` và `100_000` là giả định cho ví dụ, phải thay bằng state thật của form. Nếu giá chưa tải xong thì `startWith(0)` có thể tạo tổng tiền sai chứ không chỉ “mở khóa stream”. Hãy mô hình hóa state `loading` hoặc chặn hành động cho tới khi dữ liệu sẵn sàng.
+
+`startWith(value)` luôn thêm value đầu cho mỗi subscription, kể cả khi source sẽ phát dữ liệu. `defaultIfEmpty(value)` chỉ thêm fallback nếu source complete mà chưa phát gì; nó không giúp một event stream chưa emit và chưa complete.
+
+## withLatestFrom để một source làm trigger
+
+`withLatestFrom` lấy latest từ các nguồn phụ, nhưng **chỉ source chính kích hoạt output**. Đây là lựa chọn cho “khi người dùng bấm xác nhận, lấy form hiện tại”, không phải “mỗi khi form đổi, gửi xác nhận lại”.
+
+Trong timeline dưới, A là trigger và B là state. Đọc cột của A để biết lúc nào operator có cơ hội phát.
+
+<MarbleDiagram
+  title="A.pipe(withLatestFrom(B))"
+  rows={[
+    { label: 'A trigger', marble: '-a---b----|', kind: 'source' },
+    { label: 'B state', marble: '---x---y----|', kind: 'source' },
+    { label: 'output', marble: '-----q----|', kind: 'output' },
+  ]}
+  values={{ a: 'Trigger sớm', b: 'Trigger đã sẵn sàng', x: 'State lần 1', y: 'State lần 2', q: '[b, x]' }}
+  caption="Chỉ trigger b ở frame 5 tạo output. B đổi sang y ở frame 7 không tạo emission mới."
+/>
+
+Trigger `a` ở frame 1 tới khi B chưa có value nên bị bỏ. Khi B có `x` ở frame 3, operator chỉ cập nhật state; tới `b` ở frame 5 mới phát `[b, x]`. A complete ở frame 10 thì output complete và unsubscribe B, không đợi completion dự kiến ở frame 12.
+
+### Trigger đến sớm không được xếp hàng
+
+Bạn có thể kiểm tra hành vi này mà không cần timer:
+
+```ts
+import { Subject, withLatestFrom } from 'rxjs';
+
+const confirm$ = new Subject<string>();
+const form$ = new Subject<{ quantity: number }>();
+
+const subscription = confirm$.pipe(withLatestFrom(form$)).subscribe(console.log);
+
+confirm$.next('early'); // Không có output, không được phát lại sau này.
+form$.next({ quantity: 2 }); // Chỉ cập nhật latest.
+confirm$.next('ready'); // ['ready', { quantity: 2 }]
+form$.next({ quantity: 3 }); // Không có output.
+confirm$.complete(); // Output complete và gỡ subscription vào form$.
+subscription.unsubscribe();
+```
+
+Nếu trigger sớm phải được xử lý, bạn cần một policy khác: vô hiệu hóa nút trước khi ready, cung cấp initial state hợp lệ, hoặc thiết kế hàng đợi rõ ràng. Đừng dùng `startWith` với dữ liệu giả để che mất trạng thái “chưa sẵn sàng”.
+
+Một nguồn phụ đã emit rồi complete vẫn cung cấp latest value cho các trigger sau. Một nguồn phụ complete rỗng làm điều kiện ready không bao giờ đạt; trong RxJS 7.8.2, output vẫn đợi source chính complete hoặc unsubscribe. Error ở nguồn phụ vẫn kết thúc output ngay.
+
+## zip ghép theo số thứ tự emission
+
+`zip` có buffer riêng cho từng nguồn. Khi mọi buffer có ít nhất một value, nó lấy value cũ nhất từ từng buffer và phát tuple. Thời gian đến chỉ quyết định **khi nào đủ một bộ**, không quyết định value nào ghép với nhau.
+
+Đối chiếu với `combineLatest`: A đã đổi sang `b` ở frame 5, nhưng bộ thứ hai phải chờ `y` ở frame 7.
+
+<MarbleDiagram
+  title="zip([A, B])"
+  rows={[
+    { label: 'A', marble: '-a---b----|', kind: 'source' },
+    { label: 'B', marble: '---x---y----|', kind: 'source' },
+    { label: 'output', marble: '---p---r--|', kind: 'output' },
+  ]}
+  values={{ a: 'A lần 1', b: 'A lần 2', x: 'B lần 1', y: 'B lần 2', p: '[a, x]', r: '[b, y]' }}
+  caption="Bộ thứ nhất phát ở frame 3, bộ thứ hai ở frame 7. A complete với buffer rỗng ở frame 10 nên không thể ghép thêm."
+/>
+
+`a` đợi trong buffer từ frame 1 tới frame 3. Tương tự, `b` đợi `y` từ frame 5 tới frame 7. Khi A complete ở frame 10 và buffer của A đã rỗng, output complete, đồng thời unsubscribe B.
+
+```ts
+import { of, zip } from 'rxjs';
+
+zip([of('order-1', 'order-2', 'order-3'), of(100, 200)]).subscribe({
+  next: (pair) => console.log(pair),
+  complete: () => console.log('complete'),
+});
+
+// ['order-1', 100]
+// ['order-2', 200]
+// complete — order-3 không có partner.
+```
+
+Nếu một source đã complete nhưng buffer còn value, `zip` vẫn có thể ghép các value đó với nguồn khác. Nó dừng khi một nguồn đã complete **và buffer của nguồn ấy đã cạn**, chứ không luôn dừng ngay khi thấy completion đầu tiên.
+
+<Callout type="warn" title="zip không phải backpressure hay join theo ID">
+  Nguồn nhanh có thể liên tục làm buffer phình trong khi nguồn chậm chưa đủ value. `zip` không yêu cầu producer nhanh giảm tốc. Nó cũng không kiểm tra `orderId`: nếu hai luồng khác thứ tự hoặc mất một event, ghép theo index có thể nối nhầm dữ liệu. Chỉ dùng khi thứ tự tương ứng là một invariant thật của hệ thống.
+</Callout>
+
+## forkJoin lấy kết quả cuối của các source hữu hạn
+
+`forkJoin` subscribe các input, ghi nhớ last value của mỗi nguồn và đợi tất cả complete. Nếu mỗi nguồn đều đã emit, nó phát đúng một array hoặc object kết quả rồi complete. Với request HTTP phát một response và complete, đây thường là policy bạn cần khi tải dữ liệu ban đầu cho màn hình.
+
+Dùng lại hai nguồn trước để thấy output không xuất hiện ở frame 7 dù lúc đó đã có cả `b` và `y`.
+
+<MarbleDiagram
+  title="forkJoin([A, B])"
+  rows={[
+    { label: 'A', marble: '-a---b----|', kind: 'source' },
+    { label: 'B', marble: '---x---y----|', kind: 'source' },
+    { label: 'output', marble: '------------(r|)', kind: 'output' },
+  ]}
+  values={{ a: 'A lần 1', b: 'A cuối', x: 'B lần 1', y: 'B cuối', r: '[b, y]' }}
+  caption="Ở frame 12, B complete nên forkJoin phát [b, y] rồi complete trong cùng frame."
+/>
+
+A xong ở frame 10 nhưng B còn hoạt động. Tới frame 12 mới đủ điều kiện; nhóm `(r|)` biểu diễn `next` và `complete` cùng frame, một cú pháp renderer của dự án hỗ trợ. `forkJoin` giữ value cuối, không trả toàn bộ lịch sử của từng nguồn.
+
+Dạng object giúp tránh nhầm vị trí khi số request tăng:
+
+```ts
+import { delay, forkJoin, of } from 'rxjs';
+
+const profile$ = of({ id: 'u1', name: 'An' }).pipe(delay(100));
+const permissions$ = of(['read', 'write']).pipe(delay(200));
+
+forkJoin({ profile: profile$, permissions: permissions$ }).subscribe({
+  next: (data) => console.log(data),
+  error: (error) => console.error(error),
+  complete: () => console.log('complete'),
+});
+
+// Sau khoảng 200 ms:
+// { profile: { id: 'u1', name: 'An' }, permissions: ['read', 'write'] }
+// complete
+```
+
+Đây là request giả lập; timing thật phụ thuộc network và scheduler. Nếu nguồn thực phát progress nhiều lần, last value phải đúng là response mà consumer cần, hoặc bạn phải lọc và giới hạn nguồn trước khi đưa vào `forkJoin`.
+
+### Source không complete hoặc complete rỗng
+
+Hai loại “không có kết quả” này rất khác nhau:
+
+```ts
+import { EMPTY, forkJoin, interval, of, take } from 'rxjs';
+
+forkJoin({ tick: interval(1_000), label: of('ready') });
+// Nếu subscribe: không có output vì interval không complete.
+
+forkJoin({ tick: interval(1_000).pipe(take(1)), label: of('ready') });
+// Nếu subscribe: { tick: 0, label: 'ready' } sau tick đầu rồi complete.
+
+forkJoin([EMPTY, of('ready')]).subscribe({
+  next: console.log,
+  complete: () => console.log('complete without value'),
+});
+// Chỉ log complete without value trong RxJS 7.8.2.
+```
+
+`take(1)` có nghĩa “lấy snapshot đầu tiên”, không phải cách sửa chung cho mọi source. Nếu business cần stream cập nhật liên tục, thay `forkJoin` bằng `combineLatest`; nếu cần đợi tác vụ kết thúc thật, hãy tìm đúng tín hiệu completion.
+
+Trong RxJS 7.8.2, một input complete rỗng khiến `forkJoin` complete mà không phát kết quả. Dùng `defaultIfEmpty(fallback)` trên **input đó** nếu “không có dữ liệu” có một fallback hợp lệ. `forkJoin([])` và `forkJoin({})` cũng complete ngay, không phát `[]` hoặc `{}`.
+
+### Giữ kết quả từng nhánh khi có lỗi
+
+Mặc định một input error làm cả `forkJoin` error và unsubscribe những input khác. `catchError` đặt **sau** `forkJoin` chỉ đổi lỗi của cả nhóm thành một fallback; nó không lấy lại các kết quả đã nằm trong bộ nhớ nội bộ.
+
+Nếu màn hình cho phép một phần dữ liệu thất bại, chuyển error thành value ngay tại nhánh đó:
+
+```ts
+import { catchError, forkJoin, map, of, throwError } from 'rxjs';
+import type { Observable } from 'rxjs';
+
+type Result<T> =
+  | { status: 'ok'; value: T }
+  | { status: 'error'; message: string };
+
+function asResult<T>(source$: Observable<T>): Observable<Result<T>> {
+  return source$.pipe(
+    map((value): Result<T> => ({ status: 'ok', value })),
+    catchError((error: unknown) => of<Result<T>>({
+      status: 'error',
+      message: error instanceof Error ? error.message : String(error),
+    })),
+  );
+}
+
+forkJoin({
+  profile: asResult(of({ id: 'u1', name: 'An' })),
+  recommendations: asResult(
+    throwError(() => new Error('recommendation service unavailable')),
+  ),
+}).subscribe(console.log);
+
+// {
+//   profile: { status: 'ok', value: { id: 'u1', name: 'An' } },
+//   recommendations: {
+//     status: 'error', message: 'recommendation service unavailable'
+//   }
+// }
+```
+
+Một `Result` phân biệt lỗi với danh sách rỗng hợp lệ; trả `[]` cho mọi lỗi dễ làm UI hiển thị “không có gợi ý” trong khi service đang hỏng. Helper này chỉ đổi **error**, không xử lý source complete rỗng hay source không complete. Hãy quyết định những trường hợp đó riêng, và đừng nuốt lỗi của nhánh bắt buộc nếu màn hình không thể hoạt động khi thiếu nó.
+
+## race chọn source phản hồi trước
+
+`race` không ghép kết quả. Khi một nguồn phát `next` trước, nó unsubscribe các nguồn thua và tiếp tục mirror **toàn bộ stream của nguồn thắng**, không chỉ value đầu tiên.
+
+Timeline dưới cho thấy B thắng ở frame 1, còn A bị unsubscribe trước emission dự kiến ở frame 3.
+
+<MarbleDiagram
+  title="race([A, B])"
+  rows={[
+    { label: 'A sub', marble: '^!', kind: 'subscription' },
+    { label: 'B', marble: '-x--y|', kind: 'source' },
+    { label: 'output', marble: '-x--y|', kind: 'output' },
+  ]}
+  values={{ x: 'B phản hồi đầu', y: 'B phản hồi tiếp' }}
+  caption="A unsubscribe ở frame 1; B tiếp tục phát y ở frame 4 rồi complete ở frame 5."
+/>
+
+Dấu `!` là unsubscribe chứ không phải A complete. B vẫn hoạt động sau khi thắng; nếu bạn chỉ muốn một kết quả, thêm `take(1)` vào output.
+
+```ts
+import { delay, of, race } from 'rxjs';
+
+const primary$ = of({ from: 'primary' }).pipe(delay(200));
+const replica$ = of({ from: 'replica' }).pipe(delay(100));
+
+race([primary$, replica$]).subscribe(console.log);
+// Sau khoảng 100 ms: { from: 'replica' }, rồi complete.
+```
+
+<Callout type="warn" title="Phản hồi trước không có nghĩa thành công trước">
+  Trong RxJS 7.8.2, error hoặc completion rỗng đến trước `next` có thể kết thúc cả race. `race([EMPTY, request$])` có thể complete ngay mà không nhận response; một lỗi nhanh cũng có thể chặn kết quả thành công chậm hơn. Đừng dùng `race` như một API “thử tất cả rồi lấy thành công đầu tiên” nếu chưa thiết kế policy lỗi và nhánh rỗng.
+</Callout>
+
+Input subscribe theo thứ tự; nếu nguồn đầu thắng đồng bộ, các nguồn sau có thể chưa được subscribe. Và unsubscribe chỉ hủy tác vụ nền nếu producer có teardown tương ứng: Observable bọc Promise không tự hủy Promise hay `fetch` đã chạy. Với request thật, hãy kiểm tra cơ chế abort và cân nhắc tải tăng thêm do chạy nhiều nhánh cùng lúc.
+
+## Completion error và teardown
+
+Chọn operator xong vẫn phải kiểm tra ai làm output kết thúc. Bảng dưới mô tả RxJS 7.8.2, giả sử không có error và consumer chưa unsubscribe:
+
+| API | Khi nào output complete? | Một input complete rỗng |
+| --- | --- | --- |
+| `merge` | Khi tất cả input đã complete | Không có value từ input đó, các input khác tiếp tục |
+| `concat` | Khi nguồn cuối cùng complete | Chuyển sang nguồn tiếp theo |
+| `combineLatest` | Khi tất cả input đã complete | Không đủ bộ value nên không có output; implementation 7.8.2 vẫn đợi các input còn lại complete |
+| `withLatestFrom` | Khi source chính complete | Nguồn phụ rỗng khiến không ready; vẫn đợi source chính |
+| `zip` | Khi một input đã complete và buffer của nó rỗng | Không thể ghép nên complete |
+| `forkJoin` | Phát một kết quả khi đủ last value và tất cả complete | Complete không có value ngay khi nhánh rỗng kết thúc |
+| `race` | Theo nguồn thắng; terminal notification sớm có thể kết thúc trước khi có winner `next` | Có thể complete không có value trước response khác |
+
+<Callout type="warn" title="Đừng suy ra thời điểm complete từ việc không thể ghép">
+  JSDoc của `combineLatest` 7.8.2 mô tả trường hợp input complete rỗng là complete ngay, nhưng implementation `combineLatestInit` chỉ complete khi bộ đếm input đang hoạt động về 0. Vì vậy `combineLatest([EMPTY, NEVER])` không emit và cũng không tự complete trong phiên bản này. Nếu code phụ thuộc vào edge case đó, hãy viết test theo phiên bản thực tế thay vì dùng mô tả tổng quát làm cam kết.
+</Callout>
+
+Với các API trên, error từ một input đang subscribe thường được chuyển xuống output ngay; các subscription con đang hoạt động được teardown. Một nguồn đã bị `race` loại, chưa đến lượt `concat`, hoặc đã bị output unsubscribe không còn được quan sát như một input đang chạy.
+
+Consumer gọi `unsubscribe()` cũng teardown các input đang subscribe, nhưng **không gửi notification `complete`** cho observer. Teardown có thể gỡ event listener, hủy timer hoặc abort request nếu producer hỗ trợ. Nó không rollback tác vụ đã thực hiện, không trả lại event đã bỏ, và không tự biến những cold subscription riêng thành một request dùng chung.
+
+## Ví dụ hoàn chỉnh tính giá và xác nhận đơn
+
+Giả sử form có số lượng và đơn giá. UI cần cập nhật tổng tiền khi một trong hai đổi, nhưng lệnh xác nhận chỉ được tạo khi người dùng bấm nút. Đây là hai pipeline khác nhau, không nên gộp thành một `combineLatest` giữa click và state.
+
+```ts
+import { BehaviorSubject, combineLatest, map, Subject, withLatestFrom } from 'rxjs';
+
+type Quote = { quantity: number; unitPrice: number; total: number };
+type OrderCommand = { requestId: string; quote: Quote };
+
+const quantity$ = new BehaviorSubject(1);
+const unitPrice$ = new BehaviorSubject(100_000);
+const confirm$ = new Subject<string>();
+
+const quote$ = combineLatest({ quantity: quantity$, unitPrice: unitPrice$ }).pipe(
+  map(({ quantity, unitPrice }): Quote => ({
+    quantity,
+    unitPrice,
+    total: quantity * unitPrice,
+  })),
+);
+
+const orderCommand$ = confirm$.pipe(
+  withLatestFrom(quote$),
+  map(([requestId, quote]): OrderCommand => ({ requestId, quote })),
+);
+
+const viewSubscription = quote$.subscribe((quote) => {
+  console.log('UI total:', quote.total);
+});
+const commandSubscription = orderCommand$.subscribe((command) => {
+  console.log('command:', command);
+});
+
+// UI total: 100000
+quantity$.next(2); // UI total: 200000 — chưa có command.
+unitPrice$.next(90_000); // UI total: 180000 — chưa có command.
+confirm$.next('req-1');
+// command: {
+//   requestId: 'req-1',
+//   quote: { quantity: 2, unitPrice: 90000, total: 180000 }
+// }
+quantity$.next(3); // UI total: 270000 — không gửi lại command.
+
+// Khi view bị hủy:
+viewSubscription.unsubscribe();
+commandSubscription.unsubscribe();
+```
+
+`BehaviorSubject` cung cấp initial state thật của ví dụ cho mỗi subscriber, nên pipeline command có quote ngay. Hai subscription vào `quote$` tính projection riêng; ở đây projection thuần và nguồn là state Subject nên không tạo hai request. Nếu thay nguồn bằng cold HTTP, phải quyết định chia sẻ và cache trước, không tự động thêm `shareReplay` mà bỏ qua lifetime của dữ liệu.
+
+Ví dụ chỉ tạo command, chưa gửi API và chưa chống double-submit. Backend vẫn phải kiểm tra giá và tính hợp lệ của đơn; snapshot UI không phải một transaction. Khi nối command với request ghi, hãy chọn `concatMap` nếu cần xếp hàng hoặc `exhaustMap` nếu cần bỏ click mới lúc request đang chạy. Đừng chọn `switchMap` cho thao tác ghi chỉ vì muốn “latest”: unsubscribe không bảo đảm backend chưa thực hiện lệnh cũ.
+
+## Kiểm chứng timeline bằng TestScheduler
+
+Các sơ đồ phía trên dùng frame bắt đầu từ 0. Trong `TestScheduler.run()`, mỗi dấu `-` trong các chuỗi này tương ứng một virtual millisecond; bài học nằm ở thứ tự frame, không phải thời gian network thật.
+
+Đoạn test dưới chạy trong môi trường Node có RxJS 7.8.2. Nó kiểm tra output của cả bảy sơ đồ và subscription bị trì hoãn hoặc hủy. Visual row của B trong sơ đồ `concat` chứa cả `^` lẫn notification; test tách chúng thành `cold()` và `expectSubscriptions()`.
+
+```ts
+import { deepStrictEqual } from 'node:assert';
+import { combineLatest, concat, EMPTY, forkJoin, merge, race, withLatestFrom, zip } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const a$ = cold('-a---b----|');
+  const b$ = cold('---x---y----|');
+  const pairs = {
+    p: ['a', 'x'],
+    q: ['b', 'x'],
+    r: ['b', 'y'],
+  };
+
+  expectObservable(merge(a$, b$)).toBe('-a-x-b-y----|');
+  expectObservable(combineLatest([a$, b$])).toBe('---p-q-r----|', pairs);
+  expectObservable(a$.pipe(withLatestFrom(b$))).toBe('-----q----|', pairs);
+  expectObservable(zip([a$, b$])).toBe('---p---r--|', pairs);
+  expectObservable(forkJoin([a$, b$])).toBe('------------(r|)', pairs);
+
+  const first$ = cold('-a--|');
+  const second$ = cold('--x--y|');
+  expectObservable(concat(first$, second$)).toBe('-a----x--y|');
+  expectSubscriptions(first$.subscriptions).toBe('^---!');
+  expectSubscriptions(second$.subscriptions).toBe('----^-----!');
+
+  const slow$ = cold('---a--|');
+  const fast$ = cold('-x--y|');
+  expectObservable(race([slow$, fast$])).toBe('-x--y|');
+  expectSubscriptions(slow$.subscriptions).toBe('^!');
+  expectSubscriptions(fast$.subscriptions).toBe('^----!');
+
+  // Edge case theo implementation 7.8.2: không tự complete.
+  const never$ = cold('------');
+  expectObservable(combineLatest([EMPTY, never$]), '---!').toBe('');
+  expectSubscriptions(never$.subscriptions).toBe('^--!');
+
+  expectObservable(forkJoin([EMPTY, cold('--x|')])).toBe('|');
+  expectObservable(race([EMPTY, cold('--x|')])).toBe('|');
+});
+```
+
+TestScheduler đếm vị trí trong chuỗi `(r|)` theo cú pháp marble testing, còn renderer gom nhóm vào một cột. Ở ví dụ này nhóm ở cuối chuỗi nên cả hai vẫn đặt notification ở frame 12; nếu thêm notification sau nhóm, phải tính lại alignment thay vì copy chuỗi visual một cách máy móc.
+
+## Ranh giới với higher-order operators
+
+Các ví dụ chính nhận những input Observable đã biết. Nếu mỗi event tạo một request mới, bạn đang có bài toán **higher-order**: cần quyết định subscribe những inner Observable nào, khi nào, và xử lý overlap ra sao.
+
+| Đã biết các nguồn | Nguồn được tạo theo từng value của outer |
+| --- | --- |
+| `merge(a$, b$)` | `outer$.pipe(mergeMap(project))` |
+| `concat(a$, b$)` | `outer$.pipe(concatMap(project))` |
+| `combineLatest([a$, b$])` | `outerOfStreams$.pipe(combineLatestAll())` nếu muốn thu thập toàn bộ inner rồi kết hợp |
+| `zip([a$, b$])` | `outerOfStreams$.pipe(zipAll())` nếu muốn thu thập toàn bộ inner rồi ghép theo index |
+
+`combineLatestAll` và `zipAll` đợi **outer complete** trước khi subscribe tập inner đã thu thập. Đừng dùng chúng trên một outer event stream sống mãi rồi chờ UI cập nhật. `mergeAll` và `concatAll` flatten inner; chúng không ghép tuple latest hay tuple theo index.
+
+Khi outer value mới phải hủy request cũ, đó là `switchMap`; khi phải bỏ trigger mới trong lúc request còn chạy, đó là `exhaustMap`. Hai policy này không được thay thế bằng `combineLatest` hay `withLatestFrom`. `withLatestFrom` chỉ chụp state tại trigger, còn operator phía sau quyết định công việc async chạy thế nào.
+
+## Những bẫy thường gặp
+
+1. **Dùng `combineLatest` cho lệnh submit.** Sau click đầu, mỗi lần state đổi có thể kích hoạt output mới với latest click cũ. Dùng `withLatestFrom` khi click phải là trigger duy nhất.
+2. **Chờ `withLatestFrom` phát lại click sớm.** Nó bỏ trigger chưa đủ state, không buffer trigger để replay.
+3. **Cho rằng `combineLatest` trả mọi tổ hợp.** Nó giữ latest; input đồng bộ phát trước có thể chỉ còn value cuối khi input khác bắt đầu.
+4. **Dùng `forkJoin` với WebSocket hoặc `interval` không complete.** Có latest data vẫn chưa đủ; phải có completion hoặc chọn API cập nhật liên tục.
+5. **Dùng `catchError(() => EMPTY)` trong một nhánh `forkJoin`.** Trong 7.8.2, nhánh trở thành rỗng có thể khiến cả nhóm complete không có kết quả. Trả một value fallback rõ nghĩa nếu đó là policy mong muốn.
+6. **Dùng `zip` để nối theo ID.** Index emission không phải business key; buffer cũng có thể tăng không giới hạn nếu tốc độ lệch lâu dài.
+7. **Tưởng `concat` xếp hàng event của mọi input.** Nó chưa subscribe nguồn sau, nên có thể bỏ lỡ event hot đã xảy ra.
+8. **Hiểu đồng thời là đa luồng.** `merge` cho subscription overlap; JavaScript callback vẫn chạy theo execution model của môi trường.
+9. **Hiểu unsubscribe là rollback hoặc abort chắc chắn.** Producer cần hỗ trợ teardown; một request đã tới server không được hoàn tác bởi operator.
+10. **Subscribe output nhiều lần mà không kiểm tra cold source.** Mỗi subscription có thể tạo lại request; combination không mặc định multicast.
+
+Trước khi triển khai, ghi ra một timeline gồm value đầu tiên, completion và error cho mỗi input. Nếu không thể nói chính xác output sẽ phát lúc nào và ai dọn subscription, hãy viết một test nhỏ như phần trên trước khi nối thêm logic UI.
+
+## Bài tập tự kiểm tra
+
+1. Với A `-a---b----|` và B `---x---y----|`, viết output của `merge`, `combineLatest`, `withLatestFrom`, `zip`, `forkJoin` trước khi chạy test.
+2. Thay B bằng source chưa phát value nào. `combineLatest` và `withLatestFrom` có emit không? Thêm seed hợp lệ và giải thích state nghiệp vụ mà seed đại diện.
+3. Cho A emit ba value rồi complete; B emit chậm hai value. Vẽ buffer của `zip` sau mỗi frame và chỉ ra value nào không có partner.
+4. Thay một nhánh `forkJoin` bằng `EMPTY`, rồi bằng `NEVER`. So sánh `next`, `complete`, và nhu cầu unsubscribe trong RxJS 7.8.2.
+5. Trong ví dụ đơn hàng, thay `withLatestFrom(quote$)` bằng `combineLatest([confirm$, quote$])`. Click một lần rồi đổi số lượng; xác định vì sao command bị tạo lại.
+6. Tạo `concat(a$, subject$)` và cho `subject$` phát trước khi A complete. So sánh với `merge` để thấy subscription timing quan trọng hơn tên “kết hợp”.
+
+Lấy một pipeline có nhiều nguồn trong dự án của bạn và ghi câu policy ngay bên cạnh nó: “mọi event”, “nguồn sau đợi nguồn trước”, “mọi state đổi”, “chỉ trigger”, “ghép theo index”, hay “kết quả cuối”. Nếu không câu nào khớp, có thể bạn cần một workflow higher-order hoặc join theo key, không phải thêm một combination operator.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Creation operators" href="/docs/operators/creation-operators" description="Tạo nguồn đúng tính lazy, completion và teardown trước khi kết hợp." />
+  <Card title="Cold và hot Observable" href="/docs/observable-subscription/cold-va-hot" description="Hiểu vì sao concat có thể bỏ lỡ event và nhiều subscriber có thể tạo nhiều request." />
+  <Card title="Higher-order Observables" href="/docs/higher-order-observables" description="Quản lý queue, concurrency, cancellation và trigger bị bỏ qua." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Kiểm chứng emission và subscription bằng virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS 7.8.2 — `merge`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/merge.ts) và [`concat`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/concat.ts) — policy subscription và concurrency.
+- [RxJS 7.8.2 — `combineLatest`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/combineLatest.ts) — latest value, initial readiness và bộ đếm completion trong implementation.
+- [RxJS 7.8.2 — `withLatestFrom`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/withLatestFrom.ts) — subscribe nguồn phụ, ready và source chính làm trigger.
+- [RxJS 7.8.2 — `zip`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/zip.ts) và [`forkJoin`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/forkJoin.ts) — buffer theo index, last value và trường hợp nguồn rỗng.
+- [RxJS 7.8.2 — `race`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/race.ts) — unsubscribe nguồn thua và subscription đồng bộ.
+- [RxJS — array argument deprecation](https://rxjs.dev/deprecations/array-argument) — overload nên dùng cho `combineLatest` và `forkJoin`.
+- [RxJS — marble testing](https://rxjs.dev/guide/testing/marble-testing) — notation, grouped notifications và subscription assertions.

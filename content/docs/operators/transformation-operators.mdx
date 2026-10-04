@@ -6,7 +6,7 @@ description: Biến đổi cấu trúc và giá trị của emission.
 API thường không trả đúng hình dạng mà UI cần. Một stream có thể phát từng `OrderEvent`, trong khi màn hình lại cần tổng tiền, trạng thái hiện tại và nhãn để hiển thị. **Transformation operator** giúp bạn đổi từng emission, tích lũy state hoặc gom nhiều emission thành một cấu trúc mới mà vẫn giữ mọi thứ trong pipeline.
 
 <Callout type="info" title="Phạm vi phiên bản">
-  Bài này dùng public API của **RxJS 7.8.2** và import trực tiếp từ `rxjs`. Cách phân nhóm bên dưới dựa trên hành vi để bạn dễ chọn operator; đây không phải danh sách đầy đủ mọi API được RxJS xếp vào nhóm transformation.
+  Bài này dùng public API của **RxJS 7.8.2** và import trực tiếp từ `rxjs`. Bạn nên biết `Observable`, `subscribe` và `pipe` trước khi đọc. Cách phân nhóm bên dưới dựa trên hành vi để bạn dễ chọn operator; đây không phải danh sách đầy đủ mọi API được RxJS xếp vào nhóm transformation.
 </Callout>
 
 ## Mục lục
@@ -22,12 +22,16 @@ API thường không trả đúng hình dạng mà UI cần. Một stream có th
   - [Seed không tự được phát](#seed-không-tự-được-phát)
   - [Tránh mutate accumulator](#tránh-mutate-accumulator)
 - [reduce và toArray chờ source complete](#reduce-và-toarray-chờ-source-complete)
+  - [Complete khác error và unsubscribe](#complete-khác-error-và-unsubscribe)
 - [pairwise đặt giá trị hiện tại cạnh giá trị trước](#pairwise-đặt-giá-trị-hiện-tại-cạnh-giá-trị-trước)
 - [buffer gom emission thành batch](#buffer-gom-emission-thành-batch)
   - [Gom theo số lượng với bufferCount](#gom-theo-số-lượng-với-buffercount)
   - [Gom theo thời gian với bufferTime](#gom-theo-thời-gian-với-buffertime)
+  - [Đóng batch bằng notifier với buffer](#đóng-batch-bằng-notifier-với-buffer)
   - [Buffer và window khác nhau ở output](#buffer-và-window-khác-nhau-ở-output)
 - [groupBy chia stream theo key](#groupby-chia-stream-theo-key)
+  - [Subscribe group ngay khi nó được tạo](#subscribe-group-ngay-khi-nó-được-tạo)
+  - [Đóng group cho source dài hạn](#đóng-group-cho-source-dài-hạn)
 - [map không flatten Observable lồng](#map-không-flatten-observable-lồng)
   - [Chọn chiến lược flatten theo lifecycle](#chọn-chiến-lược-flatten-theo-lifecycle)
   - [Cẩn thận với async callback](#cẩn-thận-với-async-callback)
@@ -122,6 +126,20 @@ from(users)
 ```
 
 Hai input tạo đúng hai output. Nếu mục tiêu là bỏ một số user, hãy thêm `filter`; trả `undefined` trong `map` không loại emission mà chỉ biến nó thành một emission có giá trị `undefined`.
+
+Đọc hai hàng theo cùng cột: output đổi giá trị, không đổi thời điểm notification trong ví dụ không có lỗi dưới đây.
+
+<MarbleDiagram
+  title="map(value => value * 10)"
+  rows={[
+    { label: 'source', marble: '-a--b--c--|', kind: 'source' },
+    { label: 'output', marble: '-x--y--z--|', kind: 'output' },
+  ]}
+  values={{ a: '1', b: '2', c: '3', x: '10', y: '20', z: '30' }}
+  caption="map phát kết quả ngay khi nhận input và chuyển tiếp completion ở frame 10."
+/>
+
+Input tại các frame 1, 4 và 7 tạo output tại chính các frame đó. Đây là virtual time để so sánh notification, không phải lời hứa rằng projection không tốn CPU; callback nặng vẫn chặn luồng đang thực thi nó.
 
 Projection còn nhận `index` bắt đầu từ `0` cho từng subscription:
 
@@ -238,11 +256,22 @@ Khác `map`, output hiện tại của `scan` phụ thuộc cả state trước 
 
 Trong ví dụ trên, `{ itemCount: 0 }` là state ban đầu để xử lý event đầu tiên. `scan` không phát seed ngay lúc subscribe; nó chỉ phát sau khi source có value.
 
-```text
-source$:  ─────(add 2)────(add 1)────(remove 1)────│
-scan:           {2}─────────{3}──────────{2}──────│
-seed {0}:  dùng để tính, không tự xuất hiện ở output
-```
+Đọc từ source xuống output để thấy state chỉ xuất hiện sau event, không có emission nào ở frame 0:
+
+<MarbleDiagram
+  title="scan(reducer, { itemCount: 0 })"
+  rows={[
+    { label: 'events', marble: '-a--b--c--|', kind: 'source' },
+    { label: 'state', marble: '-x--y--x--|', kind: 'output' },
+  ]}
+  values={{
+    a: 'add 2', b: 'add 1', c: 'remove 1',
+    x: '{ itemCount: 2 }', y: '{ itemCount: 3 }',
+  }}
+  caption="Seed dùng để tính state đầu tiên; scan không tự phát seed."
+/>
+
+Frame 1 phát state có hai item, frame 4 có ba item, frame 7 trở lại hai item. Hai ký hiệu `x` biểu diễn cùng dữ liệu, không có nghĩa reducer phải trả cùng object reference.
 
 Nếu consumer phải nhận state ban đầu trước event đầu tiên, thêm `startWith(initialState)` sau `scan`, hoặc thiết kế source phát một event khởi tạo. Mặc định mình dùng `startWith` khi state ban đầu thật sự là một UI state cần render, không chỉ là chi tiết nội bộ của phép tính.
 
@@ -281,6 +310,24 @@ of(120, 80, 50).pipe(
 // complete
 ```
 
+Để thấy khác biệt với `scan`, đọc cả hai hàng output theo cùng source. Ký hiệu `(z|)` biểu diễn value và completion ở cùng frame; renderer của dự án hỗ trợ nhóm notification này.
+
+<MarbleDiagram
+  title="scan(sum, 0) / reduce(sum, 0)"
+  rows={[
+    { label: 'prices', marble: '-a--b--c--|', kind: 'source' },
+    { label: 'scan', marble: '-x--y--z--|', kind: 'output' },
+    { label: 'reduce', marble: '----------(z|)', kind: 'output' },
+  ]}
+  values={{
+    a: 'price 120', b: 'price 80', c: 'price 50',
+    x: 'total 120', y: 'total 200', z: 'total 250',
+  }}
+  caption="scan phát ở frame 1, 4, 7; reduce chỉ phát total 250 khi source complete ở frame 10."
+/>
+
+Tổng đã được tính xong ở frame 7, nhưng `reduce` vẫn chưa phát: source còn có thể gửi thêm value. Đây là lý do không thể thay `scan` bằng `reduce` chỉ dựa trên output type.
+
 `toArray()` là trường hợp chuyên biệt: giữ mọi source emission trong một array rồi phát array đó khi complete.
 
 ```ts
@@ -302,11 +349,41 @@ interval(100).pipe(
 | `reduce(..., 0)` | Không | Có | Phát `0` khi complete |
 | `toArray()` | Không | Có | Phát `[]` khi complete |
 
-Đừng đặt `toArray()` trực tiếp sau `fromEvent()` hoặc một stream sống vô hạn rồi chờ kết quả: array sẽ tiếp tục giữ value và không được phát. Hãy tạo ranh giới bằng `take`, `takeUntil`, `buffer...`, hoặc chọn state liên tục bằng `scan`.
+Nếu không truyền seed, `reduce` dùng value đầu tiên làm accumulator và không gọi reducer cho value đó; source rỗng complete mà không phát kết quả. `scan` không seed cũng dùng value đầu làm accumulator, nhưng phát value đầu xuống downstream. Truyền seed rõ ràng giúp bạn quyết định được cả type lẫn hành vi source rỗng.
+
+Đừng đặt `toArray()` trực tiếp sau `fromEvent()` hoặc một stream sống vô hạn rồi chờ kết quả: array sẽ tiếp tục giữ value và không được phát. Hãy đặt `take` hoặc `takeUntil` **trước** `toArray` để tạo completion cho nó. Nếu cần nhiều batch thay vì một array cuối, dùng `buffer...` thay cho `toArray`; nếu cần state liên tục, chọn `scan`.
 
 <Callout type="warn" title="Completion là một phần của yêu cầu">
   `reduce` và `toArray` không phù hợp chỉ vì output type trông đúng. Bạn phải biết ai làm source complete. Nếu không có câu trả lời rõ ràng, pipeline có thể không phát gì và còn giữ dữ liệu trong bộ nhớ.
 </Callout>
+
+### Complete khác error và unsubscribe
+
+`complete` là notification từ upstream. `unsubscribe()` chỉ tháo subscription; nó không giả lập completion. Vì vậy, một tổng đang tích lũy không tự được phát khi bạn hủy subscription.
+
+| Kết thúc upstream | `reduce` và `toArray` | `bufferCount` và `bufferTime` |
+|---|---|---|
+| `complete` | Phát kết quả cuối rồi complete | Phát buffer còn mở rồi complete; `bufferCount` chỉ phát buffer không rỗng |
+| `error` | Chuyển tiếp lỗi, không phát kết quả tích lũy | Chuyển tiếp lỗi, không flush buffer đang mở |
+| Downstream unsubscribe | Dừng, không phát kết quả cuối | Dừng, không flush buffer đang mở |
+
+Thứ tự operator quyết định ai nhìn thấy completion:
+
+```ts
+import { interval, take, toArray } from 'rxjs';
+
+// take làm upstream của toArray complete sau ba value.
+interval(100).pipe(take(3), toArray()).subscribe(console.log);
+// Sau khoảng 300 ms: [0, 1, 2]
+
+// toArray chưa phát gì, nên take(3) ở downstream không đếm được value.
+const stuck = interval(100).pipe(toArray(), take(3)).subscribe(console.log);
+
+// Chỉ để dọn ví dụ: hủy sau khoảng 350 ms, không có array được phát.
+setTimeout(() => stuck.unsubscribe(), 350);
+```
+
+Tương tự, `takeUntil(stop$)` đặt trước `bufferCount` cho operator thấy completion và flush batch cuối. Đặt nó sau `bufferCount` sẽ hủy upstream khi `stop$` phát, nên batch đang giữ bị bỏ. Nếu batch cuối chứa dữ liệu cần gửi, chọn vị trí này có chủ đích.
 
 ## pairwise đặt giá trị hiện tại cạnh giá trị trước
 
@@ -330,7 +407,9 @@ from([100, 108, 103, 120]).pipe(
 
 Value `100` chưa có value trước để ghép nên chưa tạo output. Nếu cần so sánh emission đầu với một mốc ban đầu, thêm `startWith(initialValue)` trước `pairwise()`.
 
-`pairwise` chỉ nhớ đúng một value trước đó. Nếu bạn cần cửa sổ trượt ba hoặc nhiều value, dùng `bufferCount(size, 1)`; tham số thứ hai `1` mở một buffer mới ở mỗi emission.
+`pairwise` chỉ nhớ đúng một value trước đó. Nếu bạn cần cửa sổ trượt ba hoặc nhiều value, dùng `bufferCount(size, 1)`; tham số thứ hai `1` mở một buffer mới ở mỗi emission. Tuy nhiên, hai operator không hoàn toàn tương đương: `bufferCount(2, 1)` còn flush các batch chưa đủ hai value khi complete, trong khi `pairwise` không phát cặp thiếu.
+
+Nếu source phát object rồi mutate chính object đó, cả `previous` và `current` có thể trỏ tới cùng reference đã bị sửa. `pairwise` không clone dữ liệu; hãy tạo snapshot bất biến trước nó khi bạn cần so sánh state cũ và mới.
 
 ## buffer gom emission thành batch
 
@@ -351,6 +430,20 @@ of(1, 2, 3, 4, 5, 6, 7).pipe(
 // [4, 5, 6]
 // [7]
 ```
+
+Đọc output dưới đây theo cột: batch đủ phát khi nhận value thứ hai, batch thiếu phải chờ completion.
+
+<MarbleDiagram
+  title="bufferCount(2)"
+  rows={[
+    { label: 'source', marble: '-a--b--c--|', kind: 'source' },
+    { label: 'batches', marble: '----x-----(y|)', kind: 'output' },
+  ]}
+  values={{ a: '1', b: '2', c: '3', x: '[1, 2]', y: '[3]' }}
+  caption="Batch [1, 2] phát ở frame 4; batch [3] chỉ được flush khi source complete ở frame 10."
+/>
+
+Frame 7 đã có value `3` nhưng chưa đủ batch. Nếu source error hoặc downstream unsubscribe trước frame 10, `[3]` sẽ không được phát.
 
 Nếu downstream chỉ chấp nhận batch đủ ba phần tử, thêm `filter((batch) => batch.length === 3)`. Đừng mặc định loại batch cuối: với log hoặc đơn hàng, đó có thể là dữ liệu thật cần được xử lý.
 
@@ -396,36 +489,94 @@ const clickBatches$ = fromEvent<MouseEvent>(button, 'click').pipe(
 
 const subscription = clickBatches$.subscribe(console.log);
 
-// Khi view bị hủy:
-subscription.unsubscribe();
+// Đặt cleanup này trong lifecycle khi view bị hủy, không chạy ngay:
+// subscription.unsubscribe();
 ```
 
-Khoảng `1_000` ms là lịch theo scheduler, không phải deadline thời gian thực tuyệt đối; event loop có thể làm callback chạy muộn. Nếu hệ thống cần “đủ 100 item **hoặc** hết 1 giây thì gửi”, dùng overload có giới hạn kích thước của `bufferTime` và kiểm tra đúng signature của phiên bản đang chạy.
+Trong ví dụ browser, hãy giữ `subscription` cho đến khi view bị hủy rồi mới gọi `unsubscribe()`; dòng cleanup không phải phần chạy ngay sau `subscribe`. `bufferTime` có thể phát `[]` dù không có click, nên `filter` ở đây tránh các batch rỗng cả ở ranh giới thời gian lẫn lúc complete.
+
+Khoảng `1_000` ms là lịch theo scheduler, không phải deadline thời gian thực tuyệt đối; event loop có thể làm callback chạy muộn. Với RxJS 7.8.2, yêu cầu “đủ 100 item **hoặc** hết 1 giây thì gửi” dùng:
+
+```ts
+bufferTime(1_000, undefined, 100);
+```
+
+Tham số thứ hai `undefined` giữ các batch liên tiếp: đóng batch hiện tại là mở batch mới. Nếu truyền một `bufferCreationInterval`, lịch mở batch độc lập với lịch đóng; interval nhỏ hơn time span tạo batch chồng lấn, interval lớn hơn time span tạo khoảng trống mà event không thuộc batch nào.
 
 Với source nhanh, mọi buffer đều giữ value trong bộ nhớ cho tới khi đóng. Hãy chọn time span và giới hạn batch theo tải thực tế, thay vì đặt khoảng dài chỉ để giảm số lần gọi downstream.
 
-### Buffer và window khác nhau ở output
+### Đóng batch bằng notifier với buffer
 
-Hai nhóm cùng chia source thành đoạn, nhưng output khác nhau:
+Khi ranh giới batch là một event nghiệp vụ, dùng `buffer(closingNotifier)`. Mỗi `next` từ notifier đóng và phát batch hiện tại, rồi bắt đầu batch mới:
 
-```text
-source$:     ──1──2──3──4──5──6──│
+```ts
+import { buffer, Subject } from 'rxjs';
 
-bufferCount(3)
-output$:     ─────[1,2,3]────[4,5,6]│
+const edits$ = new Subject<string>();
+const save$ = new Subject<void>();
 
-windowCount(3)
-output$:     ─────Observable<1,2,3>──Observable<4,5,6>│
+edits$.pipe(buffer(save$)).subscribe(console.log);
+
+edits$.next('đổi tên');
+edits$.next('đổi địa chỉ');
+save$.next();          // ['đổi tên', 'đổi địa chỉ']
+save$.next();          // []
+edits$.next('đổi email');
+edits$.complete();    // ['đổi email'], rồi output complete
+save$.complete();
 ```
 
-- `buffer...` materialize mỗi đoạn thành array. Dễ dùng, nhưng phải giữ toàn bộ batch trong bộ nhớ.
-- `window...` phát các Observable con. Downstream có thể xử lý từng value khi nó đến, nhưng bạn phải flatten và quản lý lifecycle của inner stream.
+Notifier complete **không** tự đóng batch hoặc complete output; với `buffer`, chỉ `next` của notifier đóng batch, còn source complete flush batch cuối. Nếu chỉ muốn batch có dữ liệu, thêm `filter((batch) => batch.length > 0)`.
 
-Mặc định, dùng buffer khi batch nhỏ và cần gửi cả mảng. Dùng window khi mỗi đoạn vẫn cần pipeline riêng hoặc khi không muốn chờ materialize toàn bộ đoạn trước khi bắt đầu xử lý.
+`bufferToggle(openings$, closingSelector)` phù hợp khi cần nhiều batch mở cùng lúc, còn `bufferWhen(closingSelector)` tạo notifier đóng mới cho từng batch. Chỉ dùng chúng khi count, time span hoặc một notifier cố định chưa diễn đạt được ranh giới nghiệp vụ.
+
+### Buffer và window khác nhau ở output
+
+`buffer...` giữ mỗi đoạn trong array và phát khi đoạn đóng. `window...` phát Observable con **khi đoạn mở**, không đợi đủ value. Consumer subscribe inner ngay để xử lý value khi nó đến.
+
+So sánh `bufferCount(2)` ở trên với `windowCount(2)` dưới đây. Hàng output là stream của window; hai hàng inner cho biết mỗi window nhận những value nào:
+
+<MarbleDiagram
+  title="windowCount(2)"
+  rows={[
+    { label: 'source', marble: '-a--b--c--|', kind: 'source' },
+    { label: 'window 0', marble: '^a--(b|)', kind: 'inner' },
+    { label: 'window 1', marble: '----^--c--|', kind: 'inner' },
+    { label: 'windows', marble: 'u---v-----|', kind: 'output' },
+  ]}
+  values={{
+    a: '1', b: '2', c: '3',
+    u: 'Observable window 0', v: 'Observable window 1',
+  }}
+  caption="Window đầu mở ở frame 0; window tiếp theo mở ngay sau value thứ hai ở frame 4."
+/>
+
+Ở frame 4, window 0 nhận `2`, complete, rồi window 1 mở. Value `3` ở frame 7 đi vào window 1 ngay, chứ không chờ source complete ở frame 10. Dấu `^` giả định consumer subscribe từng window ngay khi nó được phát.
+
+```ts
+import { from, map, mergeMap, windowCount } from 'rxjs';
+
+from([1, 2, 3, 4, 5]).pipe(
+  windowCount(3),
+  mergeMap((window$, index) =>
+    window$.pipe(map((value) => ({ window: index, value }))),
+  ),
+).subscribe(console.log);
+
+// { window: 0, value: 1 }
+// { window: 0, value: 2 }
+// { window: 0, value: 3 }
+// { window: 1, value: 4 }
+// { window: 1, value: 5 }
+```
+
+`windowCount` dùng Subject, không replay value đã trôi qua. Đừng thu các window bằng `toArray()` rồi mới subscribe; khi source kết thúc, các value đã mất. Nếu số input đúng bội số của `windowSize`, RxJS 7.8.2 còn mở một window mới sau value cuối; window này có thể rỗng khi source complete.
+
+Mặc định, dùng buffer khi batch nhỏ và cần gửi cả mảng. Dùng window khi mỗi đoạn cần pipeline riêng hoặc khi không muốn chờ materialize toàn bộ đoạn trước khi bắt đầu xử lý. Đặt `toArray()` bên trong từng window lại materialize đoạn đó, nên không còn lợi thế xử lý từng value ngay.
 
 ## groupBy chia stream theo key
 
-`groupBy(keySelector)` biến một stream thành stream của các `GroupedObservable`. Mỗi group có thuộc tính `key` và phát các value thuộc key đó. Vì output bị lồng, bạn thường cần `mergeMap`, `concatMap` hoặc một chiến lược flatten khác để tiêu thụ từng group.
+`groupBy(keySelector)` biến một stream thành stream của các `GroupedObservable`. Mỗi group có thuộc tính `key` và phát các value thuộc key đó. Vì output bị lồng, thường dùng `mergeMap` để subscribe mỗi group ngay khi nó được tạo.
 
 ```ts
 import { from, groupBy, map, mergeMap, reduce, toArray } from 'rxjs';
@@ -460,9 +611,32 @@ from(payments).pipe(
 
 `reduce` bên trong mỗi group chỉ phát khi group complete; ở đây source hữu hạn complete sau ba payment nên mọi group cũng complete. Với event stream sống lâu, đoạn code tương tự có thể không bao giờ phát tổng.
 
+### Subscribe group ngay khi nó được tạo
+
+Group mặc định dùng `Subject`, không replay value. Nếu thay `mergeMap` ở ví dụ trên bằng `concatMap`, group `u2` phải đợi group `u1` complete mới được subscribe; payment `u2` đã phát trước đó nên tổng của nó bị mất. Giới hạn concurrency của `mergeMap` ở **cấp group** cũng có thể tạo cùng vấn đề khi nhiều group phải xếp hàng.
+
+Nếu cần xử lý tuần tự theo từng user nhưng song song giữa các user, hãy subscribe mọi group bằng `mergeMap`, rồi đặt `concatMap` **bên trong** từng group để xếp hàng công việc của user đó. Giới hạn tải vẫn phải được thiết kế riêng: nhiều key đồng thời có thể tạo nhiều inner subscription, còn queue trong mỗi group có thể tăng nếu producer nhanh hơn consumer.
+
+### Đóng group cho source dài hạn
+
 <Callout type="warn" title="groupBy cần chiến lược đóng group">
   Với source dài hạn và key không giới hạn như `userId`, `sessionId` hoặc URL, số group có thể tăng mãi. `groupBy` có tùy chọn `duration` để đóng group và `connector` để kiểm soát subject đứng sau group. Nếu bạn không định nghĩa được vòng đời của từng key, đừng dùng `groupBy` như một `Map` cache vô hạn.
 </Callout>
+
+Ví dụ cấu hình lifetime cố định tính từ lúc group được tạo:
+
+```ts
+import { groupBy, timer } from 'rxjs';
+
+// Đặt operator này trong pipeline của stream payment dài hạn.
+groupBy((payment: Payment) => payment.userId, {
+  duration: () => timer(30_000),
+});
+```
+
+Sau khoảng 30 giây, group complete và bị xóa khỏi lookup nội bộ. Nếu user đó có payment mới, RxJS tạo group mới với cùng key. `reduce` bên trong group lúc này phát tổng cho **mỗi lifetime**, không phải tổng cả đời của user. `timer` này không reset theo activity; muốn đóng sau một khoảng im lặng, cần duration dựa trên emission của group, chẳng hạn `group$.pipe(debounceTime(30_000))`.
+
+Lifetime hữu hạn chỉ hạn chế thời gian giữ group, không bảo đảm số group đang mở có giới hạn cứng. `connector` có thể đổi sang Subject có replay nếu bạn thật sự cần subscriber muộn, nhưng buffer replay cũng cần giới hạn bộ nhớ; nó không thay thế thiết kế lifecycle.
 
 Nếu chỉ cần cộng tổng cho một collection hữu hạn đã có sẵn, một `reduce` trên array có thể đơn giản hơn. `groupBy` đáng dùng khi từng group cần tiếp tục là một stream với operator và lifecycle riêng.
 
@@ -587,6 +761,12 @@ const orderViewModel$ = from(events).pipe(
 );
 
 orderViewModel$.subscribe(console.log);
+
+// State và canSubmit sau từng event (bỏ nhãn tiền để dễ đọc):
+// { itemCount: 1, total: 120000, status: 'draft', canSubmit: true }
+// { itemCount: 2, total: 200000, status: 'draft', canSubmit: true }
+// { itemCount: 1, total:  80000, status: 'draft', canSubmit: true }
+// { itemCount: 1, total:  80000, status: 'submitted', canSubmit: false }
 ```
 
 Pipeline chia trách nhiệm thành hai lớp:
@@ -675,5 +855,6 @@ Sau các bài này, lấy một pipeline thật trong dự án và ghi chú type
 - [RxJS 7.8.2 — mã nguồn `scan`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/scan.ts) và [`reduce`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/reduce.ts) — khác biệt giữa state liên tục và kết quả khi complete.
 - [RxJS 7.8.2 — mã nguồn `toArray`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/toArray.ts) và [`pairwise`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/pairwise.ts) — collection cuối và cặp previous/current.
 - [RxJS 7.8.2 — mã nguồn `bufferCount`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/bufferCount.ts) và [`bufferTime`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/bufferTime.ts) — batch theo count, time và hành vi khi complete.
+- [RxJS 7.8.2 — mã nguồn `buffer`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/buffer.ts) và [`windowCount`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/windowCount.ts) — notifier đóng batch, thời điểm mở window và inner Subject.
 - [RxJS 7.8.2 — mã nguồn `groupBy`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/groupBy.ts) — `GroupedObservable`, `duration` và `connector`.
 - [RxJS 7.x — deprecation `pluck`](https://rxjs.dev/api/operators/pluck) và [`mapTo`](https://rxjs.dev/api/operators/mapTo) — API thay thế bằng `map`.

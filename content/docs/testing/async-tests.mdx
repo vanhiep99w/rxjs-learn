@@ -3,8 +3,399 @@ title: Kiểm thử async stream
 description: Kiểm thử Promise bridge, timer và completion.
 ---
 
-Trang này sẽ trình bày **Kiểm thử async stream** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn gọi `subscribe()` trong test, đặt assertion trong `next`, rồi thấy test xanh dù stream chưa phát gì. Vấn đề không nằm ở assertion: test runner đã coi test là xong trước khi callback chạy. Với async stream, mình cần xác định rõ **runner phải chờ điều gì**, đồng hồ nào điều khiển công việc và subscription được đóng khi nào.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi và cách đọc ví dụ">
+  Bài dùng API RxJS 7.x, đối chiếu với RxJS 7.8.2. Bạn nên biết `next`, `error`, `complete` và `unsubscribe`. Các ví dụ TypeScript dùng `node:test` và `node:assert/strict`, trừ phần fake timers có ghi rõ Vitest. Chạy chúng trong môi trường test đã có RxJS và hỗ trợ TypeScript; đây là ví dụ cho ứng dụng của bạn, không phải test suite có sẵn của site tài liệu.
 </Callout>
+
+## Mục lục
+
+- [Chọn tín hiệu kết thúc test](#chọn-tín-hiệu-kết-thúc-test)
+- [Chờ Observable bằng Promise bridge](#chờ-observable-bằng-promise-bridge)
+  - [Giá trị đầu và giá trị cuối](#giá-trị-đầu-và-giá-trị-cuối)
+  - [Error và stream rỗng](#error-và-stream-rỗng)
+- [Kiểm thử nguồn Promise thật](#kiểm-thử-nguồn-promise-thật)
+- [Kiểm thử timer bằng đúng đồng hồ](#kiểm-thử-timer-bằng-đúng-đồng-hồ)
+  - [Virtual time cho logic RxJS](#virtual-time-cho-logic-rxjs)
+  - [Fake timers cho ranh giới timer của runtime](#fake-timers-cho-ranh-giới-timer-của-runtime)
+- [Phân biệt completion và teardown](#phân-biệt-completion-và-teardown)
+  - [Chờ đủ giá trị và completion](#chờ-đủ-giá-trị-và-completion)
+  - [Unsubscribe không gọi complete](#unsubscribe-không-gọi-complete)
+- [Giới hạn chờ mà không che lỗi](#giới-hạn-chờ-mà-không-che-lỗi)
+- [Những test dễ pass giả hoặc bị treo](#những-test-dễ-pass-giả-hoặc-bị-treo)
+- [Checklist và bài tập](#checklist-và-bài-tập)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Chọn tín hiệu kết thúc test
+
+Giả sử một service trả về Observable trạng thái upload. Test “nhận được trạng thái đầu” khác test “upload xong”, dù cả hai đều có thể nhìn thấy một giá trị hợp lệ. Nếu dùng `firstValueFrom()` cho cả hai, test thứ hai có thể bỏ qua lỗi xảy ra sau trạng thái đầu.
+
+Mình chọn công cụ theo contract cần kiểm tra, không theo việc tên hàm có chữ `async` hay không:
+
+| Contract cần kiểm tra | Cách chọn mặc định | Điều chưa được chứng minh |
+| --- | --- | --- |
+| Một giá trị đầu tiên | `await firstValueFrom(result$)` | Source complete hay các giá trị sau đúng |
+| Giá trị cuối của stream hữu hạn | `await lastValueFrom(result$)` | Toàn bộ giá trị trung gian và timing |
+| Toàn bộ giá trị, đúng thứ tự, rồi complete | `await lastValueFrom(result$.pipe(toArray()))` | Thời điểm phát từng giá trị |
+| Emission, completion hoặc cancellation tại frame cụ thể | `TestScheduler.run()` | Promise, HTTP hoặc event loop thật hoạt động đúng |
+| Adapter có native timers hoặc Promise kết hợp timer | Fake timers của runner, hoặc async test thật có giới hạn | Network thật được giả lập đúng |
+
+`subscribe()` trả về `Subscription`, không phải Promise. Runner không tự hiểu rằng một subscription còn mở nghĩa là test còn việc cần làm. Khi có thể chuyển kết quả cần chờ thành Promise, mình ưu tiên `async`/`await`: assertion nằm trong thân test, và Promise rejection làm test thất bại theo cơ chế của runner.
+
+## Chờ Observable bằng Promise bridge
+
+### Giá trị đầu và giá trị cuối
+
+`firstValueFrom()` subscribe ngay khi được gọi, resolve ở `next` đầu tiên rồi unsubscribe. `lastValueFrom()` cũng subscribe ngay, nhưng chỉ resolve khi nhận `complete`, với giá trị cuối đã thấy. Cả hai trả về native Promise, nên phần sau `await` chạy theo cơ chế Promise của JavaScript.
+
+```ts
+import test from 'node:test';
+import { strictEqual } from 'node:assert/strict';
+import { firstValueFrom, lastValueFrom, of } from 'rxjs';
+
+test('chọn đúng giá trị cần chờ', async () => {
+  const source$ = of('queued', 'running', 'done');
+
+  strictEqual(await firstValueFrom(source$), 'queued');
+  strictEqual(await lastValueFrom(source$), 'done');
+});
+```
+
+Ví dụ tạo **hai subscription riêng** vào `of()`. Với cold source gửi request, viết hai lần như vậy có thể gửi hai request. Nếu contract là một execution duy nhất với toàn bộ trạng thái, hãy thu thập giá trị trong một subscription bằng `toArray()` thay vì dùng hai Promise bridge để quan sát hai đầu.
+
+`lastValueFrom()` không chỉ là `firstValueFrom()` nhưng chọn phần tử khác. Với `interval()` không có giới hạn, giá trị vẫn đến đều nhưng Promise của `lastValueFrom()` không resolve vì không có completion. Ngược lại, `firstValueFrom()` có thể resolve dù source không bao giờ tự complete.
+
+<Callout type="warn" title="Nhận giá trị đầu không chứng minh source hoàn tất">
+  Sau giá trị đầu, `firstValueFrom()` đã unsubscribe nên không quan sát error hoặc value tiếp theo. Đừng dùng nó để kiểm tra “stream hoàn tất thành công”. `take(1)` cũng không chứng minh source tự complete: operator tạo completion cho downstream khi đủ một giá trị.
+</Callout>
+
+### Error và stream rỗng
+
+Một Observable có thể kết thúc bằng error hoặc complete mà không phát giá trị. Hai trường hợp đó phải được test riêng, vì chúng thường tương ứng với “request thất bại” và “không tìm thấy dữ liệu”.
+
+```ts
+import test from 'node:test';
+import { rejects, strictEqual } from 'node:assert/strict';
+import {
+  EMPTY,
+  EmptyError,
+  firstValueFrom,
+  lastValueFrom,
+  throwError,
+  toArray,
+} from 'rxjs';
+
+test('error đi qua Promise bridge', async () => {
+  const failure = new Error('request failed');
+
+  await rejects(
+    firstValueFrom(throwError(() => failure)),
+    (error: unknown) => error === failure,
+  );
+});
+
+test('complete không có value có contract riêng', async () => {
+  await rejects(firstValueFrom(EMPTY), EmptyError);
+  await rejects(lastValueFrom(EMPTY), EmptyError);
+
+  strictEqual(
+    await firstValueFrom(EMPTY, { defaultValue: 'not-found' }),
+    'not-found',
+  );
+
+  const values = await lastValueFrom(EMPTY.pipe(toArray()));
+  strictEqual(values.length, 0);
+});
+```
+
+Không có `defaultValue`, hai bridge reject bằng `EmptyError` khi source complete mà chưa phát value. Có `defaultValue`, chỉ trường hợp đó chuyển thành resolve; default không nuốt error và không giải cứu stream không bao giờ kết thúc. Còn `toArray()` phát một mảng rỗng lúc source rỗng complete, nên bridge nhận được một value là `[]`.
+
+Đừng thêm default chỉ để test xanh. Nếu API yêu cầu ít nhất một kết quả, `EmptyError` chính là tín hiệu bạn muốn bắt. Khi dùng `lastValueFrom()`, error sau vài emission vẫn làm Promise reject thay vì trả lại value cuối đã thấy.
+
+## Kiểm thử nguồn Promise thật
+
+`from(promise)` đưa kết quả Promise vào Observable, nhưng không biến native Promise thành tác vụ của `TestScheduler`. Với adapter Promise, mình giữ async test thật, giả lập dependency ngay tại factory tạo Promise và dùng `await` để runner chờ kết quả.
+
+Giả sử service nhận dependency `loadUser`. `defer()` giúp việc gọi dependency xảy ra khi subscribe, thay vì lúc khởi tạo Observable:
+
+```ts
+import test from 'node:test';
+import { deepStrictEqual, rejects, strictEqual } from 'node:assert/strict';
+import { defer, firstValueFrom, map } from 'rxjs';
+
+type User = { id: number; name: string };
+
+function userName$(loadUser: () => Promise<User>) {
+  return defer(loadUser).pipe(map((user) => user.name.trim()));
+}
+
+test('gọi dependency khi subscribe và map kết quả Promise', async () => {
+  const calls: string[] = [];
+  const result$ = userName$(async () => {
+    calls.push('load');
+    return { id: 1, name: '  An  ' };
+  });
+
+  strictEqual(calls.length, 0);
+  const name = await firstValueFrom(result$);
+
+  strictEqual(name, 'An');
+  deepStrictEqual(calls, ['load']);
+});
+
+test('Promise rejection trở thành Observable error', async () => {
+  const failure = new Error('service unavailable');
+  const result$ = userName$(() => Promise.reject(failure));
+
+  await rejects(firstValueFrom(result$), (error: unknown) => error === failure);
+});
+```
+
+Đây là test adapter và phép biến đổi, không phải test HTTP thật. Nếu cần kiểm tra debounce hoặc `switchMap` của pipeline phía sau, hãy tách logic đó ra và đưa `cold()` vào marble test. Như vậy mỗi test chỉ phải điều khiển một cơ chế async.
+
+`from(loadUser())` khác `defer(loadUser)`: ở cách đầu, hàm đã chạy và Promise đã được tạo trước khi subscribe. `defer()` trì hoãn lời gọi, nhưng **không tự cung cấp cancellation cho Promise**. Unsubscribe ngăn notification đến subscriber đã đóng; công việc nền vẫn có thể tiếp tục. Nếu dependency hỗ trợ `AbortSignal`, adapter phải nối teardown với abort, rồi test hành vi abort riêng.
+
+## Kiểm thử timer bằng đúng đồng hồ
+
+Có ba lựa chọn, và mỗi lựa chọn kiểm soát một phạm vi khác nhau:
+
+| Đồng hồ | Kiểm soát gì | Khi mình chọn |
+| --- | --- | --- |
+| Thời gian thật | Runtime thực thi Promise và timer thật | Smoke test hoặc adapter nhỏ cần kiểm tra đường đi thực |
+| `TestScheduler` | Lịch notification và scheduler RxJS được run mode delegate | Logic `timer`, `interval`, debounce, timeout và cancellation của pipeline |
+| Fake timers của runner | Native timer APIs được mock theo cấu hình | Code kết hợp RxJS với `setTimeout`, `Date.now()` hoặc Promise bên ngoài |
+
+Với timing của operator, đừng `sleep(1000)` rồi đo mảng. Test đó vừa chậm vừa phụ thuộc tải máy; một lần “chờ đủ lâu” cũng không chứng minh emission không đến sớm. Dùng clock ảo để assert đúng mốc, còn test với thời gian thật chỉ nên assert kết quả và có giới hạn chờ, không đòi độ chính xác wall-clock đến từng millisecond.
+
+### Virtual time cho logic RxJS
+
+Giả sử contract là phát ba tick, cách nhau `2 ms`, rồi complete. Đọc sơ đồ theo cột dọc: tick thứ ba ở frame `6` cũng là lúc `take(3)` đóng subscription upstream và complete downstream.
+
+<MarbleDiagram
+  title="timer(2, 2) → take(3)"
+  frameLabel="1 khoảng = 1 ms ảo"
+  rows={[
+    { label: 'timer', marble: '--a-b-c-d-', kind: 'source' },
+    { label: 'subscription', marble: '^-----!', kind: 'subscription' },
+    { label: 'output', marble: '--a-b-(c|)', kind: 'output' },
+  ]}
+  values={{ a: 'tick 0', b: 'tick 1', c: 'tick 2', d: 'tick 3 nếu còn subscribe' }}
+  caption="Output phát 0, 1, 2 ở frame 2, 4, 6; value và completion cuối cùng xảy ra cùng frame."
+/>
+
+Hàng `timer` mô tả lịch tiềm năng nếu subscriber còn ở lại, không phải một hot source phát tiếp trong test sau unsubscribe. Hàng subscription xác nhận test không để periodic timer chạy vô hạn; tick `d` ở frame `8` không đến output.
+
+```ts
+import test from 'node:test';
+import { deepStrictEqual } from 'node:assert/strict';
+import { take, timer } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+test('ba tick rồi complete tại tick cuối', () => {
+  const scheduler = new TestScheduler((actual, expected) => {
+    deepStrictEqual(actual, expected);
+  });
+
+  scheduler.run(({ expectObservable }) => {
+    const result$ = timer(2, 2).pipe(take(3));
+
+    expectObservable(result$).toBe('--a-b-(c|)', { a: 0, b: 1, c: 2 });
+  });
+});
+```
+
+Trong `run()`, một frame bằng một millisecond ảo. Nhóm `(c|)` đặt `next(2)` và `complete` cùng frame; nếu viết `c|`, bạn lại yêu cầu complete muộn hơn một frame. Test này không cần `async`, `await`, `done` hay fake timers. Callback của `run()` return rồi scheduler flush các assertion.
+
+<Callout type="warn" title="Không await bên trong callback run">
+  `run()` không chờ Promise được return từ callback trước khi flush và khôi phục delegation. Đừng dùng `run(async () => ...)` để chờ `from(Promise.resolve(...))`. Native Promise nằm ngoài virtual clock; hãy test bridge bằng async test riêng. Chuỗi nhóm của renderer và của `TestScheduler` cũng có cách tiến con trỏ khác nhau; sơ đồ này dùng nhóm ở cuối nên các frame notification khớp nhau.
+</Callout>
+
+### Fake timers cho ranh giới timer của runtime
+
+Khi code có native timer và Promise, fake timers thường phù hợp hơn marble test. Ví dụ dưới đây dùng **Vitest**, chạy trong suite Vitest đã có RxJS; không trộn đoạn này vào file `node:test` phía trên.
+
+```ts
+import { afterEach, expect, it, vi } from 'vitest';
+import { defer, firstValueFrom } from 'rxjs';
+
+afterEach(() => {
+  vi.clearAllTimers();
+  vi.useRealTimers();
+});
+
+it('chờ Promise được resolve từ native timer', async () => {
+  vi.useFakeTimers();
+
+  const result$ = defer(
+    () => new Promise<string>((resolve) => {
+      setTimeout(() => resolve('ready'), 100);
+    }),
+  );
+  const pending = firstValueFrom(result$); // Subscribe trước khi tiến clock.
+  let settled = false;
+  const observed = pending.then((value) => {
+    settled = true;
+    return value;
+  });
+
+  await vi.advanceTimersByTimeAsync(99);
+  expect(settled).toBe(false);
+
+  await vi.advanceTimersByTimeAsync(1);
+  expect(await observed).toBe('ready');
+});
+```
+
+Bật fake timers trước khi tạo subscription để timer thuộc clock giả. `advanceTimersByTimeAsync()` cho phép xử lý công việc async liên quan trong lúc tiến timer; API đồng bộ không thay thế mọi bước chờ Promise. Sau `99 ms` giả, kết quả chưa đến; sau `100 ms` giả, Promise resolve và adapter chuyển value xuống stream.
+
+Đừng `await pending` trước khi tiến clock: timer giả chưa chạy thì Promise chưa có lý do để resolve. Cũng đừng dùng `runAllTimers()` trên periodic stream vô hạn; timer có thể tự lên lịch mãi đến khi runner chạm loop limit. Tiến một khoảng hữu hạn, đóng subscription của test rồi khôi phục timers.
+
+`clearAllTimers()` là lớp dọn dẹp cuối, không phải bằng chứng adapter production đã biết hủy tài nguyên. Nếu cancellation là contract, cần assertion teardown riêng. Vì fake timers thay đổi global APIs, không chạy các test dùng chung clock này bằng chế độ concurrent và không kết hợp chúng với `TestScheduler.run()` trong cùng test.
+
+## Phân biệt completion và teardown
+
+### Chờ đủ giá trị và completion
+
+Nếu cần kiểm tra cả thứ tự lẫn completion, `toArray()` là cách đọc trực tiếp: nó chỉ phát mảng khi upstream complete. Test sau dùng `Subject` để tự điều khiển input; không có timer hay network nên không cần đoán lúc nào dữ liệu sẵn sàng.
+
+```ts
+import test from 'node:test';
+import { deepStrictEqual, strictEqual } from 'node:assert/strict';
+import { lastValueFrom, map, Subject, tap, timeout, toArray } from 'rxjs';
+
+test('chỉ trả mảng sau khi source complete', async (t) => {
+  const input$ = new Subject<number>();
+  t.after(() => input$.complete());
+  let completed = false;
+  const result$ = input$.pipe(
+    map((value) => value * 10),
+    tap({ complete: () => { completed = true; } }),
+    toArray(),
+  );
+
+  // Guard nằm sau toArray: đợi mảng cuối, không đợi từng input.
+  const pending = lastValueFrom(result$.pipe(timeout({ first: 1_000 })));
+
+  input$.next(1);
+  input$.next(2);
+  strictEqual(completed, false);
+
+  input$.complete();
+  deepStrictEqual(await pending, [10, 20]);
+  strictEqual(completed, true);
+});
+```
+
+Subscribe trước khi gọi `next()`: `Subject` không replay input đã phát. Nếu bỏ `input$.complete()`, `toArray()` không phát mảng; guard làm test reject thay vì chờ mãi. Mốc `1_000 ms` ở đây chỉ là giới hạn phòng lỗi của test, không phải yêu cầu hiệu năng.
+
+Mảng đúng chứng minh phần giá trị và completion, nhưng không chứng minh timing. Ngược lại, nếu chèn `take(2)` vào harness để ép kết thúc, bạn chỉ chứng minh pipeline đã nhận hai value; bạn không còn phát hiện source thiếu completion. Chỉ dùng `take(n)` khi “đủ n value thì dừng” chính là contract muốn test.
+
+### Unsubscribe không gọi complete
+
+`finalize()` chạy khi subscription kết thúc do complete, error hoặc unsubscribe. Vì vậy `finalize` được gọi không đồng nghĩa observer đã nhận `complete`. Test riêng hai tín hiệu nếu lifecycle quan trọng:
+
+```ts
+import test from 'node:test';
+import { deepStrictEqual } from 'node:assert/strict';
+import { finalize, firstValueFrom, Subject, tap } from 'rxjs';
+
+test('firstValueFrom dọn subscription nhưng không complete source', async (t) => {
+  const source$ = new Subject<string>();
+  t.after(() => source$.complete());
+  let completed = false;
+  let finalized = 0;
+  const observed$ = source$.pipe(
+    tap({ complete: () => { completed = true; } }),
+    finalize(() => { finalized += 1; }),
+  );
+
+  const pending = firstValueFrom(observed$);
+  source$.next('ready');
+  const value = await pending;
+
+  deepStrictEqual({ value, completed, finalized }, {
+    value: 'ready',
+    completed: false,
+    finalized: 1,
+  });
+});
+```
+
+Ở đây bridge rời stream ngay sau `'ready'`, nên `finalize()` chạy và observer không nhận completion. Hook `t.after()` đóng source do test sở hữu, kể cả khi assertion thất bại; nó không gửi notification trở lại subscription đã đóng.
+
+Để kiểm tra adapter sở hữu timer, listener hay request, hãy assert hành động dọn tài nguyên cụ thể, chẳng hạn `clearInterval`, `removeEventListener` hoặc `abort`. Một counter trong `finalize()` chỉ chứng minh hook chạy, chưa chứng minh hook hủy đúng tài nguyên.
+
+## Giới hạn chờ mà không che lỗi
+
+Async test cần một đường kết thúc cả khi code sai. Timeout của runner giúp test không treo vô hạn, nhưng không đảm bảo subscription của Observable hay công việc bên ngoài được hủy. Guard bên trong stream có thể tạo error và unsubscribe upstream; adapter vẫn phải có teardown đúng để tài nguyên thật được giải phóng.
+
+```ts
+import test from 'node:test';
+import { rejects } from 'node:assert/strict';
+import { firstValueFrom, NEVER, timeout, TimeoutError } from 'rxjs';
+
+test('không có giá trị đầu thì reject thay vì chờ mãi', async () => {
+  await rejects(
+    firstValueFrom(NEVER.pipe(timeout({ first: 10 }))),
+    TimeoutError,
+  );
+});
+```
+
+Ví dụ dùng timer thật nhỏ để kiểm tra đường reject, không assert “đúng 10 ms wall-clock”. Mốc `10` chỉ để minh họa; nếu contract chính là thời điểm timeout, dùng `TestScheduler` để kiểm tra frame thay vì dựa vào timer thật.
+
+Chọn guard theo thứ bạn đang chờ:
+
+- `timeout({ first: ms })` kiểm tra deadline của value đầu. Sau value đầu, nó không tiếp tục canh completion nếu không có `each`.
+- `timeout({ each: ms })` kiểm tra khoảng im lặng, gồm lần chờ đầu nếu không cấu hình `first`. Stream phát đều mãi vẫn có thể không complete và không timeout; đây không phải tổng deadline.
+- `result$.pipe(toArray(), timeout({ first: ms }))` canh mảng cuối, nên hữu ích khi test cần completion của stream hữu hạn. Không dùng cách thu mảng này cho stream vô hạn hoặc dữ liệu quá lớn.
+
+<Callout type="warn" title="Đừng đổi lỗi thiếu completion thành thành công">
+  `takeUntil(timer(deadline))` tạo completion khi deadline đến. Nếu test đang cần chứng minh source tự complete, cách này có thể trả mảng dang dở rồi vẫn pass. `Promise.race()` với timeout chỉ kết thúc cuộc đua Promise, không tự unsubscribe bridge thua cuộc. Ưu tiên guard phát error trong stream, và phân biệt guard của harness với timeout thuộc business contract.
+</Callout>
+
+## Những test dễ pass giả hoặc bị treo
+
+| Triệu chứng | Nguyên nhân thường gặp | Cách sửa |
+| --- | --- | --- |
+| Test xanh dù callback chưa chạy | Chỉ gọi `subscribe()` rồi return | Return hoặc await Promise đại diện đúng contract |
+| Assertion trong `next` báo lỗi ngoài test | Observer callback ném lỗi không tự nối vào Promise của runner | Thu kết quả qua bridge, rồi assert trong thân test |
+| Error expectation xanh dù không có error | Dùng `try/catch` nhưng không fail khi Promise resolve | Dùng `assert.rejects()` hoặc `await expect(promise).rejects...` |
+| Test treo khi vẫn có giá trị | `lastValueFrom()` chờ source không complete | Kiểm tra completion contract; không ép `take(n)` chỉ để che lỗi |
+| Fake timer test chờ mãi | Await kết quả trước khi advance, hoặc subscribe sau khi advance | Subscribe trước, tiến clock, rồi await kết quả |
+| Marble test với Promise thiếu output | Promise nằm ngoài virtual clock | Tách adapter Promise sang async test thật |
+| Test sau bị ảnh hưởng timer cũ | Quên teardown hoặc khôi phục fake timers | Dọn tài nguyên test sở hữu trong cleanup, khôi phục clock |
+| Source bị gọi nhiều hơn dự kiến | Mỗi bridge tạo một subscription mới | Test một execution bằng một subscription; assert số lần gọi dependency |
+
+Nếu framework hỗ trợ `done`, runner chỉ chờ khi bạn gọi callback đó. Khi buộc phải dùng kiểu này, chuyển error vào `done(error)` và đảm bảo assertion failure cũng đến runner; đừng vừa nhận `done` vừa return Promise. Với Observable trong bài, bridge hoặc marble test thường giúp tránh toàn bộ nhánh xử lý callback này.
+
+## Checklist và bài tập
+
+Trước khi coi một async test là đủ, kiểm tra:
+
+- Test chờ value đầu, mảng cuối, completion hay cancellation? Tên test nói đúng contract đó chưa?
+- Promise assertion đã được `await` hoặc return cho runner chưa?
+- Empty stream và error có assertion riêng, thay vì được thay bằng default vô điều kiện chưa?
+- Clock chỉ có một chủ sở hữu: runtime thật, `TestScheduler` hoặc fake timers?
+- Test có giới hạn khi source sai, nhưng guard không biến lỗi thành completion thành công?
+- Subscription, timer, listener hoặc request do test mở có đường cleanup, kể cả khi assertion thất bại?
+
+Để luyện, sửa ví dụ `Subject` theo ba cách: bỏ `complete()`, phát error sau hai value, và phát input trước khi tạo bridge. Kết quả mong đợi lần lượt là `TimeoutError`, Promise rejection với error đã phát, và mất các value xảy ra trước subscription. Sau đó viết marble test cho `timeout` để kiểm tra frame mà không chờ thời gian thật.
+
+## Nguồn tham khảo
+
+- [RxJS — firstValueFrom](https://rxjs.dev/api/index/function/firstValueFrom) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/firstValueFrom.ts): resolve ở value đầu, unsubscribe, empty stream và error.
+- [RxJS — lastValueFrom](https://rxjs.dev/api/index/function/lastValueFrom) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/lastValueFrom.ts): chờ completion và nguy cơ Promise không settle.
+- [RxJS — timeout](https://rxjs.dev/api/index/function/timeout): phân biệt `first`, `each` và timeout error.
+- [RxJS — TestScheduler](https://rxjs.dev/api/testing/TestScheduler): virtual time và run mode.
+- [Vitest — vi API](https://vitest.dev/api/vi.html#vi-advancetimersbytimeasync): tiến fake timer theo kiểu async và khôi phục timer thật.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Assert timing, error và cửa sổ subscription bằng timeline." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Tách logic stream khỏi clock của runtime." />
+  <Card title="Integration tests" href="/docs/testing/integration-tests" description="Kiểm tra adapter tại ranh giới UI, HTTP và service." />
+</Cards>

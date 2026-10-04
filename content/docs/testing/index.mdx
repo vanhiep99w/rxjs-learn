@@ -3,21 +3,257 @@ title: Testing
 description: Kiểm thử pipeline RxJS bằng marble, TestScheduler và test tích hợp.
 ---
 
-Đây là trang khung cho nhóm **Testing** trong lộ trình học RxJS.
+Pipeline trả về đúng dữ liệu chưa chắc đã chạy đúng: kết quả có thể đến quá sớm, request cũ vẫn tiếp tục chạy, hoặc subscription còn sống sau khi component unmount. Với RxJS, test cần trả lời cả **giá trị nào được phát, lúc nào được phát và khi nào tài nguyên được giải phóng**.
+
+Trang này giúp bạn chọn cách kiểm thử trước khi đi vào các bài chuyên sâu. Mặc định, mình dùng unit test cho logic pipeline, virtual time cho quy tắc thời gian, rồi thêm integration test ở nơi stream nối với UI, HTTP hoặc service. Không cần biến mọi test thành marble test.
+
+<Callout type="info" title="Trước khi bắt đầu">
+  Bạn nên nắm [Vòng đời stream](/docs/nen-tang/vong-doi-stream), `pipe()` và `unsubscribe()`. Ví dụ dùng API của **RxJS 7.8.2**, với `node:test` và `node:assert/strict` trong một dự án test đã có RxJS và runner TypeScript. Bạn cũng có thể dùng Jest/Vitest với assertion tương đương; site tài liệu này không cần thêm dependency để hiển thị code.
+</Callout>
 
 ## Mục lục
 
-- [Phạm vi dự kiến](#phạm-vi-dự-kiến)
-- [Các bài trong nhóm](#các-bài-trong-nhóm)
+- [Test contract thay vì tên operator](#test-contract-thay-vì-tên-operator)
+- [Chọn cách kiểm thử theo ranh giới](#chọn-cách-kiểm-thử-theo-ranh-giới)
+- [Thiết kế pipeline để dễ test](#thiết-kế-pipeline-để-dễ-test)
+- [Một test thời gian với TestScheduler](#một-test-thời-gian-với-testscheduler)
+  - [Đọc timeline trước khi viết assertion](#đọc-timeline-trước-khi-viết-assertion)
+  - [Kiểm tra notification và subscription](#kiểm-tra-notification-và-subscription)
+- [Khi nào dùng async test](#khi-nào-dùng-async-test)
+- [Integration test cần chứng minh điều gì](#integration-test-cần-chứng-minh-điều-gì)
+- [Những lỗi làm test pass giả](#những-lỗi-làm-test-pass-giả)
+- [Checklist cho một pipeline](#checklist-cho-một-pipeline)
+- [Lộ trình trong nhóm Testing](#lộ-trình-trong-nhóm-testing)
+- [Bài tập tiếp theo](#bài-tập-tiếp-theo)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
 
-## Phạm vi dự kiến
+## Test contract thay vì tên operator
 
-Nhóm này cung cấp chiến lược kiểm thử xác định cho stream đồng bộ, bất đồng bộ và phụ thuộc thời gian.
+Giả sử bạn có ô tìm kiếm: chỉ gửi query sau khi người dùng ngừng gõ, chỉ hiển thị kết quả của query mới nhất, và dừng lắng nghe khi rời màn hình. Test “đã gọi `debounceTime` và `switchMap`” không chứng minh được ba yêu cầu ấy. Một refactor hợp lệ còn có thể thay cấu trúc pipeline mà vẫn giữ nguyên hành vi.
 
-## Các bài trong nhóm
+Hãy viết contract bằng hành vi quan sát được, rồi chọn assertion tương ứng:
 
-- **[Marble testing](/docs/testing/marble-testing)** — Biểu diễn timeline emission bằng marble syntax.
-- **[TestScheduler](/docs/testing/test-scheduler)** — Chạy assertion với virtual time.
-- **[Unit test custom operators](/docs/testing/unit-test-operators)** — Kiểm thử operator tùy biến theo input và output.
-- **[Kiểm thử async stream](/docs/testing/async-tests)** — Kiểm thử Promise bridge, timer và completion.
-- **[Integration tests](/docs/testing/integration-tests)** — Kiểm tra stream tại ranh giới UI, HTTP và service.
+| Mặt cần kiểm tra | Câu hỏi cụ thể | Assertion phù hợp |
+| --- | --- | --- |
+| Giá trị và thứ tự | Query cuối được chuẩn hóa đúng chưa? Có phát trùng không? | So giá trị hoặc expected notification |
+| Thời gian | Có phát trước khoảng lặng cho phép không? | Expected marble với virtual time |
+| Terminal notification | Stream complete, error hay tiếp tục sau lỗi? | Dấu complete/error trong marble, hoặc assertion async |
+| Subscription | Request cũ bị unsubscribe khi query mới đến chưa? | `expectSubscriptions()` cho source giả |
+| Teardown và side effect | Listener bị gỡ chưa? Adapter HTTP có gọi abort không? | Spy/counter teardown và integration test |
+
+**Complete không đồng nghĩa với unsubscribe.** Complete là notification gửi xuống Observer; unsubscribe có thể đóng subscription mà không gửi complete. Vì vậy, test chờ callback `complete` không phải cách chứng minh component đã cleanup.
+
+Tương tự, output không còn kết quả cũ chưa chắc request cũ đã bị hủy. `switchMap` unsubscribe inner cũ, nhưng việc đó có thực sự abort request hay không phụ thuộc teardown của source hoặc adapter. Đây là lý do cần kiểm tra lifecycle riêng với output.
+
+## Chọn cách kiểm thử theo ranh giới
+
+Marble là ký hiệu mô tả timeline; `TestScheduler` là công cụ thực thi và đối chiếu timeline ấy bằng virtual time. Hai thứ liên quan nhưng không đồng nghĩa: một sơ đồ marble trong tài liệu chỉ là minh họa, không tự chạy assertion.
+
+| Code đang test | Chọn trước | Vì sao |
+| --- | --- | --- |
+| Hàm chuẩn hóa, tính toán thuần | Unit test thông thường | Không có timeline cần điều khiển |
+| Pipeline đồng bộ như `map`, `filter` | Unit test thông thường; marble nếu cần giữ contract timeline | Không cần timer thật chỉ để so giá trị |
+| Debounce, delay, timeout, retry có delay | `TestScheduler.run()` | Kiểm tra mốc thời gian mà không chờ thật |
+| Flattening và cancellation như `switchMap` | Marble cùng subscription assertion | Phải chứng minh inner nào còn hoạt động |
+| `from(Promise)`, Promise bridge, I/O thật | Async test có `await` hoặc trả Promise cho runner | Native Promise và I/O không do clock ảo điều khiển |
+| DOM, component, HTTP adapter, service wiring | Integration test | Unit test pipeline không chứng minh adapter được nối và cleanup đúng |
+
+Một unit test cũng có thể là async test; một integration test cũng có thể dùng fake timer. Bảng này phân biệt **ranh giới cần chứng minh**, không chia mọi test thành các loại loại trừ nhau.
+
+Mình ưu tiên virtual time khi thời gian là một phần của yêu cầu. Với phép biến đổi thuần, assertion thông thường thường dễ đọc hơn; với HTTP thật, ép mọi thứ vào marble lại che mất phần cần kiểm tra.
+
+<Callout type="warn" title="Clock ảo không điều khiển toàn bộ event loop">
+  Trong `run()`, timer qua scheduler/provider của RxJS như `debounceTime` và `delay` được virtualize. Native Promise, `fetch()` thật và `setTimeout()` bạn gọi trực tiếp không tự trở thành virtual time. Đừng kết hợp `run(async () => ...)` với kỳ vọng scheduler sẽ chờ `await`, hoặc tùy tiện trộn TestScheduler với fake timer của runner.
+</Callout>
+
+## Thiết kế pipeline để dễ test
+
+Nếu pipeline tự đọc DOM, tự gọi HTTP và tự subscribe ngay trong cùng một hàm, test phải dựng cả môi trường chỉ để kiểm tra một phép biến đổi. Tách phần tạo source và thực hiện side effect khỏi phần ghép operator giúp bạn đưa source giả vào mà vẫn test đúng logic production.
+
+Ví dụ, phần chuẩn hóa query có thể chỉ nhận một `Observable<string>` và trả về Observable mới:
+
+```ts
+import { debounceTime, distinctUntilChanged, map } from 'rxjs';
+import type { Observable } from 'rxjs';
+
+export function queryChanges(input$: Observable<string>): Observable<string> {
+  return input$.pipe(
+    map((query) => query.trim()),
+    debounceTime(300),
+    distinctUntilChanged(),
+  );
+}
+```
+
+Hàm không subscribe thay caller, nên UI/service có thể tự quyết định vòng đời. Unit test truyền `cold()` hoặc `hot()` vào `queryChanges`; integration test kiểm tra source thực và nơi subscribe. Nếu dùng hàm này trong ứng dụng, test nên import chính hàm production, không sao chép implementation vào file test.
+
+Với pipeline gọi service, nhận một hàm như `search(query): Observable<Result>` qua tham số hoặc dependency injection. Unit test có thể trả về cold Observable với timeline định trước. Sau đó test adapter riêng để xác nhận nó thật sự chuyển response, error và teardown đúng như contract.
+
+Không cần thêm scheduler argument vào mọi hàm chỉ để test timer mặc định của RxJS: `TestScheduler.run()` đã hỗ trợ virtual time cho các operator ấy. Inject scheduler khi code thật sự cần điều khiển scheduling tường minh, chứ không phải như một nghi thức bắt buộc.
+
+## Một test thời gian với TestScheduler
+
+Bắt đầu bằng một contract nhỏ: giữ giá trị mới nhất khi có khoảng lặng đủ `3` ms. Con số này chỉ là duration minh họa để timeline ngắn; nó không phải đề xuất debounce cho UI production.
+
+### Đọc timeline trước khi viết assertion
+
+Source phát `a` ở frame `1`, `b` ở frame `3` và `c` ở frame `8`. Đọc theo cột dọc để so input và output; trong ví dụ `run()` này, một frame bằng một millisecond ảo.
+
+<MarbleDiagram
+  title="debounceTime(3)"
+  frameLabel="1 khoảng = 1 ms ảo"
+  rows={[
+    { label: 'source', marble: '-a-b----c----|', kind: 'source' },
+    { label: 'subscription', marble: '^------------!', kind: 'subscription' },
+    { label: 'output', marble: '------b----c-|', kind: 'output' },
+  ]}
+  values={{ a: 'r', b: 'rx', c: 'rxjs' }}
+  caption="b thay a trước khi a đủ thời gian chờ; b được phát ở frame 6, c ở frame 11. Source và output complete ở frame 13."
+/>
+
+`a` lẽ ra đủ thời gian chờ ở frame `4`, nhưng `b` đến trước đó nên thay nó. Không có input mới trong ba frame sau `b`, vì vậy output phát `b` ở frame `6`. `c` cũng chờ đủ ba frame rồi được phát ở frame `11`.
+
+Dấu `|` ở frame `13` là complete; dấu `!` cùng frame trong hàng subscription cho biết subscription đã đóng. Hàng subscription là log lifecycle riêng, không phải notification string đưa vào `cold()`.
+
+### Kiểm tra notification và subscription
+
+Test dưới đây thực thi đúng timeline của sơ đồ. Mỗi test tạo một `TestScheduler` mới; callback constructor phải dùng assertion ném lỗi khi actual khác expected.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { it } from 'node:test';
+import { debounceTime } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+it('giữ query mới nhất sau khoảng lặng', () => {
+  const scheduler = new TestScheduler((actual, expected) => {
+    deepStrictEqual(actual, expected);
+  });
+
+  scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+    const values = { a: 'r', b: 'rx', c: 'rxjs' };
+    const source$ = cold('-a-b----c----|', values);
+    const result$ = source$.pipe(debounceTime(3));
+
+    expectObservable(result$).toBe('------b----c-|', values);
+    expectSubscriptions(source$.subscriptions).toBe('^------------!');
+  });
+});
+```
+
+Callback `run()` đăng ký expectation, rồi scheduler tự flush khi callback return. Test không cần `sleep(3)` và không chờ từng millisecond thật. Nếu expected sai giá trị, sai frame hoặc sai complete, assertion làm test fail.
+
+Vì example dùng cold source, timeline của nó bắt đầu khi được subscribe, ở đây là frame `0`. Với event đã có timeline chung và có thể đến trước khi consumer subscribe, dùng `hot()` để mô hình hóa; chọn source chỉ vì chuỗi dễ viết có thể làm test bỏ sót event bị mất.
+
+<Callout type="info" title="Đừng suy ra mọi case từ một timeline">
+  `debounceTime` phát giá trị đang chờ ngay khi source complete, chứ không luôn chờ đủ duration; nếu source error, giá trị đang chờ bị bỏ và error đi xuống. Timeline trên cố tình complete sau khi `c` đã được phát. Bạn cần test riêng cho complete sớm, error và unsubscribe trong lúc còn giá trị pending.
+</Callout>
+
+Bài [Marble testing](/docs/testing/marble-testing) giải thích syntax, còn [TestScheduler](/docs/testing/test-scheduler) đi sâu vào `hot`, `cold`, cửa sổ subscription và cancellation. Không cần học hết helper trước khi viết test đầu tiên.
+
+## Khi nào dùng async test
+
+Nếu source thật được tạo từ Promise, hãy để runner chờ Promise của test. `TestScheduler` không virtualize native Promise microtask; thay Promise thật bằng cold Observable chỉ test phần pipeline phía sau adapter, không test chính adapter đó.
+
+Ví dụ độc lập này kiểm tra bridge từ Promise sang Observable:
+
+```ts
+import { strictEqual } from 'node:assert/strict';
+import { it } from 'node:test';
+import { firstValueFrom, from, timeout } from 'rxjs';
+
+it('nhận giá trị từ Promise bridge', async () => {
+  const source$ = from(Promise.resolve('ok')).pipe(
+    timeout({ first: 1_000 }),
+  );
+
+  const value = await firstValueFrom(source$);
+  strictEqual(value, 'ok');
+});
+```
+
+`await` khiến runner chờ đến khi assertion chạy xong. `timeout` ở đây là guard minh họa để source lỗi nếu không có notification kịp thời, không phải assertion rằng Promise phải hoàn thành chính xác sau một giây. Với integration test, chọn giới hạn phù hợp và đặt thêm timeout của runner để chặn cả lỗi khiến test bị treo ngoài stream.
+
+Chọn Promise bridge theo contract:
+
+- `firstValueFrom()` resolve khi có giá trị đầu tiên rồi unsubscribe; nó **không chứng minh source complete**.
+- `lastValueFrom()` chỉ resolve khi source complete và trả giá trị cuối; không dùng trên stream vô hạn nếu chưa có điều kiện kết thúc.
+- Cả hai reject khi source error; nếu source complete mà chưa phát giá trị, mặc định chúng reject với `EmptyError`.
+
+Nếu cần kiểm tra toàn bộ chuỗi của một source hữu hạn, có thể gom bằng `toArray()` rồi chờ completion. Đừng gom một stream sống mãi mà không giới hạn lifecycle; test sẽ không có kết quả để assert. Đọc thêm ở [Kiểm thử async stream](/docs/testing/async-tests).
+
+## Integration test cần chứng minh điều gì
+
+Unit test có thể chứng minh query mới unsubscribe inner cũ. Nó không chứng minh button được nối đúng event, request dùng đúng URL, hoặc unmount đã gỡ listener. Integration test nên tập trung vào những mối nối này thay vì lặp lại toàn bộ ma trận marble.
+
+Với ô tìm kiếm giả định ở đầu bài, chọn vài tình huống có giá trị:
+
+1. Phát event qua ranh giới UI thật của test, kiểm tra query gửi tới service đã được chuẩn hóa đúng.
+2. Cho hai response về ngược thứ tự, kiểm tra UI không bị kết quả cũ ghi đè.
+3. Rời màn hình khi request còn pending, kiểm tra cleanup và hành vi abort nếu adapter có contract đó.
+4. Cho service lỗi, kiểm tra trạng thái lỗi và khả năng thực hiện lượt tìm kiếm tiếp theo theo thiết kế.
+
+Mặc định, mình dùng HTTP mock/test server có thể điều khiển response cho integration test. Backend thật phù hợp hơn với một nhóm end-to-end riêng; để unit test phụ thuộc mạng bên ngoài sẽ khiến lỗi mạng trông giống lỗi pipeline.
+
+<Callout type="warn" title="Mock phải giữ contract của adapter">
+  Mock luôn trả `of(response)` đồng bộ có thể che mất race condition hoặc thiếu teardown. Nếu cần kiểm tra response đến muộn, hãy dùng source có thể điều khiển thời điểm trả về. Nếu cần kiểm tra abort thật, dùng harness của adapter hoặc transport mock có thể quan sát abort; subscription log của source giả không đủ chứng minh điều đó.
+</Callout>
+
+Chi tiết về các ranh giới này nằm ở [Integration tests](/docs/testing/integration-tests).
+
+## Những lỗi làm test pass giả
+
+| Dấu hiệu | Vấn đề | Cách sửa |
+| --- | --- | --- |
+| Chỉ assert trong callback `next` | Nếu không có emission, assertion không chạy mà test vẫn có thể kết thúc | Dùng expected marble hoặc trả/await Promise với giới hạn phù hợp |
+| Gọi `subscribe()` rồi test return ngay | Notification async đến sau khi runner coi test đã xong | Để runner chờ Promise hoặc dùng cơ chế async của runner đúng cách |
+| Callback TestScheduler chỉ log hoặc trả boolean | Không có lỗi được ném khi actual sai | Dùng deep equality assertion thật |
+| Dùng `firstValueFrom()` để chứng minh cleanup khi complete | Bridge unsubscribe ngay ở giá trị đầu, bỏ qua contract complete | Assert terminal notification và teardown riêng |
+| Chỉ so mảng output của `switchMap` | Không biết inner cũ đóng lúc nào | Thêm subscription assertion và test adapter nếu cần abort |
+| `run()` gặp `interval` không có điểm dừng | Scheduler tiếp tục có công việc, test có thể chạy mãi | Dùng `take`, `takeUntil` hoặc cửa sổ unsubscribe trong test |
+| Assert side effect trước khi flush | Công việc ảo chưa chạy | Assert sau `run()` hoặc gọi helper `flush()` trước assertion trong callback |
+| Chờ timer thật cho từng case debounce | Test chậm và dễ nhạy với tải CI | Chuyển contract thời gian sang virtual time |
+
+Ngoài ra, đừng subscribe thêm chỉ để debug trong test nếu không chủ đích kiểm tra nhiều consumer. Với cold Observable, mỗi subscription có thể tạo execution và side effect riêng, làm log lifecycle khác với pipeline bạn tưởng đang test.
+
+## Checklist cho một pipeline
+
+Không phải pipeline nào cũng cần mọi case. Dùng checklist này để chọn case theo contract, không để tăng số lượng test một cách máy móc:
+
+- [ ] Happy path: giá trị và thứ tự đúng, kể cả input trùng hoặc không hợp lệ nếu có quy tắc xử lý.
+- [ ] Timing: chưa phát trước deadline; emission mới thay đổi quyết định chờ đúng cách.
+- [ ] Complete: source kết thúc khi còn dữ liệu pending hoặc trước khi có giá trị đầu tiên.
+- [ ] Error: terminal error hoặc recovery đúng; retry có giới hạn nếu đó là thiết kế.
+- [ ] Cancellation: downstream unsubscribe khi upstream/inner còn hoạt động.
+- [ ] Teardown: subscription, listener, timer và request được giải phóng theo contract.
+- [ ] Isolation: scheduler/state mới cho mỗi test, không để execution cũ ảnh hưởng test sau.
+- [ ] Assertion thực sự chạy và test có điểm dừng xác định.
+
+## Lộ trình trong nhóm Testing
+
+Nếu mới bắt đầu, đọc Marble testing rồi TestScheduler và áp dụng vào một pipeline nhỏ. Nếu đang debug một integration cụ thể, bạn có thể đi thẳng tới bài async hoặc integration; không cần học toàn bộ marble syntax trước.
+
+<Cards>
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Đọc notification, đếm frame và mô tả expected timeline." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Dùng run(), source giả và subscription assertion với virtual time." />
+  <Card title="Unit test custom operators" href="/docs/testing/unit-test-operators" description="Kiểm tra contract của operator tùy biến, bao gồm error và teardown." />
+  <Card title="Kiểm thử async stream" href="/docs/testing/async-tests" description="Chờ Promise bridge và stream hữu hạn mà không bỏ sót assertion." />
+  <Card title="Integration tests" href="/docs/testing/integration-tests" description="Kiểm tra wiring và lifecycle ở ranh giới UI, HTTP và service." />
+</Cards>
+
+## Bài tập tiếp theo
+
+Lấy test `debounceTime(3)` ở trên và thêm ba case trước khi ghép với service:
+
+1. Source `-a|`: output phải phát `a` và complete cùng frame `2`, viết expected `--(a|)`. Đây là completion flush, không phải chờ đủ ba frame.
+2. Source `-a#`: output phải error ở frame `2` mà không phát `a`; dùng cùng một error object cho source và expected để assertion rõ ràng.
+3. Source `-a-----` nhưng downstream unsubscribe ở frame `2`: không có output, và log source subscription phải là `^-!`.
+
+Sau đó thử cố tình đổi expected của một case cho sai một frame và xác nhận test fail. Đây là cách kiểm tra nhanh rằng assertion của bạn đang thực sự bảo vệ contract, thay vì chỉ chạy code rồi báo xanh.
+
+## Nguồn tham khảo
+
+- [RxJS — Testing RxJS Code with Marble Diagrams](https://rxjs.dev/guide/testing/marble-testing).
+- [Hướng dẫn marble testing trong source RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/docs_app/content/guide/testing/marble-testing.md).
+- [Implementation debounceTime trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/debounceTime.ts) — đối chiếu completion flush và error.
+- [RxJS — firstValueFrom](https://rxjs.dev/api/index/function/firstValueFrom) và [lastValueFrom](https://rxjs.dev/api/index/function/lastValueFrom).

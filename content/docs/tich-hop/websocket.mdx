@@ -3,8 +3,574 @@ title: WebSocket
 description: Mô hình hóa kết nối hai chiều và reconnect.
 ---
 
-Trang này sẽ trình bày **WebSocket** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn mở một dashboard giá trực tiếp: server đẩy dữ liệu liên tục, hai widget cùng đọc, rồi mạng mất giữa chừng. Bọc `message` thành Observable mới giải quyết phần nhận dữ liệu; bạn vẫn phải quyết định ai giữ kết nối, khi nào reconnect và lệnh gửi trong lúc offline sẽ đi đâu.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+`webSocket` của RxJS giúp gom gửi, nhận và teardown vào một `WebSocketSubject`. Bài này đi từ kết nối đơn giản đến một client có retry hữu hạn, rồi tách nhiều topic trên cùng socket. Mình chọn **một owner cho kết nối**, thay vì để mỗi widget tự tạo socket và tự retry.
+
+<Callout type="info" title="Phạm vi và điều kiện chạy">
+  Các ví dụ dùng API **RxJS 7.8.2**, TypeScript và WebSocket của browser. Chạy phần kết nối ở client, không ở lúc render SSR. Endpoint `ws://localhost:8080/quotes` là ví dụ: bạn cần server hỗ trợ protocol JSON mô tả bên dưới, không phải dịch vụ có sẵn. Nên đọc [Subject](/docs/subjects-multicasting/subject), [share](/docs/subjects-multicasting/share) và [Retry](/docs/loi-hoan-tat/retry-retry-when) trước.
 </Callout>
+
+## Mục lục
+
+- [Khi nào nên dùng WebSocket](#khi-nào-nên-dùng-websocket)
+- [Mental model của WebSocketSubject](#mental-model-của-websocketsubject)
+- [Kết nối và gửi nhận JSON](#kết-nối-và-gửi-nhận-json)
+  - [Protocol minh họa](#protocol-minh-họa)
+  - [Ví dụ kết nối tối thiểu](#ví-dụ-kết-nối-tối-thiểu)
+  - [Kiểu TypeScript không kiểm tra payload](#kiểu-typescript-không-kiểm-tra-payload)
+- [Vòng đời và các cách đóng kết nối](#vòng-đời-và-các-cách-đóng-kết-nối)
+- [Reconnect có giới hạn](#reconnect-có-giới-hạn)
+  - [Retry khác với repeat](#retry-khác-với-repeat)
+  - [Client có một owner](#client-có-một-owner)
+  - [Sử dụng và dừng client](#sử-dụng-và-dừng-client)
+- [Nhiều topic với multiplex](#nhiều-topic-với-multiplex)
+- [Offline và phục hồi dữ liệu](#offline-và-phục-hồi-dữ-liệu)
+  - [Gửi thành công không có nghĩa server đã xử lý](#gửi-thành-công-không-có-nghĩa-server-đã-xử-lý)
+  - [Heartbeat và consumer chậm](#heartbeat-và-consumer-chậm)
+- [Bảo mật và môi trường chạy](#bảo-mật-và-môi-trường-chạy)
+- [Kiểm chứng và xử lý sự cố](#kiểm-chứng-và-xử-lý-sự-cố)
+  - [Kiểm tra thời điểm retry bằng TestScheduler](#kiểm-tra-thời-điểm-retry-bằng-testscheduler)
+  - [Checklist integration test](#checklist-integration-test)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Khi nào nên dùng WebSocket
+
+WebSocket phù hợp khi server phải đẩy dữ liệu và client cũng gửi lệnh thường xuyên: chat, game, bảng giá hoặc cộng tác trên tài liệu. Một connection tồn tại lâu, nên bạn có thể xử lý từng message bằng `filter`, `scan`, `auditTime` và các operator khác thay vì gắn logic riêng vào từng callback.
+
+Nếu chỉ cần gọi API khi bấm nút, mình dùng HTTP. Nếu dữ liệu chỉ đi từ server xuống browser, cân nhắc Server-Sent Events; nếu cập nhật thưa và không cần độ trễ thấp, polling dễ vận hành hơn. RxJS không làm WebSocket đáng dùng hơn trong những trường hợp ấy; nó giúp quản lý stream khi bạn đã có lý do dùng connection hai chiều.
+
+## Mental model của WebSocketSubject
+
+Có hai chiều riêng biệt, dù cùng nằm trên một object:
+
+```text
+client gọi socket$.next(command) ──► WebSocket ──► server
+client subscribe(socket$)       ◄── WebSocket ◄── server
+```
+
+`socket$.next(value)` **gửi ra server**, không phát trực tiếp cho subscriber của `socket$`. Subscriber chỉ nhận message server gửi về. Nếu server echo lại lệnh thì bạn mới thấy lệnh đó ở chiều nhận.
+
+`webSocket(...)` tạo một `WebSocketSubject`, nhưng kết nối bắt đầu khi có subscriber đầu tiên. Các subscriber trên **cùng instance** dùng chung socket đang hoạt động. Subscriber đến muộn chỉ nhận message mới, không được replay lịch sử message server đã gửi.
+
+Điều này khác với cold HTTP Observable, nơi mỗi subscription có thể tạo request riêng. Tuy vậy, gọi `webSocket(...)` hai lần vẫn tạo hai instance và có thể mở hai connection. Khi subscriber cuối cùng rời instance đang hoạt động, RxJS đóng socket; đây là cơ chế quản lý tài nguyên, không phải dấu hiệu server đã gửi `complete`.
+
+<Callout type="warn" title="Đừng nhầm hai loại buffer">
+  Trong RxJS 7.8.2, các giá trị gọi `next` trước khi socket mở được buffer để gửi khi mở. Điều đó không làm dữ liệu nhận từ server trở thành replay stream, và cũng không phải outbox bền vững cho lệnh offline. Buffer gửi mặc định không có giới hạn do bạn cấu hình.
+</Callout>
+
+## Kết nối và gửi nhận JSON
+
+### Protocol minh họa
+
+Giả sử server hiểu hai lệnh sau và trả hai loại event. Các giá và symbol dưới đây chỉ là dữ liệu minh họa:
+
+| Chiều | Payload | Ý nghĩa |
+| --- | --- | --- |
+| Client → server | `{"type":"subscribe","symbol":"ABC"}` | Đăng ký nhận giá ABC |
+| Client → server | `{"type":"unsubscribe","symbol":"ABC"}` | Ngừng nhận giá ABC |
+| Server → client | `{"type":"quote","symbol":"ABC","price":101}` | Một cập nhật giá |
+| Server → client | `{"type":"ready"}` | Server báo phiên ứng dụng đã sẵn sàng |
+
+`subscribe` ở đây là tên lệnh của **protocol ứng dụng**. Nó không phải lời gọi `.subscribe()` của RxJS. Server phải tự triển khai ý nghĩa của lệnh; WebSocket không có topic hay room tích hợp sẵn.
+
+### Ví dụ kết nối tối thiểu
+
+Ví dụ độc lập này chủ động subscribe trước, gửi đăng ký và trả về hàm cleanup. Với protocol này, lệnh được phép gửi ngay sau khi transport mở; nếu server yêu cầu chờ event `ready` hoặc xác thực thêm, cần đợi bước đó rồi mới đăng ký topic.
+
+```ts
+import { webSocket } from 'rxjs/webSocket';
+
+type ClientMessage = {
+  type: 'subscribe' | 'unsubscribe';
+  symbol: string;
+};
+
+type ServerMessage =
+  | { type: 'quote'; symbol: string; price: number }
+  | { type: 'ready' };
+
+type WireMessage = ClientMessage | ServerMessage;
+
+function startQuotes(): () => void {
+  const socket$ = webSocket<WireMessage>({
+    url: 'ws://localhost:8080/quotes',
+    openObserver: {
+      next: () => console.log('transport open'),
+    },
+    closeObserver: {
+      next: (event) => console.log('transport close', {
+        code: event.code,
+        reason: event.reason,
+        wasClean: event.wasClean,
+      }),
+    },
+  });
+
+  const subscription = socket$.subscribe({
+    next: (message) => {
+      if (message.type === 'quote') {
+        console.log(message.symbol, message.price);
+      }
+    },
+    error: (error) => console.error('socket error', error),
+    complete: () => console.log('receive stream complete'),
+  });
+
+  // Nếu transport chưa mở, WebSocketSubject buffer lệnh này.
+  socket$.next({ type: 'subscribe', symbol: 'ABC' });
+
+  return () => subscription.unsubscribe();
+}
+
+const stopQuotes = startQuotes();
+// Khi màn hình bị tháo khỏi UI, gọi stopQuotes().
+```
+
+Mặc định `serializer` là `JSON.stringify`, còn `deserializer` là `JSON.parse(event.data)`. Vì vậy hãy truyền object vào `next`, không stringify trước rồi để serializer stringify lần nữa. Khi server gửi một message `quote`, bạn sẽ thấy symbol và giá trong console; `next` ở client không tự tạo output đó.
+
+Nếu protocol là text thuần, cấu hình rõ `serializer: (text: string) => text` và `deserializer: (event) => String(event.data)` trên `webSocket<string>`. Với binary, chọn `binaryType` phù hợp và viết decoder riêng; decoder JSON không đọc được `ArrayBuffer`.
+
+### Kiểu TypeScript không kiểm tra payload
+
+Generic `webSocket<WireMessage>` chỉ giúp compiler. Nó không ngăn server gửi `{"type":"quote","price":"sai kiểu"}`, và `JSON.parse` vẫn trả object đó. Khi dữ liệu đi qua network, hãy nhận `unknown` rồi kiểm tra schema trước khi đưa vào domain stream.
+
+Các đoạn trong phần client reconnect dùng các kiểu `ClientMessage`, `ServerMessage`, `WireMessage` ở trên và decoder dưới đây. Bạn có thể đặt chúng trong cùng một module TypeScript:
+
+```ts
+class ProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProtocolError';
+  }
+}
+
+function decodeServerMessage(event: MessageEvent): ServerMessage {
+  if (typeof event.data !== 'string') {
+    throw new ProtocolError('Expected a JSON text message');
+  }
+
+  let value: unknown;
+  try {
+    value = JSON.parse(event.data);
+  } catch {
+    throw new ProtocolError('Invalid JSON');
+  }
+
+  if (typeof value !== 'object' || value === null) {
+    throw new ProtocolError('Expected an object');
+  }
+
+  const message = value as Record<string, unknown>;
+  if (message.type === 'ready') return { type: 'ready' };
+
+  if (
+    message.type === 'quote' &&
+    typeof message.symbol === 'string' &&
+    typeof message.price === 'number' &&
+    Number.isFinite(message.price)
+  ) {
+    return {
+      type: 'quote',
+      symbol: message.symbol,
+      price: message.price,
+    };
+  }
+
+  throw new ProtocolError('Unknown or invalid server message');
+}
+```
+
+Trong ví dụ này, lỗi protocol làm receive stream error. Mình không retry lỗi ấy vì reconnect không sửa được schema sai. Nếu muốn bỏ riêng một payload hỏng mà giữ connection, nhận raw payload rồi decode trong một nhánh xử lý từng message; đừng thay payload hỏng bằng object mặc định khiến UI tưởng đó là dữ liệu thật.
+
+## Vòng đời và các cách đóng kết nối
+
+`openObserver` báo transport đã mở. `closeObserver` nhận `CloseEvent` để bạn ghi log, nhưng **observer này không tự quyết định stream phải error hay complete**. Trong RxJS 7.8.2, handler `onclose` gọi complete khi `event.wasClean` là `true`, và error khi nó là `false`; lỗi transport qua `onerror` cũng đi vào error channel.
+
+`wasClean` chỉ nói về việc đóng connection ở tầng protocol, không nói thao tác nghiệp vụ đã thành công. Một server đang restart có thể đóng connection sạch nhưng bạn vẫn muốn reconnect. Ngược lại, một phiên bị từ chối quyền truy cập có thể cần dừng, không retry.
+
+| Thao tác hoặc sự kiện | Tác động cần nhớ |
+| --- | --- |
+| Một consumer gọi `subscription.unsubscribe()` | Consumer đó dừng nhận; socket còn nếu instance vẫn có consumer khác |
+| Consumer cuối unsubscribe | RxJS đóng socket đang hoạt động; consumer đã unsubscribe không nhận callback complete |
+| Owner gọi `socket$.complete()` | Yêu cầu đóng connection dùng chung; không dùng để cleanup một widget khi widget khác còn cần socket |
+| Gọi `socket$.error({ code: 4000, reason: 'client shutdown' })` khi socket mở | Yêu cầu đóng với code/reason; đây không phải `Subject.error(new Error(...))` thông thường |
+| Server đóng sạch | Receive stream complete theo `wasClean`; `retry` không chạy vì chưa có error |
+| Server đóng không sạch hoặc transport error | Receive stream error; policy retry có thể tạo lần kết nối tiếp theo |
+
+Code truyền vào `WebSocket.close` phải hợp lệ với browser: thường là `1000` hoặc code ứng dụng trong khoảng `3000–4999`. `1006` dùng để quan sát đóng bất thường, không phải code bạn gửi trong close frame. Giữ reason ngắn và không chứa secret.
+
+Mình thường cleanup bằng subscription và để owner quản lý đóng toàn cục. Không gọi `socket$.unsubscribe()` cho từng consumer: thao tác đó đóng chính Subject, khác với bỏ một subscription nhận message.
+
+## Reconnect có giới hạn
+
+### Retry khác với repeat
+
+`retry` subscribe lại khi **error**, còn `repeat` subscribe lại khi **complete**. Ghép `retry()` và `repeat()` vô hạn có thể làm client kết nối mãi sau khi người dùng logout hoặc server chủ động kết thúc phiên.
+
+Mặc định mình phân loại close code ở owner: code `1000` kết thúc bình thường, `1008` dừng vì policy violation, các code khác thử lại có giới hạn. Đây là **policy minh họa**, không phải quy tắc bắt buộc của WebSocket; hãy thêm code nghiệp vụ của backend vào danh sách không retry, ví dụ code báo phiên đăng nhập hết hạn.
+
+Đọc theo cột dọc trong sơ đồ: attempt đầu đã phát `a` trước khi lỗi; retry không xóa `a` và không replay nó.
+
+<MarbleDiagram
+  title="retry({ count: 1, delay })"
+  rows={[
+    { label: 'attempt 1', marble: '^-a-#', kind: 'source' },
+    { label: 'delay', marble: '----^--|', kind: 'subscription' },
+    { label: 'attempt 2', marble: '-------^-b--|', kind: 'inner' },
+    { label: 'output', marble: '--a------b--|', kind: 'output' },
+  ]}
+  values={{ a: 'message trước lỗi', b: 'message của connection mới' }}
+  caption="Lỗi ở frame 4; đợi 3 frame rồi subscribe lại ở frame 7. Attempt 2 complete ở frame 12 nên retry không mở attempt 3."
+/>
+
+`a` xuất hiện ở frame 2, `b` ở frame 9. Output không error ở frame 4 vì vẫn còn lượt retry. Đây là virtual timeline của policy retry, không mô phỏng thời gian handshake ngoài mạng; test ở cuối trang kiểm chứng đúng các mốc này.
+
+### Client có một owner
+
+Client dưới đây tạo socket mới trong `defer` cho mỗi attempt, giữ một receive pipeline chung và không nhận lệnh gửi khi chưa open. Các thời gian backoff là cấu hình minh họa: tăng từ khoảng 500 ms, có jitter và giới hạn trên 10 giây.
+
+Lệnh gửi trong lúc connecting/retrying bị **từ chối**, không âm thầm xếp hàng. Cách này phù hợp với stream giá: UI có thể disable nút hoặc báo offline, thay vì gửi lại một hành động đã hết ý nghĩa sau khi mạng phục hồi.
+
+```ts
+import {
+  BehaviorSubject,
+  EMPTY,
+  Subject,
+  concatWith,
+  defer,
+  filter,
+  finalize,
+  retry,
+  share,
+  takeUntil,
+  throwError,
+  timer,
+} from 'rxjs';
+import { webSocket, type WebSocketSubject } from 'rxjs/webSocket';
+
+type ConnectionState = 'idle' | 'connecting' | 'open' | 'retrying' | 'closed';
+
+class SocketClosedError extends Error {
+  constructor(readonly code: number, readonly reason: string) {
+    super(`Socket closed: ${code} ${reason}`);
+    this.name = 'SocketClosedError';
+  }
+}
+
+function isServerMessage(message: WireMessage): message is ServerMessage {
+  return message.type === 'quote' || message.type === 'ready';
+}
+
+function createQuoteClient(url: string) {
+  const state = new BehaviorSubject<ConnectionState>('idle');
+  const stop$ = new Subject<void>();
+  let destroyed = false;
+  let active: WebSocketSubject<WireMessage> | undefined;
+
+  const attempt$ = defer(() => {
+    if (destroyed) return EMPTY;
+
+    let lastClose: CloseEvent | undefined;
+    state.next('connecting');
+
+    const socket$ = webSocket<WireMessage>({
+      url,
+      deserializer: decodeServerMessage,
+      openObserver: { next: () => state.next('open') },
+      closeObserver: {
+        next: (event) => {
+          lastClose = event;
+          console.log('socket close', {
+            code: event.code,
+            wasClean: event.wasClean,
+          });
+        },
+      },
+    });
+    active = socket$;
+
+    return socket$.pipe(
+      filter(isServerMessage),
+      // Chỉ chạy nhánh này khi receive stream complete.
+      concatWith(defer(() => {
+        if (lastClose?.code === 1000 || lastClose?.code === 1008) {
+          return EMPTY;
+        }
+        return throwError(() => new SocketClosedError(
+          lastClose?.code ?? 1006,
+          lastClose?.reason ?? 'Connection ended',
+        ));
+      })),
+      finalize(() => {
+        if (active === socket$) active = undefined;
+      }),
+    );
+  });
+
+  const messages$ = attempt$.pipe(
+    retry({
+      count: 5,
+      // Tổng ngân sách của execution, không reset mỗi khi có message.
+      resetOnSuccess: false,
+      delay: (error: unknown, retryCount) => {
+        if (error instanceof ProtocolError) {
+          return throwError(() => error);
+        }
+        const code = error instanceof SocketClosedError
+          ? error.code
+          : (error as CloseEvent | undefined)?.code;
+        if (code === 1000 || code === 1008) {
+          return throwError(() => error);
+        }
+
+        state.next('retrying');
+        const base = Math.min(500 * 2 ** (retryCount - 1), 10_000);
+        const wait = Math.round(base * (0.5 + Math.random() * 0.5));
+        console.log('retry scheduled', { retryCount, wait });
+        return timer(wait);
+      },
+    }),
+    // Đặt sau retry để dừng cả connection lẫn timer backoff.
+    takeUntil(stop$),
+    finalize(() => {
+      if (!destroyed) state.next('closed');
+    }),
+    // Consumer dùng chung cả socket lẫn ngân sách retry.
+    share(),
+  );
+
+  return {
+    messages$,
+    state$: state.asObservable(),
+    send(message: ClientMessage): boolean {
+      if (destroyed || state.value !== 'open' || !active) return false;
+      active.next(message);
+      return true;
+    },
+    destroy(): void {
+      if (destroyed) return;
+      destroyed = true;
+      stop$.next();
+      stop$.complete();
+      state.next('closed');
+      state.complete();
+    },
+  };
+}
+```
+
+Vì `share()` nằm **sau** retry nên hai widget dùng chung một chuỗi reconnect. Nếu đặt retry riêng trong mỗi widget, bạn tạo nhiều ngân sách và lịch reconnect độc lập, kể cả khi chúng ban đầu đọc cùng một socket.
+
+`count: 5` cho phép tối đa năm lần thử lại sau attempt đầu, tức tối đa sáu attempt trong một execution. Không bật `resetOnSuccess: true` ở ví dụ này: với stream nhận message thường xuyên, tùy chọn ấy reset counter sau mỗi message và có thể khiến chuỗi reconnect kéo dài mãi.
+
+Client không giữ socket khi không còn consumer của `messages$`. Một subscription chỉ nghe `state$` cũng không mở connection. Sau complete, error hoặc refCount về 0, `share()` mặc định reset; một subscription mới có thể bắt đầu execution mới. Riêng `destroy()` là dừng vĩnh viễn instance: guard trong `defer` ngăn subscriber đến sau mở lại socket.
+
+<Callout type="warn" title="Policy chưa phải client production đầy đủ">
+  Browser có thể báo lỗi handshake bằng một `Event` không có close code chi tiết, nên nhánh error chưa chắc phân biệt được lỗi mạng với lỗi xác thực. Ví dụ dùng retry hữu hạn để tránh lặp vô hạn; production còn cần timeout kết nối, handshake ứng dụng, danh sách close code theo backend và metrics. `open` ở đây là transport open, không phải đã đăng nhập hay đăng ký topic thành công.
+</Callout>
+
+### Sử dụng và dừng client
+
+Ghép đoạn sử dụng này với các kiểu, decoder và factory phía trên. Hai consumer dùng chung connection, nhưng chỉ owner gửi lệnh đăng ký khi mỗi connection mới mở:
+
+```ts
+const client = createQuoteClient('ws://localhost:8080/quotes');
+
+const statusSubscription = client.state$.subscribe((status) => {
+  console.log('connection:', status);
+  if (status === 'open') {
+    client.send({ type: 'subscribe', symbol: 'ABC' });
+  }
+});
+
+const tableSubscription = client.messages$.subscribe({
+  next: (message) => console.log('table:', message),
+  error: (error) => console.error('table stopped:', error),
+  complete: () => console.log('table completed'),
+});
+
+const badgeSubscription = client.messages$.subscribe({
+  next: (message) => console.log('badge:', message),
+  error: (error) => console.error('badge stopped:', error),
+});
+
+function leavePage(): void {
+  client.destroy();
+  statusSubscription.unsubscribe();
+  tableSubscription.unsubscribe();
+  badgeSubscription.unsubscribe();
+}
+```
+
+Khi server đóng với code được phép retry, bạn thấy state chuyển sang `retrying`, sau đó `connecting` rồi `open` nếu kết nối thành công. Khi hết ngân sách retry, cả hai consumer nhận error. `destroy()` trong lúc đang đợi sẽ hủy timer, không tạo attempt tiếp theo.
+
+Lệnh đăng ký được gửi lại mỗi lần `open` vì registry topic thuộc connection cũ thường đã mất. Không làm điều tương tự với mọi lệnh nghiệp vụ: một lệnh tạo đơn hàng có thể đã được server xử lý trước khi connection đứt.
+
+## Nhiều topic với multiplex
+
+Một connection có thể chở nhiều topic, nhưng server vẫn phải hiểu protocol subscribe/unsubscribe. `multiplex(subMsg, unsubMsg, messageFilter)` tạo Observable gửi lệnh đăng ký khi subscribe, lọc message nhận và gửi lệnh hủy khi finalize.
+
+Đoạn độc lập này dùng các kiểu và decoder phía trên. Nó minh họa multiplex **chưa kèm reconnect**:
+
+```ts
+import { filter, share } from 'rxjs';
+import { webSocket } from 'rxjs/webSocket';
+
+const socket$ = webSocket<WireMessage>({
+  url: 'ws://localhost:8080/quotes',
+  deserializer: decodeServerMessage,
+});
+
+const abcQuotes$ = socket$.multiplex(
+  () => ({ type: 'subscribe', symbol: 'ABC' }),
+  () => ({ type: 'unsubscribe', symbol: 'ABC' }),
+  (message) => message.type === 'quote' && message.symbol === 'ABC',
+).pipe(
+  filter((message): message is Extract<ServerMessage, { type: 'quote' }> =>
+    message.type === 'quote'),
+  share(),
+);
+
+const table = abcQuotes$.subscribe({
+  next: (quote) => console.log('table:', quote.price),
+  error: console.error,
+});
+const badge = abcQuotes$.subscribe({
+  next: (quote) => console.log('badge:', quote.price),
+  error: console.error,
+});
+
+function leaveTable(): void {
+  table.unsubscribe(); // Badge còn nghe: chưa gửi unsubscribe cho ABC.
+}
+function leaveBadge(): void {
+  badge.unsubscribe(); // Consumer cuối rời topic: gửi lệnh unsubscribe.
+}
+```
+
+`share()` sau multiplex rất quan trọng: nếu không có nó, mỗi consumer tạo một subscription multiplex riêng và gửi một cặp subscribe/unsubscribe riêng. Một consumer rời đi có thể khiến server ngừng gửi topic trong khi consumer khác vẫn cần dữ liệu. Hãy cache Observable dùng chung theo topic; gọi factory tạo `abcQuotes$` hai lần vẫn tạo hai vùng sharing khác nhau.
+
+Lệnh unsubscribe được gửi theo best effort: nếu transport đã hỏng, không thể trông chờ server nhận được. Server cũng phải dọn registry khi connection đóng.
+
+Đừng chỉ đặt `retry` lên một receive stream rồi nghĩ multiplex sẽ tự đăng ký lại. Nếu subscription multiplex không được tạo lại, hàm `subMsg` không chạy lại khi transport reconnect. Với nhiều topic và một owner, nên giữ registry các topic đang dùng ở owner và gửi lại chúng sau handshake của connection mới. Hoặc đặt việc tạo multiplex bên trong mỗi attempt được retry; bảo đảm vẫn chỉ có một policy reconnect chung.
+
+## Offline và phục hồi dữ liệu
+
+### Gửi thành công không có nghĩa server đã xử lý
+
+`client.send(...) === true` trong ví dụ chỉ có nghĩa owner chấp nhận chuyển lệnh vào socket đang open. Nó không phải ACK từ server; mạng vẫn có thể đứt ngay sau khi gửi.
+
+Với một lệnh quan trọng, protocol nên có `commandId`, ACK tương ứng và cơ chế deduplicate phía server. Ví dụ client gửi lại cùng `commandId` sau reconnect, server trả lại kết quả đã xử lý thay vì thực hiện lệnh lần nữa. Nếu cần outbox offline, đặt giới hạn số lượng, TTL và lưu bền vững theo yêu cầu sản phẩm; đừng dựa vào buffer ngầm của `WebSocketSubject`.
+
+Reconnect cũng không lấy lại những event bạn đã bỏ lỡ. Với dashboard giá, bạn có thể tải snapshot mới rồi theo dõi cập nhật. Với chat hoặc event log, cần cursor/sequence để server replay từ vị trí cuối cùng; client phải xử lý duplicate và phát hiện gap. `shareReplay(1)` chỉ giữ một giá trị phía client, không thay thế protocol phục hồi lịch sử.
+
+### Heartbeat và consumer chậm
+
+Browser không cho JavaScript chủ động gửi control frame ping của WebSocket. Nếu cần phát hiện connection im lặng, dùng message heartbeat ở tầng ứng dụng, ví dụ `ping`/`pong` có id, rồi dừng hoặc reconnect khi quá thời hạn. Server và client phải thống nhất interval và timeout; các kiểu protocol phía trên chưa có heartbeat.
+
+Không dùng “không có quote trong 30 giây” làm lỗi mặc định nếu sản phẩm có thể hợp lệ không phát quote trong khoảng đó. Timeout nên đo điều bạn thực sự cần: handshake, phản hồi heartbeat hoặc deadline của một lệnh.
+
+WebSocket của browser không có cơ chế backpressure ở chiều nhận. `auditTime` giúp giảm số lần render nhưng server vẫn gửi và browser vẫn nhận payload. Nếu nguồn quá nhanh, cần giảm tần suất phía server, batch, giới hạn topic hoặc định nghĩa policy drop rõ ràng. Tránh đưa mọi message vào `concatMap` với tác vụ chậm không giới hạn: queue sẽ tiếp tục lớn lên.
+
+## Bảo mật và môi trường chạy
+
+- Dùng `wss://` trong production. Trang HTTPS không nên kết nối `ws://`; browser có thể chặn mixed content.
+- WebSocket API của browser không cho bạn tùy ý thêm header `Authorization` như HTTP client. Cân nhắc cookie phiên, ticket ngắn hạn hoặc message xác thực đầu tiên theo thiết kế backend. Tránh access token dài hạn trong URL vì URL có thể xuất hiện trong log.
+- Server cần kiểm tra `Origin`, xác thực connection và phân quyền từng topic/lệnh. Đừng xem `Origin` là danh tính người dùng, và đừng chỉ kiểm tra quyền một lần ở client.
+- Đặt giới hạn kích thước message, số topic và tốc độ gửi. Validate payload ở cả hai chiều; decoder ở client không bảo vệ server.
+- Không tạo socket lúc import module dùng chung SSR. Trong React, tạo/subscribe ở lifecycle phía client và cleanup khi unmount; trong Angular, xác định service owner cùng phạm vi sống phù hợp.
+- Với Node.js hoặc test, `WebSocketCtor` cho phép truyền constructor tương thích. Kiểm tra API, type và khả năng hỗ trợ của runtime/library đang dùng; bài này không giả định mọi phiên bản Node có cùng WebSocket implementation.
+
+## Kiểm chứng và xử lý sự cố
+
+### Kiểm tra thời điểm retry bằng TestScheduler
+
+Test dưới đây không mở network. Nó kiểm chứng policy retry trong marble phía trên: attempt đầu lỗi ở frame 4, timer chờ ba frame, attempt thứ hai bắt đầu ở frame 7. Đây là ví dụ độc lập có thể chạy trong project đã có RxJS:
+
+```ts
+import { defer, retry, timer } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error('Marble assertion failed');
+  }
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const first = cold('--a-#', { a: 'before disconnect' });
+  const second = cold('--b--|', { b: 'after reconnect' });
+  let attempts = 0;
+
+  const output$ = defer(() => ++attempts === 1 ? first : second).pipe(
+    retry({ count: 1, delay: () => timer(3, scheduler) }),
+  );
+
+  expectObservable(output$).toBe('--a------b--|', {
+    a: 'before disconnect',
+    b: 'after reconnect',
+  });
+  expectSubscriptions(first.subscriptions).toBe('^---!');
+  expectSubscriptions(second.subscriptions).toBe('-------^----!');
+});
+```
+
+Visual marble có thể gộp `^` và notification vào cùng một hàng; `cold()` trong test chỉ chứa notification, còn subscription được assert riêng. Test này chưa chứng minh handshake, close code hay decoder hoạt động đúng với server thật.
+
+### Checklist integration test
+
+Bạn có thể truyền fake constructor qua `WebSocketCtor` để kiểm tra vòng đời một cách xác định, sau đó dùng server test để kiểm tra các close frame thật. Ưu tiên các ca sau:
+
+| Ca thử | Kết quả cần thấy |
+| --- | --- |
+| Hai widget cùng subscribe | Một connection và một lịch retry chung |
+| Widget A unmount, B vẫn còn | B tiếp tục nhận dữ liệu |
+| Consumer cuối unmount | Socket được đóng, không còn backoff chờ |
+| Đứt mạng hoặc close code cho phép retry | Delay tăng có giới hạn; connection mới được tạo |
+| Close sạch với code `1000` | Stream complete, không tự reconnect trong execution đó |
+| Close với code `1008` | Không retry, dù callback cuối là complete hay error |
+| JSON sai hoặc schema sai | `ProtocolError`, không lặp reconnect |
+| `destroy()` trong lúc backoff | Timer bị hủy; subscriber đến sau không mở socket |
+| Reconnect thành công | Topic được đăng ký lại sau handshake; dữ liệu thiếu được phục hồi theo protocol |
+| Gửi khi offline hoặc server không ACK | UI biết lệnh chưa được chấp nhận hoặc chưa được xác nhận, không báo thành công giả |
+
+Nếu gặp sự cố, bắt đầu bằng log close code và số attempt, không chỉ log `error`:
+
+| Triệu chứng | Kiểm tra trước |
+| --- | --- |
+| Có nhiều connection giống nhau | Có gọi `webSocket` hoặc factory client cho từng widget không? Có dùng cùng instance `messages$` không? |
+| Server đóng nhưng không retry | `wasClean` có dẫn đến complete không? Policy đã phân loại close code chưa? |
+| Retry thành công nhưng không có quote | Topic đã được đăng ký lại và có cần đợi `ready`/ACK không? |
+| Mọi message làm stream error | Server gửi JSON, text hay binary? Payload có đúng decoder không? |
+| Client tăng RAM khi offline | Có `next` liên tục lúc socket chưa mở hoặc outbox không giới hạn không? |
+| Unmount rồi vẫn reconnect | `takeUntil` có nằm sau retry không? Subscription upstream có còn owner khác giữ không? |
+
+Để vận hành, đo số connection, số reconnect, khoảng thời gian ở state retrying, lỗi decoder, số lệnh bị từ chối và độ trễ ACK nếu protocol có ACK. Không log toàn bộ payload mặc định, nhất là khi có dữ liệu cá nhân hoặc token.
+
+## Bài tập tự kiểm tra
+
+1. Cho server gửi một quote rồi đóng bất thường. Kiểm tra hai consumer cùng nhận quote nhưng chỉ tạo một attempt reconnect.
+2. Đổi close code sang `1000`, rồi sang code restart của backend. Giải thích vì sao `wasClean` giống nhau vẫn có thể dẫn đến hai policy khác nhau.
+3. Gọi `destroy()` trong khi timer backoff đang đợi. Assert không tạo constructor mới và `send` trả `false`.
+4. Thêm hai topic ABC và XYZ vào một registry ở owner. Sau reconnect, chỉ đăng ký lại topic vẫn có consumer; topic đã bị tháo khỏi UI không được sống lại.
+5. Thêm `commandId` và ACK cho một lệnh thử nghiệm. Cắt connection sau khi server xử lý nhưng trước khi client nhận ACK; gửi lại cùng id và kiểm tra server không xử lý hai lần.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Operator share" href="/docs/subjects-multicasting/share" description="Chọn vị trí sharing và hiểu refCount của connection." />
+  <Card title="Retry" href="/docs/loi-hoan-tat/retry-retry-when" description="Thiết kế ngân sách retry, delay và điều kiện dừng." />
+  <Card title="Polling và realtime" href="/docs/patterns-production/polling-realtime" description="Chọn transport theo nhu cầu cập nhật của sản phẩm." />
+  <Card title="Integration testing" href="/docs/testing/integration-tests" description="Kiểm chứng I/O và teardown ngoài virtual timeline." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — webSocket](https://rxjs.dev/api/webSocket/webSocket) và [WebSocketSubject](https://rxjs.dev/api/webSocket/WebSocketSubject).
+- [Mã nguồn WebSocketSubject, tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/dom/WebSocketSubject.ts) — serializer/deserializer mặc định, multiplex, close handling và teardown.
+- [Mã nguồn retry, tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/retry.ts) — count, delay và resetOnSuccess.
+- [MDN — WebSocket](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket) và [CloseEvent.wasClean](https://developer.mozilla.org/en-US/docs/Web/API/CloseEvent/wasClean) — API browser và giới hạn backpressure.
+- [MDN — WebSocket.close](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket/close) — close code và giới hạn reason.

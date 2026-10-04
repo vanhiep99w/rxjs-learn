@@ -87,9 +87,11 @@ Ba trách nhiệm đi cùng nhau vì một queue thời gian không thể chỉ 
 
 ### Action là đơn vị công việc
 
-Ở mức public contract, bạn thường làm việc với `SchedulerLike` thay vì tự tạo subclass từ lớp `Scheduler`:
+Ở mức public contract, bạn thường làm việc với `SchedulerLike` thay vì tự tạo subclass từ lớp `Scheduler`. Đoạn dưới minh họa phần contract cần cho bài này, không phải toàn bộ khai báo kiểu của RxJS; trong code ứng dụng, hãy dùng `import type { SchedulerLike } from 'rxjs'`:
 
 ```ts
+import type { SchedulerAction, Subscription } from 'rxjs';
+
 interface SchedulerLike {
   now(): number;
 
@@ -390,8 +392,12 @@ Với Action lặp lại, callback có thể reschedule chính nó qua `this.sch
 ```ts
 import { asyncScheduler } from 'rxjs';
 
-const countdown = asyncScheduler.schedule(
+const countdown = asyncScheduler.schedule<number>(
   function (remaining) {
+    if (remaining === undefined) {
+      return;
+    }
+
     console.log(remaining);
 
     if (remaining > 1) {
@@ -404,6 +410,8 @@ const countdown = asyncScheduler.schedule(
 
 setTimeout(() => countdown.unsubscribe(), 1_500);
 ```
+
+Trong RxJS 7.8.2, callback nhận `state?: T`, nên với `schedule<number>` thì `remaining` vẫn có kiểu `number | undefined` khi bật TypeScript strict, dù lời gọi ban đầu truyền `3`. Guard `remaining === undefined` kết thúc lượt chạy nếu thiếu state, không log hay reschedule; sau guard, TypeScript thu hẹp kiểu thành `number` để so sánh và trừ an toàn. Không cần dùng non-null assertion (`remaining!`) hay ép callback thành tham số bắt buộc.
 
 Output xấp xỉ:
 

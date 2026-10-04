@@ -3,8 +3,526 @@ title: HTTP và Ajax
 description: Gọi API, hủy request và xử lý response bằng Observable.
 ---
 
-Trang này sẽ trình bày **HTTP và Ajax** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn đang làm ô tìm kiếm: người dùng gõ từ khóa mới nhưng response của từ khóa cũ lại về sau và ghi đè kết quả. Thêm một vấn đề nữa: rời màn hình rồi mà request vẫn chạy. Với RxJS, mình có thể đặt cả việc gọi API, chọn response còn hợp lệ và teardown vào cùng một pipeline — nhưng chỉ khi nguồn HTTP thật sự hỗ trợ hủy, chứ không chỉ bọc một Promise bằng Observable.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi và điều kiện chạy">
+  Bài dùng **RxJS 7.8.x**, đối chiếu implementation 7.8.2. Ví dụ TypeScript chạy ở browser có RxJS; các endpoint `/api/...` là API minh họa mà bạn cần cung cấp, không phải API có sẵn trong site này. Bạn nên biết `subscribe`, `switchMap`, `catchError` và teardown. `ajax` cần `XMLHttpRequest`; `fromFetch` cần `fetch` và `AbortController`.
 </Callout>
+
+## Mục lục
+
+- [Chọn nguồn HTTP phù hợp](#chọn-nguồn-http-phù-hợp)
+- [Gọi GET và đọc response](#gọi-get-và-đọc-response)
+  - [Chỉ cần JSON với getJSON](#chỉ-cần-json-với-getjson)
+  - [Cần status và metadata với ajax](#cần-status-và-metadata-với-ajax)
+- [Gửi body và cấu hình request](#gửi-body-và-cấu-hình-request)
+- [Hủy request và vòng đời subscription](#hủy-request-và-vòng-đời-subscription)
+  - [Unsubscribe hủy gì](#unsubscribe-hủy-gì)
+  - [Tìm kiếm chỉ giữ request mới nhất](#tìm-kiếm-chỉ-giữ-request-mới-nhất)
+- [Phân loại lỗi và giới hạn retry](#phân-loại-lỗi-và-giới-hạn-retry)
+  - [AjaxError và timeout](#ajaxerror-và-timeout)
+  - [Retry có chọn lọc cho GET](#retry-có-chọn-lọc-cho-get)
+- [Dùng fromFetch đúng vòng đời body](#dùng-fromfetch-đúng-vòng-đời-body)
+- [Theo dõi upload progress](#theo-dõi-upload-progress)
+- [Tránh request trùng và cache ngoài ý muốn](#tránh-request-trùng-và-cache-ngoài-ý-muốn)
+- [Kiểm thử cancellation](#kiểm-thử-cancellation)
+- [Checklist trước khi đưa vào ứng dụng](#checklist-trước-khi-đưa-vào-ứng-dụng)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Chọn nguồn HTTP phù hợp
+
+Mặc định, nếu ứng dụng browser đã dùng RxJS và cần JSON đơn giản hoặc upload progress, mình chọn `ajax` từ `rxjs/ajax`. Nếu đang dùng Fetch API, cần các tùy chọn của Fetch hoặc chạy trong runtime không có XHR, mình chọn `fromFetch` từ `rxjs/fetch`. Một request độc lập không cần orchestration hay cancellation theo stream thì `fetch` với `async/await` thường dễ đọc hơn; không cần đưa RxJS vào chỉ để đổi cú pháp gọi API.
+
+| Nguồn | Request bắt đầu khi nào | Kết quả mặc định | Khi unsubscribe lúc còn pending |
+| --- | --- | --- | --- |
+| `ajax` / `ajax.getJSON` | Khi subscribe, mỗi subscription tạo một XHR | `AjaxResponse<T>` / body `T` | Abort XHR chưa kết thúc |
+| `fromFetch` | Khi subscribe, mỗi subscription gọi `fetch` | `Response`, hoặc kết quả của `selector` | Abort khi request còn trong phạm vi mà `fromFetch` quản lý |
+| `from(fetch(url))` | `fetch(url)` đã bắt đầu lúc biểu thức được gọi | `Response` từ Promise đã có | Ngừng nhận notification, không tự abort Fetch |
+| `defer(() => from(fetch(url)))` | Khi subscribe, mỗi subscription tạo Promise mới | `Response` | Lazy nhưng vẫn không tự abort Fetch |
+
+`ajax` và `fromFetch` là **creation functions**, không phải operator nhận một stream đầu vào. Chúng tạo cold Observable: chưa subscribe thì chưa gửi request. Operators như `switchMap`, `retry` và `shareReplay` quyết định khi nào và bao nhiêu lần subscribe vào nguồn đó.
+
+Trong Angular, nên dùng `HttpClient` nếu ứng dụng đã dựa vào interceptors, auth và testing của Angular. Thay nó bằng `ajax` sẽ bỏ qua những lớp tích hợp ấy. Trong SSR/Node.js, đừng giả định có `XMLHttpRequest`; với `fromFetch`, kiểm tra runtime có đủ Fetch API và dùng URL tuyệt đối phù hợp với server.
+
+## Gọi GET và đọc response
+
+### Chỉ cần JSON với getJSON
+
+Giả sử `GET /api/users` trả về một JSON array:
+
+```json
+[
+  { "id": 1, "name": "An" },
+  { "id": 2, "name": "Bình" }
+]
+```
+
+Bạn có thể đọc trực tiếp body mà không phải bóc lớp response:
+
+```ts
+import { ajax } from 'rxjs/ajax';
+
+type User = { id: number; name: string };
+
+const users$ = ajax.getJSON<User[]>('/api/users');
+
+const subscription = users$.subscribe({
+  next: (users) => console.log(users.map((user) => user.name)),
+  error: (error: unknown) => console.error('Không tải được users', error),
+  complete: () => console.log('Request đã hoàn tất'),
+});
+
+// Khi màn hình bị tháo bỏ và request còn pending:
+// subscription.unsubscribe();
+```
+
+Ở cấu hình thông thường, request thành công phát một body rồi complete; request lỗi đi vào error channel, không gọi `complete`. Đừng dùng callback `complete` để tắt loading cho mọi trường hợp, vì callback này cũng không chạy khi bạn chủ động unsubscribe.
+
+<Callout type="warn" title="Generic không kiểm tra dữ liệu từ server">
+  `getJSON<User[]>` chỉ nói với TypeScript rằng bạn kỳ vọng `User[]`. Nó không kiểm tra JSON thực tế. Với dữ liệu không đáng tin, hãy nhận `unknown` và kiểm tra shape ở boundary bằng type guard hoặc schema validator của ứng dụng. Body rỗng, như response 204, cũng không phải một `User[]` hợp lệ chỉ vì bạn đã truyền generic.
+</Callout>
+
+### Cần status và metadata với ajax
+
+Dùng `ajax<T>` hoặc `ajax.get<T>` khi cần cả body và thông tin XHR. `response.response` là body, còn `response.status` là HTTP status:
+
+```ts
+import { ajax } from 'rxjs/ajax';
+import { map, tap } from 'rxjs';
+
+type User = { id: number; name: string };
+
+const users$ = ajax<User[]>({
+  url: '/api/users',
+  method: 'GET',
+  responseType: 'json',
+  timeout: 5000,
+}).pipe(
+  tap((response) => {
+    console.log('HTTP status:', response.status);
+    console.log('Request ID:', response.xhr.getResponseHeader('X-Request-ID'));
+  }),
+  map((response) => response.response),
+);
+
+users$.subscribe({
+  next: (users) => console.log(users),
+  error: (error: unknown) => console.error(error),
+});
+```
+
+`AjaxResponse<T>` còn có `request`, `xhr`, `originalEvent` và `type`. Cấu hình mặc định chỉ phát response cuối; bật progress sẽ thay đổi giả định “mỗi request chỉ có một value”. Với response cross-origin, custom response header chỉ đọc được nếu server cho phép qua `Access-Control-Expose-Headers`.
+
+## Gửi body và cấu hình request
+
+Giả sử `POST /api/users` nhận `{ name: string }` và trả về user mới. Với plain object body, RxJS 7.8.2 serialize thành JSON; ví dụ dưới đây khai báo rõ content type để hợp đồng dễ đọc:
+
+```ts
+import { ajax } from 'rxjs/ajax';
+import { map } from 'rxjs';
+
+type User = { id: number; name: string };
+
+const createUser$ = ajax<User>({
+  url: '/api/users',
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: { name: 'An' },
+  responseType: 'json',
+  timeout: 5000,
+}).pipe(map((response) => response.response));
+
+createUser$.subscribe({
+  next: (user) => console.log('User vừa tạo:', user),
+  error: (error: unknown) => console.error('Không tạo được user', error),
+});
+```
+
+`responseType` mô tả **response muốn đọc**, không phải format của request body. Nếu gửi form URL-encoded, hãy truyền `URLSearchParams` hoặc chuỗi đã encode; đừng chỉ đổi header rồi kỳ vọng một plain object được chuyển thành form. Với `FormData`, không tự đặt `Content-Type: multipart/form-data`: browser phải thêm boundary tương ứng với body.
+
+| Cấu hình | Mặc định trong RxJS 7.8.2 | Khi cần đổi |
+| --- | --- | --- |
+| `method` | `'GET'` | Gửi `POST`, `PUT`, `PATCH`, `DELETE` theo hợp đồng API |
+| `responseType` | `'json'` | Dùng `'text'`, `'blob'`, `'arraybuffer'` khi response không phải JSON |
+| `timeout` | `0`, không đặt timeout XHR | Đặt thời hạn request, đơn vị ms |
+| `headers` | RxJS có thể thêm header theo body và cấu hình | Content type, auth, correlation ID; không hard-code secret |
+| `queryParams` | Không thêm tham số | Dùng `URLSearchParams` để encode query thay vì nối chuỗi thủ công |
+| `withCredentials` | `false` | Cho phép gửi credentials trong request cross-origin khi API yêu cầu |
+| `includeUploadProgress` / `includeDownloadProgress` | `false` | Nhận thêm progress events trên cùng Observable |
+
+`withCredentials: false` không có nghĩa là tắt cookie của request same-origin; tùy chọn này chủ yếu ảnh hưởng request cross-origin. CORS vẫn do browser và server quyết định. Nếu dùng cookie cross-origin, server cần cho phép đúng origin và credentials; cookie còn chịu chính sách `SameSite`, `Secure` và giới hạn third-party cookie của browser.
+
+Trong RxJS 7.8.x, `crossDomain: true` tránh việc `ajax` tự thêm `X-Requested-With`; tùy chọn này đã deprecated và **không phải cách vượt CORS**. Header JSON hoặc `Authorization` vẫn có thể khiến browser gửi preflight. Bảo vệ CSRF cho API dùng cookie là trách nhiệm của hợp đồng client–server, không được giải quyết chỉ bằng việc dùng Observable.
+
+## Hủy request và vòng đời subscription
+
+### Unsubscribe hủy gì
+
+Với một subscription trực tiếp vào `ajax`, unsubscribe khi XHR chưa xong sẽ gọi `xhr.abort()`. Với `fromFetch`, teardown dùng `AbortController` nội bộ khi request còn abortable. Subscriber đã đóng nên không nhận một lỗi cancellation để hiển thị như lỗi API thông thường.
+
+Bạn có thể dùng `takeUntil(destroy$)` để buộc request dừng khi màn hình bị tháo bỏ. Notifier phải **phát một value**; chỉ gọi `destroy$.complete()` không kích hoạt `takeUntil`:
+
+```ts
+import { Subject, finalize, takeUntil } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+const destroy$ = new Subject<void>();
+
+ajax.getJSON<unknown>('/api/profile').pipe(
+  takeUntil(destroy$),
+  finalize(() => console.log('Đã cleanup request')),
+).subscribe({
+  next: (profile) => console.log(profile),
+  error: (error: unknown) => console.error(error),
+});
+
+// Gọi từ lifecycle cleanup của màn hình.
+function dispose() {
+  destroy$.next();
+  destroy$.complete();
+}
+```
+
+`finalize` chạy khi complete, error **hoặc unsubscribe**, nên phù hợp để giải phóng resource. Nhưng nó không cho biết request thành công hay bị hủy; muốn biết kết quả, hãy biểu diễn trạng thái riêng. Nếu upstream đã được share, một consumer unsubscribe chỉ hủy nguồn khi chính sách sharing thật sự ngắt subscription upstream.
+
+<Callout type="warn" title="Abort không rollback server">
+  Hủy request ngăn client tiếp tục chờ/nhận response; server có thể đã xử lý và lưu dữ liệu. Vì vậy đừng dùng `switchMap` cho thao tác ghi mà mọi lần submit đều phải được thực hiện. Cân nhắc `concatMap` để xếp hàng hoặc `exhaustMap` để bỏ submit mới khi đang xử lý, và dùng idempotency key phía server nếu cần chống ghi trùng.
+</Callout>
+
+### Tìm kiếm chỉ giữ request mới nhất
+
+Với search, response cũ thường không còn giá trị sau khi query đổi. Đây là chỗ `switchMap` phù hợp: unsubscribe request cũ rồi subscribe request mới. Đọc diagram theo cột dọc; hai hàng HTTP biểu diễn lifecycle, còn body nhận được nằm ở hàng `output`.
+
+<MarbleDiagram
+  title="switchMap(query => ajax.getJSON(url))"
+  rows={[
+    { label: 'query', marble: '-a---b----|', kind: 'source' },
+    { label: 'HTTP A', marble: '-^---!', kind: 'inner' },
+    { label: 'HTTP B', marble: '-----^-|', kind: 'inner' },
+    { label: 'output', marble: '-------y--|', kind: 'output' },
+  ]}
+  values={{
+    a: 'query cũ',
+    b: 'query mới',
+    y: 'body của request B',
+  }}
+  caption="A bắt đầu ở frame 1 và bị hủy ở frame 5. B bắt đầu ở frame 5, trả body rồi complete ở frame 7; output complete khi query complete ở frame 10."
+/>
+
+A chưa có response lúc B đến ở frame 5 nên không có body nào của A đi xuống output. B trả `y` ở frame 7; dù B đã xong, output vẫn chờ query stream kết thúc ở frame 10. Các frame là mô hình virtual time, không phải thời gian mạng thực tế.
+
+Ví dụ sau giả định trang có `<input id="search" />` và API trả `Product[]`. Mỗi lần input đổi, nó hủy inner cũ **ngay**, sau đó đợi 300 ms trước khi gửi query mới. Đặt timer bên trong `switchMap` tránh khoảng trống của cách `debounceTime` trước `switchMap`, nơi request cũ vẫn có thể trả về trong lúc đang debounce input mới.
+
+```ts
+import {
+  Subject, catchError, distinctUntilChanged, fromEvent,
+  map, of, startWith, switchMap, takeUntil, timer,
+} from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Product = { id: string; name: string };
+type SearchState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'success'; items: Product[] }
+  | { status: 'error'; message: string };
+
+const input = document.querySelector<HTMLInputElement>('#search');
+if (!input) throw new Error('Thiếu input #search');
+
+const destroy$ = new Subject<void>();
+const state$ = fromEvent(input, 'input').pipe(
+  map(() => input.value.trim()),
+  distinctUntilChanged(),
+  switchMap((query) => {
+    if (query.length < 2) return of<SearchState>({ status: 'idle' });
+
+    return timer(300).pipe(
+      switchMap(() => {
+        const params = new URLSearchParams({ q: query });
+        return ajax.getJSON<Product[]>(`/api/products?${params}`).pipe(
+          map((items): SearchState => ({ status: 'success', items })),
+          // Bắt lỗi từng request: input stream vẫn sống để tìm tiếp.
+          catchError(() => of<SearchState>({
+            status: 'error', message: 'Không tải được kết quả. Hãy thử lại.',
+          })),
+        );
+      }),
+      // Loading ở đây bao gồm cả thời gian chờ 300 ms.
+      startWith({ status: 'loading' } as SearchState),
+    );
+  }),
+  startWith({ status: 'idle' } as SearchState),
+  // Đặt sau switchMap để teardown cả inner HTTP đang chạy.
+  takeUntil(destroy$),
+);
+
+state$.subscribe({
+  next: (state) => console.log('Render UI:', state),
+  error: (error: unknown) => console.error('Lỗi pipeline ngoài HTTP', error),
+});
+
+function dispose() {
+  destroy$.next();
+  destroy$.complete();
+}
+```
+
+Không lọc query ngắn bằng `filter` trước `switchMap`: nếu người dùng xóa hết input, value bị lọc sẽ không tới operator để hủy request cũ. Trả `idle` bên trong `switchMap` vừa hủy inner cũ vừa dọn UI. `distinctUntilChanged` so sánh query đã trim nên những input có cùng query chuẩn hóa không tạo request mới.
+
+Đặt `catchError` trong inner giữ stream input hoạt động sau một request lỗi. Nếu đặt nó ngoài cùng và trả `of(fallback)`, cả chuỗi search sẽ chuyển sang fallback rồi complete; gõ tiếp không còn được xử lý. Ở ví dụ này, UI state đi qua stream nên cleanup của request cũ cũng không thể tắt loading của request mới bằng một biến dùng chung.
+
+## Phân loại lỗi và giới hạn retry
+
+### AjaxError và timeout
+
+Trong RxJS 7.8.2, HTTP status từ 400 trở lên đi vào error channel của `ajax`. Lỗi transport và XHR timeout cũng đi vào đó, nhưng không cùng ý nghĩa với “server trả 500”. Response body chứa `{ error: ... }` với HTTP 200 vẫn là một value thành công ở tầng HTTP; ứng dụng phải tự kiểm tra lỗi nghiệp vụ.
+
+```ts
+import { AjaxError, AjaxTimeoutError } from 'rxjs/ajax';
+import { TimeoutError } from 'rxjs';
+
+function describeError(error: unknown): string {
+  if (error instanceof AjaxTimeoutError) {
+    return 'XHR đã vượt thời hạn request.';
+  }
+  if (error instanceof TimeoutError) {
+    return 'Stream không phát kết quả trong thời hạn cho phép.';
+  }
+  if (error instanceof AjaxError) {
+    if (error.status === 0) return 'Không đọc được HTTP response.';
+    if (error.status === 401) return 'Cần đăng nhập lại.';
+    if (error.status === 403) return 'Bạn không có quyền truy cập.';
+    if (error.status === 429) return 'Đang bị giới hạn tần suất.';
+    return `API trả HTTP ${error.status}.`;
+  }
+  return 'Lỗi không thuộc nhóm HTTP đã biết.';
+}
+```
+
+`AjaxTimeoutError` kế thừa `AjaxError`, nên kiểm tra nó trước. `status === 0` không đủ để kết luận server down: có thể là offline, lỗi DNS, CORS hoặc một lỗi transport khác mà browser không cho đọc response. Xem Network panel và log server thay vì retry mù.
+
+Có hai đồng hồ khác nhau. `ajax({ timeout: 5000 })` đặt timeout trên XHR và tạo `AjaxTimeoutError`; `.pipe(timeout({ first: 5000 }))` giới hạn thời gian chờ notification của Observable và tạo `TimeoutError`. Khi RxJS timeout ngắt upstream `ajax`, teardown hủy XHR pending. Với progress stream, notification đầu có thể là progress chứ không phải body cuối, nên `first` không còn mang nghĩa “đợi kết quả cuối tối đa 5 giây”.
+
+### Retry có chọn lọc cho GET
+
+`retry` không gửi lại notification lỗi; nó **subscribe lại source**, tức là tạo request mới. Mình bắt đầu với retry hữu hạn cho GET và nhóm lỗi tạm thời có thể giải thích được, không áp cùng policy lên mọi endpoint.
+
+Ví dụ này retry riêng HTTP 502/503/504 tối đa hai lần. Các khoảng chờ là cấu hình minh họa; production nên cân nhắc jitter, `Retry-After` và ngân sách thời gian tổng.
+
+```ts
+import { retry, throwError, timer } from 'rxjs';
+import { ajax, AjaxError } from 'rxjs/ajax';
+
+type User = { id: number; name: string };
+
+const users$ = ajax<User[]>({
+  url: '/api/users',
+  method: 'GET',
+  timeout: 5000,
+}).pipe(
+  retry({
+    count: 2,
+    delay: (error: unknown, retryCount) => {
+      const transient = error instanceof AjaxError
+        && [502, 503, 504].includes(error.status);
+      if (!transient) return throwError(() => error);
+      return timer(500 * 2 ** (retryCount - 1));
+    },
+  }),
+);
+
+users$.subscribe({
+  next: (response) => console.log(response.response),
+  error: (error: unknown) => console.error('Đã dừng retry', error),
+});
+```
+
+`count: 2` nghĩa là tối đa ba lần gửi: lần đầu và hai retry, với khoảng chờ lần lượt 500 ms và 1000 ms. Mỗi lần có timeout XHR riêng nên toàn bộ thao tác có thể kéo dài hơn 5 giây. Nếu cần deadline cho cả thao tác, đặt RxJS `timeout` sau `retry` trên stream không bật progress.
+
+Đừng tự retry 401/403 hoặc lỗi validation; những lỗi ấy cần thay đổi credentials, quyền hoặc input. Với 429, xử lý policy server và `Retry-After` thay vì dùng cùng backoff mặc định. Với POST, timeout không chứng minh lần ghi đầu thất bại: server có thể đã ghi nhưng response bị mất. Chỉ retry khi hợp đồng API có tính idempotent hoặc cơ chế idempotency key rõ ràng.
+
+## Dùng fromFetch đúng vòng đời body
+
+Fetch không reject chỉ vì status là 404 hay 500. Vì vậy `fromFetch` cũng không tự biến những status này thành RxJS error; bạn phải kiểm tra `response.ok`. Dùng `selector` để việc đọc body nằm trong cùng lifecycle abort của `fromFetch`:
+
+```ts
+import { fromFetch } from 'rxjs/fetch';
+import { map } from 'rxjs';
+
+type User = { id: number; name: string };
+
+function isUser(value: unknown): value is User {
+  if (typeof value !== 'object' || value === null) return false;
+  const user = value as Record<string, unknown>;
+  return typeof user.id === 'number' && typeof user.name === 'string';
+}
+
+const users$ = fromFetch<unknown>('/api/users', {
+  selector: async (response): Promise<unknown> => {
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  },
+}).pipe(
+  map((body): User[] => {
+    if (!Array.isArray(body) || !body.every(isUser)) {
+      throw new Error('Response không đúng shape User[]');
+    }
+    return body;
+  }),
+);
+
+const subscription = users$.subscribe({
+  next: (users) => console.log(users),
+  error: (error: unknown) => console.error(error),
+});
+
+// Lifecycle cleanup khi không còn cần kết quả:
+// subscription.unsubscribe();
+```
+
+Không có `selector`, `fromFetch` phát `Response` rồi complete khi Fetch nhận được headers; body có thể vẫn đang tải. Nếu sau đó gọi `response.json()` trong một `switchMap` riêng, unsubscribe không còn khiến `fromFetch` abort việc đọc body ấy. Với `selector`, subscription được giữ đến khi kết quả đọc body kết thúc, nên teardown khi pending có thể abort cả phần tải body còn lại.
+
+Abort không phải cách ngắt mọi công việc synchronous: khi body đã tải xong và bạn đang chạy một vòng lặp parse/transform trên main thread, unsubscribe không làm vòng lặp ấy tự dừng. Với API trả 204, chọn nhánh trả `null` hoặc không đọc body theo hợp đồng endpoint; đừng gọi `json()` trên body rỗng. Nếu ứng dụng cần phân loại status để retry, hãy tạo kiểu lỗi HTTP chứa `status` thay vì chỉ giữ message như ví dụ nhỏ này.
+
+## Theo dõi upload progress
+
+`ajax` dùng XHR nên có thể phát upload progress. Giả sử `#upload` là file input và `POST /api/files` trả JSON `{ id: string }`; ví dụ dưới đây gửi file đầu tiên đang được chọn khi đoạn code chạy:
+
+```ts
+import { ajax } from 'rxjs/ajax';
+
+type UploadedFile = { id: string };
+
+const input = document.querySelector<HTMLInputElement>('#upload');
+const file = input?.files?.[0];
+if (!file) throw new Error('Hãy chọn file trước khi upload');
+
+const body = new FormData();
+body.append('file', file);
+
+ajax<UploadedFile>({
+  url: '/api/files',
+  method: 'POST',
+  body,
+  includeUploadProgress: true,
+}).subscribe({
+  next: (event) => {
+    if (event.type === 'upload_progress') {
+      const progress = event.originalEvent;
+      if (progress.lengthComputable && progress.total > 0) {
+        console.log('Upload %:', Math.round(100 * progress.loaded / progress.total));
+      }
+    }
+    if (event.type === 'download_load') {
+      console.log('Server trả file ID:', event.response.id);
+    }
+  },
+  error: (error: unknown) => console.error('Upload thất bại', error),
+});
+```
+
+Upload 100% chỉ có nghĩa là browser đã gửi xong dữ liệu, không có nghĩa server đã lưu hoặc xử lý file xong. Chờ response cuối có `type === 'download_load'` để đọc body, và vẫn xử lý HTTP error. Khi progress không có tổng dung lượng tính được, UI nên hiển thị trạng thái không xác định thay vì một phần trăm giả.
+
+Đừng dùng `take(1)` hoặc `firstValueFrom` trực tiếp trên stream đã bật progress để lấy kết quả cuối: value đầu có thể là `upload_loadstart`, khiến subscription đóng và abort upload. Nếu muốn chuyển kết quả cuối sang Promise, lọc đúng `download_load` trước. Không dùng `progressSubscriber` cho code mới; tùy chọn đó đã deprecated trong RxJS 7.8.x.
+
+## Tránh request trùng và cache ngoài ý muốn
+
+Hai subscription vào cùng cold Observable vẫn là hai request. Muốn header và profile panel dùng chung kết quả, tạo **một instance** shared Observable ở phạm vi phù hợp:
+
+```ts
+import { shareReplay } from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type Profile = { id: string; name: string };
+
+const profile$ = ajax.getJSON<Profile>('/api/profile').pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+const headerSubscription = profile$.subscribe({
+  next: (profile) => console.log('Header:', profile.name),
+  error: (error: unknown) => console.error(error),
+});
+const panelSubscription = profile$.subscribe({
+  next: (profile) => console.log('Panel:', profile),
+  error: (error: unknown) => console.error(error),
+});
+
+// Khi các consumer không còn sử dụng:
+// headerSubscription.unsubscribe();
+// panelSubscription.unsubscribe();
+```
+
+Trong RxJS 7.8.x, với cấu hình này, consumer cuối rời đi lúc source chưa complete sẽ ngắt source pending. Nhưng request đã complete thì `shareReplay` giữ kết quả cho subscriber đến muộn; `refCount: true` không tự biến nó thành cache có TTL hoặc refresh sau logout.
+
+Nếu tạo `ajax(...).pipe(shareReplay(...))` bên trong hàm mỗi lần gọi, bạn tạo nhiều instance cache độc lập và vẫn có request trùng. Chốt rõ nơi lưu instance, khi nào invalidate và dữ liệu thuộc user nào. Không đặt cache dữ liệu riêng tư thành singleton dùng chung mọi request SSR. Tránh lồng `subscribe` trong `subscribe`; orchestration nên nằm trong `switchMap`, `concatMap` hoặc operator kết hợp tương ứng.
+
+## Kiểm thử cancellation
+
+TestScheduler kiểm tra quyết định subscription của pipeline, không giả lập mạng thật. Test sau dùng cold Observable để thay HTTP: A sẽ trả `x` ở frame 7 nếu không bị hủy, còn B trả `y` và complete cùng frame 7. Nó đối chiếu đúng timeline phía trên.
+
+```ts
+import { switchMap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`Không khớp:\n${JSON.stringify(actual)}\n${JSON.stringify(expected)}`);
+  }
+});
+
+scheduler.run(({ hot, cold, expectObservable, expectSubscriptions }) => {
+  const queries$ = hot('-a---b----|');
+  const requestA$ = cold('------(x|)');
+  const requestB$ = cold('--(y|)');
+
+  const result$ = queries$.pipe(
+    switchMap((query) => query === 'a' ? requestA$ : requestB$),
+  );
+
+  expectObservable(result$).toBe('-------y--|');
+  expectSubscriptions(requestA$.subscriptions).toBe('-^---!');
+  expectSubscriptions(requestB$.subscriptions).toBe('-----^-!');
+});
+```
+
+Trong test, `(y|)` nhóm value và complete cùng frame. Subscription B kết thúc ở frame 7 nên subscription marble dùng `!` ở frame đó; diagram dùng `|` để chỉ request hoàn tất bình thường. A bị unsubscribe ở frame 5 trước khi có `x`, và outer complete ở frame 10 quyết định lúc output complete.
+
+Bổ sung integration test ở boundary HTTP cho các điểm mà marble không chứng minh được:
+
+- Unsubscribe pending `ajax` thật sự gọi `abort`; unsubscribe `fromFetch` với `selector` làm `AbortSignal` chuyển sang aborted khi body còn pending.
+- 404/500 đi vào error đúng cách; với `fromFetch`, nhánh kiểm tra `response.ok` phải thực sự chạy.
+- JSON sai shape, response 204 và XHR timeout được xử lý theo hợp đồng API.
+- Sau request search lỗi, input tiếp theo vẫn gửi request; rời màn hình thì event listener và request pending được cleanup.
+- Nhiều consumer của cùng shared instance không tạo request trùng, và logout/refresh không replay dữ liệu cũ ngoài ý muốn.
+
+## Checklist trước khi đưa vào ứng dụng
+
+- [ ] Nguồn HTTP lazy và có teardown thật; không nhầm `from(Promise)` với transport có abort.
+- [ ] Body được validate tại boundary; response rỗng có nhánh xử lý riêng.
+- [ ] Operator flattening khớp nghiệp vụ: hủy search cũ không đồng nghĩa hủy an toàn một lần ghi.
+- [ ] `catchError` nằm đúng cấp và UI phân biệt empty result với request thất bại.
+- [ ] Timeout, retry và deadline tổng có giới hạn rõ ràng; thao tác ghi có chính sách idempotency.
+- [ ] Credentials, CORS và CSRF được kiểm tra theo hợp đồng backend, không suy luận từ `status: 0`.
+- [ ] Cleanup ngắt cả inner HTTP; progress không bị hiểu nhầm là response cuối.
+- [ ] Sharing có phạm vi và invalidation rõ ràng, đặc biệt khi đổi user hoặc chạy SSR.
+
+Thử chậm hóa mạng trong DevTools, gõ hai query liên tiếp rồi rời màn hình. Kiểm tra request cũ có bị hủy, response cũ có còn cập nhật UI và lần tìm kiếm sau lỗi có còn hoạt động. Đây là bước nhỏ giúp bạn phát hiện sai lifecycle trước khi bổ sung cache hay retry phức tạp hơn.
+
+## Nguồn tham khảo
+
+- [RxJS ajax API](https://rxjs.dev/api/ajax/ajax) và [implementation ajax 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/ajax/ajax.ts): cold execution, serialize body, lỗi status và teardown XHR.
+- [AjaxConfig 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/ajax/types.ts): tùy chọn request, progress và các API deprecated.
+- [RxJS fromFetch API](https://rxjs.dev/api/fetch/fromFetch) và [implementation fromFetch 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/dom/fetch.ts): AbortController và lifecycle của `selector`.
+- [MDN Fetch API](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch) và [CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS): status, credentials và giới hạn của browser.
+
+## Học tiếp
+
+<Cards>
+  <Card title="switchMap" href="/docs/higher-order-observables/switch-map" description="Hiểu chính sách thay inner và thời điểm output complete." />
+  <Card title="catchError" href="/docs/loi-hoan-tat/catch-error" description="Chọn phạm vi phục hồi lỗi để stream tương tác không chết." />
+  <Card title="shareReplay" href="/docs/subjects-multicasting/share-replay" description="Kiểm soát sharing, replay và lifecycle của cache." />
+  <Card title="RxJS với Angular" href="/docs/tich-hop/angular" description="Tiếp tục với HttpClient và lifecycle trong Angular." />
+</Cards>

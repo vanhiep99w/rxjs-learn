@@ -3,8 +3,448 @@ title: Integration tests
 description: Kiểm tra stream tại ranh giới UI, HTTP và service.
 ---
 
-Trang này sẽ trình bày **Integration tests** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Unit test cho `switchMap` đã xanh, nhưng UI vẫn có thể không gửi đúng query, không hiện lỗi HTTP hoặc tiếp tục nghe input sau khi màn hình bị tháo bỏ. Những lỗi này nằm ở chỗ các thành phần nối với nhau, không chỉ ở một operator. Integration test giúp bạn giữ pipeline và adapter thật, rồi kiểm tra hành vi tại ranh giới mà người dùng nhìn thấy.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi ví dụ">
+  Bài dùng TypeScript, **RxJS 7.8.x**, **Vitest**, môi trường **jsdom** và **MSW 2.x** (`http`, `HttpResponse`, `setupServer`). Ví dụ là mã cho ứng dụng cần kiểm thử, không phải tính năng có sẵn trong site tài liệu này. Project chạy ví dụ cần có các thư viện trên, DOM types và runtime cung cấp `fetch`, `Response`, `AbortController`; jsdom không tự bảo đảm có Fetch API. Bạn nên biết `switchMap`, `catchError` và `unsubscribe` trước khi đọc.
 </Callout>
+
+## Mục lục
+
+- [Chọn ranh giới integration test](#chọn-ranh-giới-integration-test)
+- [Chốt contract trước khi viết test](#chốt-contract-trước-khi-viết-test)
+- [Dựng luồng tìm kiếm cần kiểm thử](#dựng-luồng-tìm-kiếm-cần-kiểm-thử)
+  - [Service HTTP thật](#service-http-thật)
+  - [Nối DOM với pipeline](#nối-dom-với-pipeline)
+- [Kiểm thử UI đến HTTP bằng MSW](#kiểm-thử-ui-đến-http-bằng-msw)
+  - [Harness và cleanup](#harness-và-cleanup)
+  - [Response thành công và phục hồi sau lỗi](#response-thành-công-và-phục-hồi-sau-lỗi)
+  - [Hủy request cũ khi input mới đến](#hủy-request-cũ-khi-input-mới-đến)
+- [Kiểm thử teardown tại ranh giới service](#kiểm-thử-teardown-tại-ranh-giới-service)
+- [Chọn đồng hồ và cách chờ](#chọn-đồng-hồ-và-cách-chờ)
+- [Những test xanh nhưng chưa đủ](#những-test-xanh-nhưng-chưa-đủ)
+- [Checklist cho một suite nhỏ](#checklist-cho-một-suite-nhỏ)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Chọn ranh giới integration test
+
+Mình mặc định giữ code ứng dụng thật và thay phần ngoài quyền kiểm soát của test, chẳng hạn backend. Cách này kiểm tra được việc ghép DOM event, operator, HTTP adapter và render mà không phụ thuộc vào mạng hay dữ liệu production.
+
+| Loại test | Giữ thật | Thay thế hoặc kiểm soát | Câu hỏi chính |
+| --- | --- | --- | --- |
+| Unit test pipeline | Operator hoặc hàm tạo stream | Nguồn bằng `hot`, `cold`, scheduler | Emission và subscription có đúng contract không? |
+| Integration UI–service | DOM binding và pipeline | Service bằng Observable có thể điều khiển | UI cập nhật và teardown đúng không? |
+| Integration UI–HTTP | DOM, pipeline, service, lời gọi Fetch | Backend response bằng MSW | Query, status, JSON và UI có nối đúng không? |
+| End-to-end | Browser và ứng dụng triển khai | Tùy suite, thường có backend test thật | Luồng người dùng có chạy trong môi trường triển khai không? |
+
+Tên loại test không quan trọng bằng **nêu rõ phần nào vẫn thật**. Mock service trả về `of(...)` là đủ cho một số contract UI, nhưng test đó không kiểm tra URL, header, JSON parsing hay abort của Fetch.
+
+Với Node.js, `setupServer` của MSW chặn request trong process; nó không mở một HTTP server thật và không dùng Service Worker. Vì vậy test vẫn chưa chứng minh DNS, TLS, CORS trong browser hoặc backend thật hoạt động. Giữ một số browser/E2E test cho những ranh giới ấy.
+
+## Chốt contract trước khi viết test
+
+Giả sử màn hình có một ô tìm kiếm và một vùng kết quả. Luồng cần kiểm tra chỉ có vài thành phần, nên sơ đồ chữ đủ để thấy ranh giới; không cần Mermaid cho trường hợp này.
+
+```text
+DOM input → pipeline switchMap → searchUsers → Fetch
+                 ↓                              ↕
+             render DOM                  MSW / backend
+```
+
+Chốt các hành vi trước, rồi mới viết assertion:
+
+| Tình huống | Điều cần quan sát |
+| --- | --- |
+| Nhập `An` | Gửi `GET /api/users?q=An`, UI chuyển từ loading sang dữ liệu |
+| Backend trả 503 | UI hiện lỗi; nhập từ khóa khác vẫn gửi request được |
+| Nhập B khi A còn pending | A bị unsubscribe; adapter hỗ trợ abort phải nhận tín hiệu abort |
+| Tháo màn hình lúc request pending | Subscription đang chạy bị hủy; input sau đó không tạo request |
+| Response rỗng | UI hiện trạng thái không có kết quả, không giữ dữ liệu cũ |
+
+Đừng gộp tất cả thành một test dài. Mỗi test nên thất bại vì một contract cụ thể; khi query sai, bạn không muốn phải đọc thêm mười assertion về cleanup mới tìm ra nguyên nhân.
+
+## Dựng luồng tìm kiếm cần kiểm thử
+
+Hai file dưới đây nằm cạnh file test trong ứng dụng minh họa. Đặt URL backend qua tham số để test dùng URL tuyệt đối mà không phải đổi global location. `https://api.example.test` chỉ là địa chỉ minh họa và phải được MSW chặn trong suite này.
+
+### Service HTTP thật
+
+```ts title="users-api.ts"
+import { fromFetch } from 'rxjs/fetch';
+
+export type User = { id: number; name: string };
+
+export function searchUsers(baseUrl: string, query: string) {
+  const url = new URL('/api/users', baseUrl);
+  url.searchParams.set('q', query);
+
+  return fromFetch<User[]>(url.href, {
+    selector: async (response): Promise<User[]> => {
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return (await response.json()) as User[];
+    },
+  });
+}
+```
+
+Fetch không reject chỉ vì server trả 404 hoặc 503. Vì vậy service phải kiểm tra `response.ok`, nếu không test có thể render body lỗi như thể đó là danh sách users.
+
+`selector` giữ việc đọc body trong lifecycle mà `fromFetch` quản lý. Nếu chỉ lấy `Response` rồi gọi `json()` ở một pipeline khác, subscription của `fromFetch` có thể đã complete trước khi đọc hết body; unsubscribe ở đoạn sau không còn bảo đảm abort việc đọc đó.
+
+<Callout type="warn" title="TypeScript không xác thực JSON">
+  Ép kiểu `as User[]` chỉ giữ ví dụ ngắn, không kiểm tra dữ liệu từ server. Với contract production, nhận `unknown`, validate shape bằng type guard hoặc schema của ứng dụng, rồi thêm test body sai shape và JSON không hợp lệ. MSW trả fixture đúng không chứng minh backend luôn đúng schema.
+</Callout>
+
+### Nối DOM với pipeline
+
+```ts title="search-screen.ts"
+import {
+  catchError,
+  distinctUntilChanged,
+  fromEvent,
+  map,
+  of,
+  startWith,
+  switchMap,
+  type Observable,
+} from 'rxjs';
+import type { User } from './users-api';
+
+export type Search = (query: string) => Observable<User[]>;
+
+type State =
+  | { kind: 'idle' }
+  | { kind: 'loading' }
+  | { kind: 'success'; users: User[] }
+  | { kind: 'error'; message: string };
+
+export function bindSearch(
+  input: HTMLInputElement,
+  output: HTMLElement,
+  search: Search,
+): () => void {
+  const subscription = fromEvent(input, 'input').pipe(
+    map(() => input.value.trim()),
+    distinctUntilChanged(),
+    switchMap((query): Observable<State> => {
+      if (!query) return of<State>({ kind: 'idle' });
+
+      return search(query).pipe(
+        map((users): State => ({ kind: 'success', users })),
+        catchError((error: unknown) => of<State>({
+          kind: 'error',
+          message: error instanceof Error ? error.message : 'Unknown error',
+        })),
+        startWith<State>({ kind: 'loading' }),
+      );
+    }),
+    startWith<State>({ kind: 'idle' }),
+  ).subscribe((state) => {
+    switch (state.kind) {
+      case 'idle':
+        output.textContent = 'Nhập từ khóa';
+        break;
+      case 'loading':
+        output.textContent = 'Đang tải';
+        break;
+      case 'success':
+        output.textContent = state.users.length
+          ? state.users.map((user) => user.name).join(', ')
+          : 'Không có kết quả';
+        break;
+      case 'error':
+        output.textContent = `Lỗi: ${state.message}`;
+        break;
+    }
+  });
+
+  return () => subscription.unsubscribe();
+}
+```
+
+Mình đặt `catchError` **bên trong `switchMap`** vì lỗi một lần tìm kiếm không nên giết stream input. Nếu đặt nó ở ngoài và trả về `of(errorState)`, stream thay thế sẽ phát lỗi UI rồi complete; lần nhập tiếp theo không còn được xử lý. Test phục hồi bên dưới được viết để bắt chính lỗi này.
+
+Ví dụ chưa có debounce, cache hay retry để contract chính dễ nhìn. Khi ứng dụng có các lớp đó, integration test nên giữ chúng thật và thêm case cho chính sách tương ứng, thay vì bỏ operator chỉ để test nhanh hơn.
+
+Hàm `search` được kỳ vọng trả về Observable, không throw đồng bộ trước khi trả về. Nếu một implementation có thể throw ngay khi được gọi, dùng `defer(() => search(query))` bên trong `switchMap` để lỗi đi qua error channel và được `catchError` xử lý.
+
+## Kiểm thử UI đến HTTP bằng MSW
+
+Các block `search-screen.test.ts` dưới đây ghép vào **cùng một file**. Chạy riêng file này bằng test runner đã có trong project, ví dụ `vitest run search-screen.test.ts`. Không cần gọi API live hay mở backend thật.
+
+### Harness và cleanup
+
+```ts title="search-screen.test.ts"
+// @vitest-environment jsdom
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  expect,
+  it,
+  vi,
+} from 'vitest';
+import { http, HttpResponse } from 'msw';
+import { setupServer } from 'msw/node';
+import { bindSearch } from './search-screen';
+import { searchUsers } from './users-api';
+
+const API = 'https://api.example.test';
+const ENDPOINT = `${API}/api/users`;
+const server = setupServer();
+const disposers: Array<() => void> = [];
+
+beforeAll(() => server.listen({ onUnhandledRequest: 'error' }));
+afterAll(() => server.close());
+afterEach(() => {
+  // Hủy stream trước khi phục hồi mocks và xóa DOM.
+  for (const dispose of disposers.splice(0)) dispose();
+  vi.restoreAllMocks();
+  server.resetHandlers();
+  document.body.replaceChildren();
+});
+
+function mount() {
+  const input = document.createElement('input');
+  input.setAttribute('aria-label', 'Tìm user');
+  const output = document.createElement('div');
+  output.setAttribute('role', 'status');
+  document.body.append(input, output);
+
+  const dispose = bindSearch(input, output, (query) => searchUsers(API, query));
+  disposers.push(dispose);
+  return { input, output, dispose };
+}
+
+function enter(input: HTMLInputElement, value: string) {
+  input.value = value;
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+```
+
+`onUnhandledRequest: 'error'` biến request chưa được mô tả thành lỗi thay vì âm thầm đi ra mạng. `resetHandlers()` bỏ handler được thêm qua `server.use()` giữa các test; nó không dọn subscription, DOM hay spy, nên các bước cleanup còn lại vẫn cần thiết.
+
+Giữ các test dùng global server/spy này chạy tuần tự, không dùng `it.concurrent`. Nếu cần concurrency, phải thiết kế isolation cho handler và tài nguyên dùng chung.
+
+### Response thành công và phục hồi sau lỗi
+
+```ts title="search-screen.test.ts — thêm vào sau harness"
+it('gửi đúng query và render JSON từ HTTP', async () => {
+  const queries: Array<string | null> = [];
+  server.use(http.get(ENDPOINT, ({ request }) => {
+    queries.push(new URL(request.url).searchParams.get('q'));
+    return HttpResponse.json([{ id: 1, name: 'An' }]);
+  }));
+  const { input, output } = mount();
+
+  enter(input, '  An  ');
+  expect(output.textContent).toBe('Đang tải');
+
+  await vi.waitFor(() => {
+    expect(output.textContent).toBe('An');
+  });
+  expect(queries).toEqual(['An']);
+});
+
+it('hiện lỗi 503 nhưng vẫn xử lý input tiếp theo', async () => {
+  const queries: Array<string | null> = [];
+  server.use(http.get(ENDPOINT, ({ request }) => {
+    const query = new URL(request.url).searchParams.get('q');
+    queries.push(query);
+    return query === 'fail'
+      ? HttpResponse.json({ message: 'Unavailable' }, { status: 503 })
+      : HttpResponse.json([{ id: 2, name: 'Bình' }]);
+  }));
+  const { input, output } = mount();
+
+  enter(input, 'fail');
+  await vi.waitFor(() => {
+    expect(output.textContent).toBe('Lỗi: HTTP 503');
+  });
+
+  enter(input, 'Bình');
+  await vi.waitFor(() => {
+    expect(output.textContent).toBe('Bình');
+  });
+  expect(queries).toEqual(['fail', 'Bình']);
+});
+```
+
+Test đầu không stub `searchUsers`: URL construction, Fetch, đọc JSON và render đều chạy qua code thật. Assertion query nằm ngoài handler để lỗi assertion được báo trực tiếp từ test, không bị nhầm thành lỗi resolver/network.
+
+Test thứ hai quan sát cả lỗi lẫn lần thành công sau lỗi. Chỉ kiểm tra dòng chữ `Lỗi: HTTP 503` thì chưa phát hiện việc stream input đã chết. Bạn có thể thêm case `HttpResponse.json([])` và kỳ vọng `Không có kết quả` bằng cùng harness.
+
+### Hủy request cũ khi input mới đến
+
+Chỉ thấy kết quả B trên màn hình chưa chứng minh A đã bị abort. Mình giữ response A pending bằng một Promise gate, rồi quan sát `AbortSignal` mà adapter thật truyền cho Fetch. Spy dưới đây chỉ ghi nhận signal và **chuyển tiếp lời gọi** tới Fetch đã được MSW intercept, không thay response bằng Promise giả.
+
+```ts title="search-screen.test.ts — thêm test cancellation"
+it('abort A đang pending khi B thay thế', async () => {
+  let releaseA!: () => void;
+  const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+  let aReachedHandler = false;
+  let signalA: AbortSignal | undefined;
+
+  server.use(http.get(ENDPOINT, async ({ request }) => {
+    const query = new URL(request.url).searchParams.get('q');
+    if (query === 'A') {
+      aReachedHandler = true;
+      await gateA;
+      return HttpResponse.json([{ id: 1, name: 'Kết quả A' }]);
+    }
+    return HttpResponse.json([{ id: 2, name: 'Kết quả B' }]);
+  }));
+
+  // Lấy Fetch sau server.listen(), trước khi đặt spy.
+  const interceptedFetch = globalThis.fetch.bind(globalThis);
+  vi.spyOn(globalThis, 'fetch').mockImplementation((resource, init) => {
+    const href = resource instanceof Request ? resource.url : String(resource);
+    if (new URL(href).searchParams.get('q') === 'A') {
+      signalA = init?.signal ?? undefined;
+    }
+    return interceptedFetch(resource, init);
+  });
+
+  const { input, output, dispose } = mount();
+  try {
+    enter(input, 'A');
+    await vi.waitFor(() => {
+      expect(aReachedHandler).toBe(true);
+      expect(signalA?.aborted).toBe(false);
+    });
+
+    enter(input, 'B');
+    expect(signalA?.aborted).toBe(true);
+    await vi.waitFor(() => {
+      expect(output.textContent).toBe('Kết quả B');
+    });
+  } finally {
+    dispose();
+    releaseA();
+  }
+});
+```
+
+Gate bảo đảm A còn pending trước khi B đến. Nhờ vậy assertion abort không phụ thuộc vào việc máy CI có đủ chậm để hai request chồng nhau hay không. `finally` luôn mở gate để resolver không bị treo khi test thất bại; cleanup của harness vẫn chạy sau đó.
+
+Ở ranh giới này, test chứng minh code client phát tín hiệu abort cho Fetch khi đổi query và B vẫn render được. Nó **không chứng minh backend dừng xử lý A**: server có thể đã nhận request và tiếp tục làm việc. Không dùng cancellation của client như cơ chế rollback cho thao tác ghi dữ liệu.
+
+## Kiểm thử teardown tại ranh giới service
+
+HTTP test đã kiểm tra adapter. Với lifecycle của UI, mình dùng một service có thể điều khiển để assertion teardown chạy đồng bộ, không cần mạng hoặc đồng hồ. Thêm block sau vào cùng file test; các import bổ sung cũng đặt ở đầu file.
+
+```ts title="search-screen.test.ts — import bổ sung"
+import { Observable, type Subscriber } from 'rxjs';
+import type { Search } from './search-screen';
+import type { User } from './users-api';
+```
+
+```ts title="search-screen.test.ts — service điều khiển được"
+it('hủy inner cũ và tháo listener khi dispose', () => {
+  const pending = new Map<string, Subscriber<User[]>>();
+  const tornDown: string[] = [];
+  const search = vi.fn<Search>((query) => new Observable<User[]>((subscriber) => {
+    pending.set(query, subscriber);
+    return () => { tornDown.push(query); };
+  }));
+
+  const input = document.createElement('input');
+  const output = document.createElement('div');
+  document.body.append(input, output);
+  const dispose = bindSearch(input, output, search);
+  disposers.push(dispose);
+
+  enter(input, 'A');
+  enter(input, 'B');
+  expect(tornDown).toEqual(['A']);
+  expect(pending.get('A')!.closed).toBe(true);
+
+  pending.get('B')!.next([{ id: 2, name: 'Bình' }]);
+  expect(output.textContent).toBe('Bình');
+  pending.get('A')!.next([{ id: 1, name: 'An cũ' }]);
+  expect(output.textContent).toBe('Bình');
+
+  dispose();
+  expect(tornDown).toEqual(['A', 'B']);
+  expect(pending.get('B')!.closed).toBe(true);
+
+  pending.get('B')!.next([{ id: 3, name: 'Đến sau dispose' }]);
+  enter(input, 'C');
+  expect(output.textContent).toBe('Bình');
+  expect(search.mock.calls.map(([query]) => query)).toEqual(['A', 'B']);
+});
+```
+
+Test này vẫn giữ DOM event, pipeline và render thật; chỉ thay service. B không được gọi `complete()` trước `dispose()`, nên việc thấy teardown B chứng minh màn hình hủy một inner còn hoạt động, không phải chỉ quan sát cleanup do complete tự nhiên.
+
+Sau `dispose()`, emission B không cập nhật DOM và event C không gọi service. Hai assertion kiểm tra hai hướng khác nhau: dữ liệu đang đến không còn lọt xuống UI, và UI không còn khởi tạo công việc mới.
+
+Trong component thật, gọi disposer từ lifecycle cleanup: chẳng hạn effect cleanup trong React hoặc lifecycle destroy trong Angular. **Xóa node khỏi DOM không tự unsubscribe `fromEvent`.** Test này chứng minh disposer hoạt động; muốn chứng minh framework thực sự gọi nó, hãy mount/unmount component thật bằng test utilities của framework và quan sát cùng contract.
+
+<Callout type="warn" title="Teardown không đồng nghĩa với abort">
+  Observable giả ở đây chỉ chứng minh subscription đã đóng. Nếu thay service bằng `from(fetch(url))`, `switchMap` vẫn chặn emission cũ xuống UI nhưng Fetch không tự bị abort. Giữ cả test lifecycle và test adapter nếu việc hủy tài nguyên là một yêu cầu của ứng dụng.
+</Callout>
+
+## Chọn đồng hồ và cách chờ
+
+Integration test thường ghép nhiều cơ chế async. Mình dùng real timers cho suite HTTP ở trên và chỉ chờ một điều kiện quan sát được bằng `vi.waitFor`, thay vì đoán một khoảng sleep đủ dài.
+
+| Cơ chế | Cách kiểm soát phù hợp | Giới hạn cần nhớ |
+| --- | --- | --- |
+| `debounceTime`, `delay`, `retry` có delay | `TestScheduler` khi pipeline nhận scheduler, hoặc fake timers của runner | Chỉ kiểm soát công việc được lên lịch qua đồng hồ đó |
+| Promise của Fetch và `response.json()` | `await` điều kiện DOM, handler hoặc signal; gate khi cần giữ pending | `TestScheduler.flush()` không flush Promise thật |
+| DOM event | Dispatch event hoặc dùng user-event của framework test | Event do jsdom tạo không thay thế browser thật |
+| Service cần hoàn tất theo thứ tự xác định | Observable/Subject điều khiển được | Không kiểm tra transport HTTP |
+| Request cần chồng nhau để kiểm tra abort | Gate do test mở/đóng | Luôn release gate và unsubscribe khi cleanup |
+
+`vi.waitFor` retry callback khi assertion throw, cho đến khi thành công hoặc hết timeout. Callback chỉ nên đọc trạng thái và assert; đừng dispatch input trong đó, vì mỗi lần retry lại tạo thêm tác động lên ứng dụng. Timeout là giới hạn bảo vệ test, không phải khoảng thời gian bạn muốn ngủ trước khi kiểm tra.
+
+Nếu ứng dụng có debounce 300 ms, kiểm tra chính xác mốc 299/300 ms ở unit test virtual time; integration test tập trung vào việc input cuối cùng gửi đúng request. Có thể dùng fake timers trong integration test, nhưng phải hiểu cả timer của polling, MSW và Promise của Fetch. Advance timer không có nghĩa mọi microtask/network callback đã hoàn tất; cần `await` tiếp kết quả quan sát được và luôn phục hồi real timers khi cleanup.
+
+Đừng dùng `lastValueFrom` để chờ stream DOM vô hạn: nó đợi complete và có thể không bao giờ resolve. `firstValueFrom` thì unsubscribe sau emission đầu; nếu emission đó là loading, test chưa chạm đến kết quả HTTP. Với UI integration, đọc DOM thường bám sát contract hơn; khi test Observable trực tiếp, chọn trạng thái terminal mong muốn và đặt giới hạn chờ rõ ràng.
+
+## Những test xanh nhưng chưa đủ
+
+| Cách viết dễ gây hiểu nhầm | Vì sao chưa đủ | Nên kiểm tra thêm |
+| --- | --- | --- |
+| Mock service luôn trả `of(users)` | Không có request pending nên không lộ race/cancellation | Gate HTTP hoặc Observable điều khiển được |
+| Chỉ assert service được gọi | Có thể URL đúng nhưng render sai hoặc stream chết sau lỗi | Output của UI và lần tương tác tiếp theo |
+| Chỉ assert kết quả mới nhất | Unsubscribe có thể không hủy transport | Signal abort hoặc API hủy của adapter |
+| Chờ `sleep(100)` rồi assert | Có thể quá ngắn ở CI hoặc lãng phí khi test chạy nhanh | Chờ điều kiện có timeout |
+| Assert mỗi loading bằng số lượng render cố định | Chi tiết render của framework có thể thay đổi | Contract trạng thái người dùng quan sát được |
+| Xóa DOM trong `afterEach` nhưng không dispose | Listener/subscription có thể vẫn giữ node và tài nguyên | Cleanup stream trước DOM |
+| Dùng backend live cho mọi test | Test phụ thuộc mạng, dữ liệu và dịch vụ ngoài | Backend giả tại boundary, E2E riêng |
+
+Nếu dùng multicasting, thêm case mount hai consumer: chúng có gửi hai request hay dùng chung một request theo contract? Nếu dùng cache, test cả cache hit, cache miss và lúc hết vòng đời cache. Đừng kết luận `shareReplay` không leak chỉ vì UI nhận đúng giá trị; lifecycle nguồn còn phụ thuộc cấu hình và việc nguồn có complete hay không.
+
+## Checklist cho một suite nhỏ
+
+- [ ] Nêu rõ phần thật, phần giả và những ranh giới chưa được kiểm tra.
+- [ ] Có happy path kiểm tra query và kết quả render, không chỉ kiểm tra lời gọi hàm.
+- [ ] Có lỗi HTTP và một lần tương tác thành công sau lỗi.
+- [ ] Có empty result và dữ liệu không hợp lệ nếu contract cần validation.
+- [ ] Có cancellation khi inner vẫn pending; phân biệt unsubscribe với abort transport.
+- [ ] Có cleanup lúc màn hình rời đi, không nhận emission hoặc event mới sau cleanup.
+- [ ] Không có sleep đoán thời gian, request ra mạng ngoài hoặc handler dùng chung bị rò giữa các test.
+- [ ] Gate, subscription, spy, handler và DOM được dọn dù assertion thất bại.
+
+Bắt đầu với ba contract dễ bị hỏng nhất ở màn hình của bạn: query đúng, lỗi không làm chết input, và dispose dừng công việc. Sau đó thêm test tại boundary HTTP nếu đang có adapter, interceptors hoặc cancellation mà mock service không thể kiểm tra.
+
+## Nguồn tham khảo
+
+- [RxJS `fromFetch`](https://rxjs.dev/api/fetch/fromFetch) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/dom/fetch.ts): `AbortController`, teardown và `selector` cho việc đọc body.
+- [MSW Node integration](https://mswjs.io/docs/integrations/node/) và [setupServer](https://mswjs.io/docs/api/setup-server/): intercept request trong môi trường test Node.js.
+- [Vitest `vi.waitFor`](https://vitest.dev/api/vi.html#vi-waitfor): retry assertion có timeout thay vì sleep.
+- [Vitest test environments](https://vitest.dev/guide/environment.html): chọn jsdom cho test cần DOM.
+
+## Học tiếp
+
+<Cards>
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Tách các assertion thời gian chính xác về unit test virtual time." />
+  <Card title="Kiểm thử async stream" href="/docs/testing/async-tests" description="Chọn cách chờ Promise, emission và completion đúng contract." />
+  <Card title="HTTP và Ajax" href="/docs/tich-hop/http-ajax" description="Hiểu giới hạn abort, lỗi HTTP và lifecycle body của fromFetch." />
+  <Card title="DOM events" href="/docs/tich-hop/dom-events" description="Nối event với Observable và dọn listener theo lifecycle." />
+</Cards>

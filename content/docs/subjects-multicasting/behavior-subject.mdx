@@ -3,8 +3,494 @@ title: BehaviorSubject
 description: Lưu và phát giá trị hiện tại cho subscriber mới.
 ---
 
-Trang này sẽ trình bày **BehaviorSubject** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn có một stream trạng thái đăng nhập, nhưng component menu chỉ được tạo sau khi người dùng đã đăng nhập. Nếu dùng `Subject`, menu sẽ phải chờ event tiếp theo mới biết trạng thái hiện tại. **BehaviorSubject** giải quyết đúng nhu cầu này: giữ một giá trị hiện tại và gửi nó ngay cho subscriber mới, miễn là subject chưa kết thúc.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Bài này dùng public API của **RxJS 7.8.2**, với import trực tiếp từ `rxjs`. Bạn nên biết `Observable`, `Subject`, `subscribe` và ba notification `next`, `error`, `complete`. Các frame trong marble là virtual time để minh họa thứ tự, không phải thời gian chờ của `BehaviorSubject`.
 </Callout>
+
+## Mục lục
+
+- [Mental model và khi nào nên dùng](#mental-model-và-khi-nào-nên-dùng)
+- [API cần nhớ](#api-cần-nhớ)
+- [Ví dụ đầu tiên và thứ tự đồng bộ](#ví-dụ-đầu-tiên-và-thứ-tự-đồng-bộ)
+- [Subscriber đến muộn trên cùng timeline](#subscriber-đến-muộn-trên-cùng-timeline)
+- [Complete error và hủy subscription](#complete-error-và-hủy-subscription)
+  - [Sau complete không còn replay](#sau-complete-không-còn-replay)
+  - [Sau error snapshot cũng ném lỗi](#sau-error-snapshot-cũng-ném-lỗi)
+  - [Hủy subscriber khác với hủy subject](#hủy-subscriber-khác-với-hủy-subject)
+- [Ví dụ store trạng thái nhỏ](#ví-dụ-store-trạng-thái-nhỏ)
+  - [Giữ quyền ghi ở bên trong store](#giữ-quyền-ghi-ở-bên-trong-store)
+  - [Dùng snapshot và selector đúng chỗ](#dùng-snapshot-và-selector-đúng-chỗ)
+- [Những bẫy dễ gặp](#những-bẫy-dễ-gặp)
+  - [Seed phải có nghĩa trong domain](#seed-phải-có-nghĩa-trong-domain)
+  - [Next không tự bỏ giá trị trùng](#next-không-tự-bỏ-giá-trị-trùng)
+  - [Object được giữ theo reference](#object-được-giữ-theo-reference)
+  - [Tránh vòng lặp next trong subscriber](#tránh-vòng-lặp-next-trong-subscriber)
+  - [Không biến state subject thành notifier hủy](#không-biến-state-subject-thành-notifier-hủy)
+- [So sánh với Subject ReplaySubject và shareReplay](#so-sánh-với-subject-replaysubject-và-sharereplay)
+- [Kiểm chứng bằng TestScheduler](#kiểm-chứng-bằng-testscheduler)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Mental model và khi nào nên dùng
+
+`Subject` giống một kênh thông báo: bạn phải đang nghe thì mới nhận được event. `BehaviorSubject` giống bảng trạng thái ở quầy: người vừa đến nhìn được trạng thái hiện tại, rồi theo dõi các lần cập nhật tiếp theo. Bảng chỉ có một ô; nó không lưu lịch sử và không sống qua lần reload ứng dụng.
+
+```text
+constructor(seed) ──► giá trị hiện tại
+next(value)       ──► thay giá trị hiện tại ──► các subscriber đang nghe
+subscribe()      ──► nhận giá trị hiện tại ngay, rồi nghe các lần next
+```
+
+Có ba điểm nên giữ trong đầu:
+
+- Constructor bắt buộc nhận **seed**, tức giá trị ban đầu. `undefined` hoặc `null` vẫn là giá trị và vẫn được phát nếu bạn chọn chúng làm seed.
+- Khi subject còn hoạt động, subscriber mới nhận đúng một giá trị hiện tại, không nhận lại mọi lần `next` trước đó.
+- Seed được gửi trong lời gọi `subscribe`; `next` cũng gửi notification đồng bộ theo mặc định. Bản thân `BehaviorSubject` không thêm scheduler hay timer.
+
+Mình chọn `BehaviorSubject` cho state có giá trị ban đầu hợp lệ: bộ lọc đang chọn, giỏ hàng rỗng, trạng thái tải dữ liệu hoặc cấu hình giao diện. Với event như “người dùng vừa bấm mua”, replay event cũ cho component mới có thể chạy lại side effect; lúc đó `Subject` thường phù hợp hơn.
+
+Nếu dữ liệu chỉ là kết quả của một Observable có sẵn, đừng vội chuyển nó vào `BehaviorSubject`. Dùng operator để biến đổi và chia sẻ stream thường ít phải tự quản lý lifecycle hơn; phần so sánh bên dưới giải thích lựa chọn `shareReplay`.
+
+## API cần nhớ
+
+```ts
+import { BehaviorSubject } from 'rxjs';
+
+const count = new BehaviorSubject<number>(0);
+const count$ = count.asObservable();
+
+console.log(count.getValue()); // 0
+count.next(1);
+console.log(count.value); // 1
+```
+
+| API | Ý nghĩa | Điểm cần nhớ |
+|---|---|---|
+| `new BehaviorSubject<T>(seed)` | Khởi tạo state kiểu `T` | Seed không phải notification `next` gửi tới một subscriber đã tồn tại; nó được giữ cho lần subscribe |
+| `next(value: T)` | Cập nhật giá trị hiện tại, phát tới subscriber đang nghe | Không tự so sánh giá trị cũ và mới |
+| `subscribe(observer)` | Theo dõi state | Nhận giá trị hiện tại đồng bộ khi subject còn hoạt động |
+| `getValue(): T` | Đọc snapshot đồng bộ | Ném lỗi nếu subject đã `error` hoặc đã bị `unsubscribe` |
+| `value` | Getter gọi `getValue()` | Chỉ đọc; cập nhật qua `next`, không gán `subject.value = ...` |
+| `asObservable()` | Cung cấp giao diện Observable cho consumer | Không còn public `next` trên giao diện trả về, nhưng vẫn cùng state và cùng lifecycle |
+| `complete()` | Kết thúc bình thường | Subscriber đến sau chỉ nhận `complete`, không nhận state cuối |
+| `error(err)` | Kết thúc bằng lỗi | Subscriber đến sau nhận lỗi; snapshot cũng ném lỗi đó |
+
+`getValue()` không tạo subscription và không chờ dữ liệu trong tương lai. Nó hợp lý cho một command cần đọc state hiện tại; để UI tự cập nhật, bạn vẫn cần subscribe stream.
+
+## Ví dụ đầu tiên và thứ tự đồng bộ
+
+Giả sử bộ đếm bắt đầu ở `0`. A subscribe trước, B subscribe sau lần cập nhật lên `1`:
+
+```ts
+import { BehaviorSubject } from 'rxjs';
+
+const count = new BehaviorSubject(0);
+
+console.log('trước A');
+const a = count.subscribe((value) => console.log('A:', value));
+console.log('sau A');
+
+count.next(1);
+const b = count.subscribe((value) => console.log('B:', value));
+count.next(2);
+
+a.unsubscribe();
+count.next(3);
+b.unsubscribe();
+
+console.log('snapshot:', count.getValue());
+```
+
+```text
+trước A
+A: 0
+sau A
+A: 1
+B: 1
+A: 2
+B: 2
+B: 3
+snapshot: 3
+```
+
+`A: 0` xuất hiện trước `sau A` vì seed được gửi ngay trong `subscribe`. B không nhận `0`: tại lúc B đến, giá trị hiện tại đã là `1`. Sau khi A unsubscribe, `next(3)` chỉ đi tới B; việc hủy A không reset state.
+
+Ngay cả khi không còn subscriber, `next` vẫn cập nhật giá trị hiện tại. Subscriber xuất hiện sau đó vẫn nhận state mới nhất, chứ không bắt đầu lại từ seed.
+
+<Callout type="warn" title="Đừng chờ subscribe trả về mới chuẩn bị dữ liệu">
+  Callback có thể chạy trước khi biến chứa subscription được gán. Tránh mẫu `const sub = state.subscribe(() => sub.unsubscribe())`: callback ban đầu có thể đụng temporal dead zone. Nếu chỉ cần một snapshot rồi kết thúc, dùng `state.pipe(take(1)).subscribe(...)` với `take` import từ `rxjs`.
+</Callout>
+
+## Subscriber đến muộn trên cùng timeline
+
+Đọc theo cột dọc để thấy subscribe và emission xảy ra cùng frame. Hàng `input` chỉ chứa các lời gọi `next` và `complete`; seed `s` được đặt ở constructor trước frame 0, không phải một lời gọi `next` ở frame 0.
+
+<MarbleDiagram
+  title="BehaviorSubject(seed)"
+  rows={[
+    { label: 'input', marble: '-a--b--c--|--', kind: 'source' },
+    { label: 'A subscribe', marble: '^------------', kind: 'subscription' },
+    { label: 'B subscribe', marble: '-----^-------', kind: 'subscription' },
+    { label: 'C subscribe', marble: '------------^', kind: 'subscription' },
+    { label: 'A output', marble: 'sa--b--c--|--', kind: 'output' },
+    { label: 'B output', marble: '-----b-c--|--', kind: 'output' },
+    { label: 'C output', marble: '------------|', kind: 'output' },
+  ]}
+  values={{ s: 'seed', a: 'state A', b: 'state B', c: 'state C' }}
+  caption="B nhận b ngay ở frame 5, dù lần next(b) xảy ra ở frame 4. C đến sau complete nên chỉ nhận complete."
+/>
+
+A subscribe ở frame 0 nên nhận `s`, rồi nhận `a`, `b`, `c` tại các frame 1, 4, 7. B đến ở frame 5, nhận `b` ngay lúc đó, sau đó nhận `c` ở frame 7. Không có timer nào tạo emission `b` ở frame 5; chính việc subscribe kích hoạt nó.
+
+Ở frame 10, subject complete nên A và B đều complete. C subscribe ở frame 12 chỉ nhận `complete`, không nhận `c`. Đây là giới hạn quan trọng của lời hứa “subscriber mới luôn nhận giá trị hiện tại”: lời hứa chỉ áp dụng khi subject còn hoạt động.
+
+## Complete error và hủy subscription
+
+### Sau complete không còn replay
+
+`complete()` kết thúc stream, không có nghĩa là phát thêm snapshot cuối rồi kết thúc. Những subscriber đang nghe đã nhận lần `next` cuối khi nó xảy ra; subscriber đến muộn chỉ biết stream đã complete.
+
+```ts
+import { BehaviorSubject } from 'rxjs';
+
+const state = new BehaviorSubject('idle');
+state.next('ready');
+state.complete();
+
+state.subscribe({
+  next: (value) => console.log('late:', value),
+  complete: () => console.log('late: complete'),
+});
+console.log('snapshot:', state.getValue());
+
+// late: complete
+// snapshot: ready
+```
+
+Trong RxJS 7.8.2, `getValue()` vẫn đọc được giá trị đã lưu sau `complete`, nếu subject chưa bị hủy hoặc kết thúc bằng lỗi. Đọc snapshot và subscribe là hai thao tác khác nhau, nên kết quả không mâu thuẫn.
+
+<Callout type="warn" title="Không dùng next để mở lại stream">
+  Sau `complete`, gọi `next` không phát notification và không làm stream sống lại. Riêng implementation 7.8.2 vẫn gán giá trị lưu trước khi kiểm tra trạng thái stopped, nên snapshot có thể đổi nếu bạn tiếp tục gọi `next`. Đừng dùng chi tiết đó làm cơ chế reset: tạo instance mới khi cần một lifecycle mới.
+</Callout>
+
+### Sau error snapshot cũng ném lỗi
+
+`error` là terminal notification, không phải một state “đang có lỗi” có thể sửa ở lần `next` tiếp theo.
+
+```ts
+import { BehaviorSubject } from 'rxjs';
+
+const state = new BehaviorSubject('idle');
+const failure = new Error('Không tải được dữ liệu');
+state.error(failure);
+
+state.subscribe({
+  next: (value) => console.log(value),
+  error: (error: Error) => console.log('late:', error.message),
+});
+
+try {
+  state.getValue();
+} catch (error) {
+  console.log('snapshot ném cùng lỗi:', error === failure);
+}
+
+// late: Không tải được dữ liệu
+// snapshot ném cùng lỗi: true
+```
+
+Nếu request thất bại nhưng người dùng vẫn có thể bấm retry, mình biểu diễn lỗi bằng một state như `{ status: 'error', message: '...' }` rồi gọi `next`. Subject còn sống để phát `loading` và `ready` ở lần retry. `catchError` trên một Observable dẫn xuất có thể cung cấp fallback cho consumer đó, nhưng không sửa hoặc khởi động lại subject đã error.
+
+### Hủy subscriber khác với hủy subject
+
+| Thao tác | Ảnh hưởng trong RxJS 7.8.2 |
+|---|---|
+| `subscription.unsubscribe()` | Chỉ subscriber đó ngừng nghe; không nhận `complete` do thao tác này; state và các subscriber khác vẫn hoạt động |
+| `subject.complete()` | Gửi `complete` cho subscriber đang nghe; subscriber tương lai cũng complete ngay |
+| `subject.unsubscribe()` | Đóng chính subject; không gửi `complete`; đọc snapshot ném `ObjectUnsubscribedError` nếu chưa có lỗi trước đó |
+
+Đừng dùng `subject.unsubscribe()` thay cho teardown của từng consumer. Khi owner của store kết thúc, `complete()` thường thể hiện lifecycle rõ hơn; từng consumer vẫn cần hủy subscription của mình khi rời màn hình.
+
+`BehaviorSubject` cũng không tự hủy subscription tới một producer bên ngoài. Nếu bạn nối `source$.subscribe(subject)`, hãy giữ và hủy subscription upstream riêng. Đồng thời, `complete` hoặc `error` của source sẽ kết thúc subject; với store sống lâu hơn một request, việc chuyển response thành state bằng callback thường phù hợp hơn cách nối thẳng này.
+
+## Ví dụ store trạng thái nhỏ
+
+### Giữ quyền ghi ở bên trong store
+
+Giả sử hai component cùng đọc bộ lọc sản phẩm. Mình giữ subject bên trong store, expose Observable cho consumer và chỉ cho phép ghi qua các method có ý nghĩa nghiệp vụ:
+
+```ts
+import { BehaviorSubject, distinctUntilChanged, map } from 'rxjs';
+
+type Category = 'all' | 'books' | 'tools';
+type Filters = Readonly<{
+  query: string;
+  category: Category;
+}>;
+
+class FilterStore {
+  private readonly stateSubject = new BehaviorSubject<Filters>({
+    query: '',
+    category: 'all',
+  });
+
+  readonly state$ = this.stateSubject.asObservable();
+  readonly category$ = this.state$.pipe(
+    map((state) => state.category),
+    distinctUntilChanged(),
+  );
+
+  setQuery(query: string): void {
+    const current = this.stateSubject.getValue();
+    this.stateSubject.next({ ...current, query });
+  }
+
+  setCategory(category: Category): void {
+    const current = this.stateSubject.getValue();
+    if (current.category === category) return;
+    this.stateSubject.next({ ...current, category });
+  }
+
+  reset(): void {
+    this.stateSubject.next({ query: '', category: 'all' });
+  }
+
+  destroy(): void {
+    this.stateSubject.complete();
+  }
+}
+
+const store = new FilterStore();
+const menu = store.category$.subscribe((category) => {
+  console.log('menu:', category);
+});
+
+store.setQuery('rxjs');
+store.setCategory('books');
+
+const summary = store.state$.subscribe((state) => {
+  console.log('summary:', JSON.stringify(state));
+});
+
+menu.unsubscribe();
+summary.unsubscribe();
+store.destroy();
+
+// menu: all
+// menu: books
+// summary: {"query":"rxjs","category":"books"}
+```
+
+`setQuery` vẫn phát state mới, nhưng `category$` không phát lại `'all'` vì selector chỉ quan tâm category và dùng `distinctUntilChanged`. Component summary đến muộn vẫn nhận đủ state hiện tại ngay lập tức.
+
+`reset` là cập nhật state về giá trị ban đầu, không kết thúc stream. `destroy` chỉ dành cho lúc owner không còn dùng store; nó không phải thao tác reset mà component bất kỳ được tự gọi.
+
+### Dùng snapshot và selector đúng chỗ
+
+`getValue()` trong command đồng bộ như `setQuery` giúp lấy các field cần giữ lại. Tuy nhiên, snapshot là giá trị tại **lúc đọc**, không phải một view tự cập nhật. Nếu đọc snapshot, `await` request rồi ghi lại cả object cũ, bạn có thể ghi đè những thay đổi xảy ra trong lúc chờ; khi ghi, hãy đọc state hiện tại lại và áp dụng quy tắc nghiệp vụ phù hợp.
+
+`asObservable()` là ranh giới API, không phải cơ chế đóng băng dữ liệu. Consumer không có method `next` trên public Observable, nhưng object được phát vẫn là cùng reference. `Readonly` ở ví dụ chỉ bảo vệ ở mức TypeScript; dữ liệu lồng sâu cần quy ước immutable riêng, và JavaScript runtime không tự chặn mutation.
+
+Scope của instance cũng là một quyết định thiết kế. Nếu cần chia sẻ state giữa component, hãy chia sẻ **cùng instance**; tạo một store mỗi component sẽ tạo nhiều state độc lập. Với SSR, state của từng người dùng cần scope theo request hoặc session phù hợp, không đặt state cá nhân vào singleton dùng chung cho mọi request.
+
+## Những bẫy dễ gặp
+
+### Seed phải có nghĩa trong domain
+
+`new BehaviorSubject<User | null>(null)` hợp lý nếu `null` có nghĩa “không có người dùng”. Nhưng nếu `null` đồng thời nghĩa “chưa kiểm tra đăng nhập”, UI có thể hiển thị màn hình logged-out trước khi request kiểm tra hoàn tất. Vấn đề không nằm ở subject; kiểu state đang gộp hai tình huống khác nhau.
+
+Dùng discriminated union khi các trạng thái cần được phân biệt:
+
+```ts
+import { BehaviorSubject } from 'rxjs';
+
+type User = { id: string; name: string };
+type SessionState =
+  | { status: 'loading' }
+  | { status: 'anonymous' }
+  | { status: 'authenticated'; user: User }
+  | { status: 'error'; message: string };
+
+const session = new BehaviorSubject<SessionState>({ status: 'loading' });
+session.next({ status: 'anonymous' });
+```
+
+Nếu domain thật sự không có giá trị ban đầu và subscriber chỉ nên nhận dữ liệu sau lần phát đầu, `ReplaySubject<T>(1)` thường phù hợp hơn việc tạo seed giả. Lọc `null` bằng `filter` có thể hữu ích, nhưng nó cũng giấu trạng thái loading hoặc empty khỏi consumer nếu các trạng thái đó có ý nghĩa.
+
+### Next không tự bỏ giá trị trùng
+
+```ts
+import { BehaviorSubject, distinctUntilChanged } from 'rxjs';
+
+const count = new BehaviorSubject(0);
+const raw = count.subscribe((value) => console.log('raw:', value));
+const distinct = count.pipe(distinctUntilChanged()).subscribe((value) => {
+  console.log('distinct:', value);
+});
+
+count.next(0);
+count.next(1);
+raw.unsubscribe();
+distinct.unsubscribe();
+
+// raw: 0
+// distinct: 0
+// raw: 0
+// raw: 1
+// distinct: 1
+```
+
+`distinctUntilChanged` giữ lịch sử riêng cho mỗi subscription. Subscriber mới vẫn nhận giá trị hiện tại; operator không có “lịch sử chung” để chặn emission đầu của subscriber mới. Mặc định nó so sánh bằng `===`, nên với object bạn cần cập nhật immutable và/hoặc chọn field trước khi so sánh.
+
+### Object được giữ theo reference
+
+```ts
+import { BehaviorSubject } from 'rxjs';
+
+const state = new BehaviorSubject({ count: 0 });
+const snapshot = state.getValue();
+snapshot.count = 1; // Đổi object đang được subject giữ, nhưng không phát next.
+console.log(state.getValue().count); // 1
+
+state.next({ ...state.getValue(), count: 2 }); // Phát object mới.
+```
+
+Mutation làm snapshot đổi mà subscriber đang nghe không nhận notification. Nếu sau đó gọi `next` với chính reference cũ, một consumer dùng `distinctUntilChanged()` còn có thể bỏ qua emission. Vì vậy, hãy tạo object mới cho mỗi thay đổi, bao gồm các nhánh lồng sâu đã thay đổi.
+
+Subject vẫn giữ giá trị hiện tại khi tất cả subscriber đã unsubscribe. Đừng coi việc hết subscriber là cơ chế xóa dữ liệu nhạy cảm hoặc giải phóng một object lớn; lifecycle của owner và việc thay state phải được thiết kế riêng.
+
+### Tránh vòng lặp next trong subscriber
+
+Vì notification đồng bộ, gọi `next` ngay trong callback có thể tạo emission lồng nhau. Ví dụ, A nhận `1` rồi gọi `next(2)` trước khi B nhận `1`; B có thể nhận `2` rồi mới nhận `1`. Subject không tự biến các cập nhật này thành một queue.
+
+Mình tránh dùng subscriber vừa đọc vừa ghi lại cùng subject. Đặt cập nhật vào command hoặc reducer rõ ràng; nếu thực sự cần scheduling để tuần tự hóa, thiết kế scheduler và kiểm thử thứ tự notification thay vì chỉ thêm `setTimeout` để che vòng lặp.
+
+### Không biến state subject thành notifier hủy
+
+`takeUntil(notifier$)` dừng khi notifier phát bất kỳ `next` nào, không kiểm tra giá trị là `true` hay `false`. Do đó, `new BehaviorSubject(false)` làm notifier sẽ khiến stream dừng ngay bởi seed `false`.
+
+```ts
+import { interval, Subject, takeUntil } from 'rxjs';
+
+const destroyed$ = new Subject<void>();
+const subscription = interval(1000).pipe(
+  takeUntil(destroyed$),
+).subscribe((tick) => console.log(tick));
+
+// Khi owner bị hủy:
+destroyed$.next();
+destroyed$.complete();
+// subscription đã ngừng nghe interval.
+```
+
+Chỉ gọi `destroyed$.complete()` không đủ để kích hoạt `takeUntil`: notifier cần phát `next`. Với teardown event, `Subject<void>` diễn đạt ý định rõ hơn state subject có seed.
+
+## So sánh với Subject ReplaySubject và shareReplay
+
+| Lựa chọn | Cần seed | Subscriber mới khi đang hoạt động | Subscriber sau complete | Snapshot đồng bộ |
+|---|---|---|---|---|
+| `Subject<T>` | Không | Chỉ các emission tương lai | Chỉ `complete` | Không |
+| `BehaviorSubject<T>` | Có | Một giá trị hiện tại, rồi các emission tương lai | Chỉ `complete` | `getValue()` / `value` |
+| `ReplaySubject<T>(1)` | Không | Một giá trị đã lưu nếu có, rồi các emission tương lai | Replay buffer còn hiệu lực, rồi `complete` | Không |
+| `source$.pipe(shareReplay({ bufferSize: 1, refCount: true }))` | Không | Chia sẻ upstream và replay buffer nếu có | Replay nếu kết quả complete còn được cache | Không |
+
+`BehaviorSubject` **không tương đương hoàn toàn** với `ReplaySubject(1)`: khác seed, API snapshot và replay sau khi kết thúc. Sau `error`, `ReplaySubject(1)` còn phát buffer còn hiệu lực trước khi phát lỗi, trong khi `BehaviorSubject` chỉ phát lỗi.
+
+`shareReplay` là operator, không phải nơi bạn chủ động gọi `next`. Trong RxJS 7.8.2, cấu hình trên reset sau error; khi refCount về 0 trước khi source kết thúc, nó hủy upstream và reset buffer; kết quả đã complete vẫn được giữ để replay. Vì vậy, chọn nó cho stream dữ liệu dẫn xuất hoặc chia sẻ request với chính sách cache phù hợp, không coi nó là bản thay thế có cùng lifecycle với store.
+
+Mặc định của mình: state có seed hợp lệ và command cập nhật thì dùng `BehaviorSubject`; event không cần replay thì dùng `Subject`; cần một emission gần nhất nhưng không có seed thì cân nhắc `ReplaySubject(1)`. Nếu đã có source Observable, ưu tiên pipeline và operator chia sẻ trước khi viết thêm một subject thủ công.
+
+## Kiểm chứng bằng TestScheduler
+
+Test sau tái hiện đúng timeline phía trên. Bạn có thể chạy trong môi trường Node có RxJS 7.8.2; `TestScheduler.run` dùng một ký tự `-` cho một frame. Không cần `setTimeout` hay chờ thời gian thật.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { BehaviorSubject } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ hot, expectObservable }) => {
+  const state = new BehaviorSubject('s');
+
+  hot('-a--b--c--|').subscribe(state);
+
+  // A ở frame 0; B ở frame 5; C ở frame 12.
+  expectObservable(state, '^').toBe('sa--b--c--|');
+  expectObservable(state, '-----^').toBe('-----b-c--|');
+  expectObservable(state, '------------^').toBe('------------|');
+});
+
+// Không ném assertion error là test đã đạt.
+```
+
+`hot` ở đây điều khiển các lời gọi `next` và `complete`; subject không tự phát seed theo clock. Hai hàng B và C kiểm chứng những điểm dễ nhầm nhất: replay diễn ra ngay tại frame subscribe và không xảy ra sau complete. Subscription marble và notification marble được viết riêng, không ghép ký hiệu `^` vào chuỗi output.
+
+Bổ sung test cho snapshot và lỗi để tránh chỉ kiểm tra happy path:
+
+```ts
+import { deepStrictEqual, strictEqual, throws } from 'node:assert/strict';
+import { BehaviorSubject } from 'rxjs';
+
+const state = new BehaviorSubject(0);
+const values: number[] = [];
+const subscription = state.subscribe((value) => values.push(value));
+
+state.next(0); // Giá trị trùng vẫn được phát.
+subscription.unsubscribe();
+state.next(2); // Không còn subscriber nhưng state vẫn cập nhật.
+
+deepStrictEqual(values, [0, 0]);
+strictEqual(state.getValue(), 2);
+
+state.complete();
+const late: string[] = [];
+state.subscribe({
+  next: (value) => late.push(String(value)),
+  complete: () => late.push('complete'),
+});
+deepStrictEqual(late, ['complete']);
+strictEqual(state.getValue(), 2);
+
+const failed = new BehaviorSubject('idle');
+const failure = new Error('request failed');
+failed.error(failure);
+throws(() => failed.getValue(), (error) => error === failure);
+failed.subscribe({
+  error: (error) => strictEqual(error, failure),
+});
+
+const disposed = new BehaviorSubject(0);
+disposed.unsubscribe();
+throws(() => disposed.getValue(), { name: 'ObjectUnsubscribedError' });
+```
+
+## Bài tập tự kiểm tra
+
+1. Với `new BehaviorSubject('loading')`, gọi `next('ready')` rồi mới subscribe: giá trị đầu tiên là gì? **`ready`**, vì subject chỉ giữ giá trị hiện tại.
+2. Sau `complete`, subscriber mới có nhận `ready` không? **Không**, chỉ nhận `complete`; snapshot vẫn đọc được nếu không có error hoặc subject unsubscribe.
+3. Hai component cùng cần bộ lọc nhưng mỗi component tự tạo store: state có đồng bộ không? **Không**, chúng đang đọc hai instance khác nhau.
+4. Sửa ví dụ store để thêm `page: number`: khi query đổi, reset page về `1` trong **cùng một lần `next`**. Viết test rằng subscriber đến muộn không nhìn thấy state trung gian “query mới, page cũ”.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Subject" href="/docs/subjects-multicasting/subject" description="Dùng kênh event khi không nên replay trạng thái." />
+  <Card title="ReplaySubject" href="/docs/subjects-multicasting/replay-subject" description="Giữ buffer lịch sử mà không cần seed." />
+  <Card title="shareReplay" href="/docs/subjects-multicasting/share-replay" description="Chia sẻ source Observable và quản lý replay cache." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm tra emission và subscription bằng virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS API: BehaviorSubject](https://rxjs.dev/api/index/class/BehaviorSubject) — constructor, snapshot và các API kế thừa.
+- [Source BehaviorSubject, tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/BehaviorSubject.ts) — gán giá trị trước `next`, gửi state lúc subscribe, kiểm tra lỗi khi đọc snapshot.
+- [Source Subject, tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/Subject.ts) — terminal notification và sự khác nhau giữa complete với unsubscribe.
+- [Tests BehaviorSubject, tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/spec/subjects/BehaviorSubject-spec.ts) — replay khi subscribe, snapshot và subscriber sau complete.
+- [Source shareReplay, tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — chính sách reset khi error, complete và refCount về 0.

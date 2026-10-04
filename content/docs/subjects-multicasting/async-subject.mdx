@@ -3,8 +3,390 @@ title: AsyncSubject
 description: Chỉ phát giá trị cuối cùng khi source hoàn tất.
 ---
 
-Trang này sẽ trình bày **AsyncSubject** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Giả sử một tác vụ export phát nhiều bản kết quả tạm, nhưng màn hình tải file chỉ được nhận bản cuối khi tác vụ thành công. Nếu dùng `ReplaySubject(1)`, subscriber vẫn thấy các bản tạm ngay khi chúng xuất hiện. `AsyncSubject` giải quyết yêu cầu khác: giữ giá trị mới nhất, chờ `complete()`, rồi mới phát giá trị đó cho subscriber hiện tại và cả subscriber đến sau.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài này">
+  Bạn nên biết `Observable`, `Subject` và ba notification `next`, `error`, `complete`. Các ví dụ dùng API RxJS 7.8; `AsyncSubject` phù hợp với một kết quả cuối cùng của một tác vụ hữu hạn, không phải stream progress hay state thay đổi liên tục.
 </Callout>
+
+## Mục lục
+
+- [AsyncSubject giữ lại điều gì](#asyncsubject-giữ-lại-điều-gì)
+- [Subscriber đến sớm và đến muộn](#subscriber-đến-sớm-và-đến-muộn)
+  - [Đọc marble timeline](#đọc-marble-timeline)
+  - [Ví dụ với thứ tự log](#ví-dụ-với-thứ-tự-log)
+- [Complete và error quyết định kết quả](#complete-và-error-quyết-định-kết-quả)
+  - [Complete khi chưa có giá trị](#complete-khi-chưa-có-giá-trị)
+  - [Error không phát giá trị đang giữ](#error-không-phát-giá-trị-đang-giữ)
+  - [Không complete thì không có kết quả](#không-complete-thì-không-có-kết-quả)
+- [Chia sẻ một tác vụ và cache kết quả cuối](#chia-sẻ-một-tác-vụ-và-cache-kết-quả-cuối)
+  - [Dùng share với connector AsyncSubject](#dùng-share-với-connector-asyncsubject)
+  - [Nối source thủ công và quản lý teardown](#nối-source-thủ-công-và-quản-lý-teardown)
+- [Chọn AsyncSubject hay công cụ khác](#chọn-asyncsubject-hay-công-cụ-khác)
+- [Những bẫy cần tránh](#những-bẫy-cần-tránh)
+- [Kiểm chứng bằng TestScheduler](#kiểm-chứng-bằng-testscheduler)
+- [Đọc tiếp](#đọc-tiếp)
+
+## AsyncSubject giữ lại điều gì
+
+`AsyncSubject<T>` vừa là Observer nhận notification, vừa là Observable để nhiều subscriber lắng nghe. Khác với `Subject` thông thường, mỗi lần `next(value)` chỉ thay thế giá trị đang giữ; nó chưa gọi `next` của subscriber.
+
+Có thể hình dung đây là bản nháp của một biên bản: bạn sửa nhiều lần, nhưng chỉ gửi bản chốt khi ký xong. Giới hạn của phép so sánh này là `AsyncSubject` không tự biết tác vụ đã xong; producer phải gửi `complete()` để chốt, hoặc `error()` để báo thất bại.
+
+| Notification gửi vào | Hành vi của AsyncSubject |
+| --- | --- |
+| `next(value)` khi còn hoạt động | Giữ `value` làm giá trị mới nhất, chưa phát ra ngoài. |
+| `complete()` sau ít nhất một `next` | Phát đúng giá trị cuối, rồi `complete` cho subscriber. |
+| `complete()` khi chưa có `next` | Chỉ gửi `complete`, không tự tạo giá trị mặc định. |
+| `error(err)` khi còn hoạt động | Gửi `error`, không phát giá trị đang giữ. |
+| Subscribe sau khi complete thành công | Nhận lại giá trị cuối nếu có, rồi `complete`. |
+| Subscribe sau khi error | Nhận lại lỗi, không có `next`. |
+
+Không có initial value bắt buộc như `BehaviorSubject`. Subject cũng không tự subscribe một source nào: nếu bạn muốn nối một Observable vào nó, bạn phải làm việc đó hoặc dùng một operator multicasting.
+
+<Callout type="warn" title="Async không có nghĩa là chạy bất đồng bộ">
+  `AsyncSubject` không tự dùng timer, microtask hay scheduler. Khi gọi `complete()`, các callback `next` và `complete` thông thường chạy đồng bộ ngay trong lời gọi đó. Subscriber đến sau cũng nhận kết quả đồng bộ trong lúc subscribe, trừ khi bạn thêm cơ chế scheduling khác.
+</Callout>
+
+## Subscriber đến sớm và đến muộn
+
+Điểm quan trọng không phải subscriber đã chứng kiến bao nhiêu lần `next`, mà là nó còn lắng nghe lúc subject complete hay subscribe sau khi subject đã complete thành công.
+
+### Đọc marble timeline
+
+Đọc theo cột dọc: hàng `input` là notification producer gửi vào subject, không phải giá trị đã đi tới subscriber. Các hàng `sub` đánh dấu thời điểm subscribe; `out` là notification subscriber thực sự nhận. Component của dự án hỗ trợ nhóm `(c|)` để biểu diễn `next(c)` rồi `complete` trong cùng một frame.
+
+<MarbleDiagram
+  title="AsyncSubject"
+  rows={[
+    { label: 'input', marble: '-a-b-c|', kind: 'source' },
+    { label: 'sub A', marble: '^', kind: 'subscription' },
+    { label: 'sub B', marble: '----^', kind: 'subscription' },
+    { label: 'sub C', marble: '--------^', kind: 'subscription' },
+    { label: 'out A', marble: '------(c|)', kind: 'output' },
+    { label: 'out B', marble: '------(c|)', kind: 'output' },
+    { label: 'out C', marble: '--------(c|)', kind: 'output' },
+  ]}
+  values={{ a: 'bản tạm 1', b: 'bản tạm 2', c: 'bản cuối' }}
+  caption="A và B nhận c khi input complete ở frame 6. C subscribe ở frame 8 nên nhận c và complete ngay tại frame 8."
+/>
+
+A subscribe ở frame 0, nhưng không nhận `a` ở frame 1 hay `b` ở frame 3. B subscribe ở frame 4 cũng chưa nhận `b`, dù lúc đó subject đang giữ giá trị ấy. Đến frame 5, `c` thay thế `b`; khi producer complete ở frame 6, cả A và B mới nhận `c`, rồi complete.
+
+C đến sau ở frame 8 vẫn nhận `c`, rồi complete ngay. Đây là replay **kết quả đã chốt**, không phải replay giá trị mới nhất trong khi tác vụ còn chạy. Các frame là thời gian ảo minh họa, không phải số millisecond thực tế.
+
+### Ví dụ với thứ tự log
+
+Ví dụ này không dùng timer để bạn nhìn rõ thời điểm callback được gọi:
+
+```ts
+import { AsyncSubject } from 'rxjs';
+
+const result = new AsyncSubject<number>();
+
+function listen(name: string): void {
+  result.subscribe({
+    next: (value) => console.log(`${name}: ${value}`),
+    complete: () => console.log(`${name}: complete`),
+  });
+}
+
+listen('A');
+result.next(10);
+result.next(20);
+listen('B'); // Chưa có log nào từ A hoặc B.
+result.next(30);
+
+console.log('before complete');
+result.complete();
+console.log('after complete');
+
+listen('C'); // Subject đã complete, vẫn replay 30.
+result.next(40); // Bị bỏ qua; không thay đổi kết quả đã chốt.
+```
+
+```text
+before complete
+A: 30
+B: 30
+A: complete
+B: complete
+after complete
+C: 30
+C: complete
+```
+
+`30` đến từ lần `next` cuối cùng trước `complete()`, không phải từ lần `next` cuối mà từng subscriber nhìn thấy. Một subject đã kết thúc không mở lại khi có subscriber mới; muốn chạy tác vụ mới, bạn cần một subject mới hoặc một cơ chế reset phù hợp.
+
+## Complete và error quyết định kết quả
+
+Nhận giá trị cuối chỉ là nhánh thành công. Nhánh rỗng và nhánh thất bại có contract khác, nên consumer không nên giả định rằng cứ subscribe là chắc chắn sẽ có một `next`.
+
+### Complete khi chưa có giá trị
+
+```ts
+import { AsyncSubject } from 'rxjs';
+
+const empty = new AsyncSubject<number>();
+empty.complete();
+
+empty.subscribe({
+  next: (value) => console.log('value:', value),
+  complete: () => console.log('empty: complete'),
+});
+// empty: complete
+
+const explicitUndefined = new AsyncSubject<number | undefined>();
+explicitUndefined.next(undefined);
+explicitUndefined.complete();
+
+explicitUndefined.subscribe({
+  next: (value) => console.log('value:', value),
+  complete: () => console.log('undefined: complete'),
+});
+// value: undefined
+// undefined: complete
+```
+
+Không gọi `next` khác với gọi `next(undefined)`: trường hợp thứ hai vẫn có một emission hợp lệ. Nếu nghiệp vụ bắt buộc phải có kết quả, hãy kiểm tra điều đó ở producer hoặc chọn operator báo lỗi khi source rỗng; đừng để consumer suy diễn từ `complete`.
+
+### Error không phát giá trị đang giữ
+
+Đọc timeline sau từ trên xuống: producer đã gửi hai giá trị nhưng kết thúc bằng lỗi thay vì complete.
+
+<MarbleDiagram
+  title="AsyncSubject"
+  rows={[
+    { label: 'input', marble: '-a-b-#', kind: 'source' },
+    { label: 'sub A', marble: '^', kind: 'subscription' },
+    { label: 'sub B', marble: '-------^', kind: 'subscription' },
+    { label: 'out A', marble: '-----#', kind: 'output' },
+    { label: 'out B', marble: '-------#', kind: 'output' },
+  ]}
+  values={{ a: 'bản tạm 1', b: 'bản tạm 2' }}
+  caption="Error ở frame 5 kết thúc subject mà không phát b. Subscriber đến sau ở frame 7 cũng chỉ nhận error."
+/>
+
+Ở frame 5, A nhận lỗi chứ không nhận `b` trước lỗi. B subscribe ở frame 7 nhận lại chính lỗi đã kết thúc subject. Gọi `complete()` sau `error()` không biến kết quả thành thành công.
+
+```ts
+import { AsyncSubject } from 'rxjs';
+
+const result = new AsyncSubject<string>();
+
+result.subscribe({
+  next: (value) => console.log('value:', value),
+  error: (err: Error) => console.log('A:', err.message),
+  complete: () => console.log('A: complete'),
+});
+
+result.next('bản tạm');
+result.error(new Error('Export failed'));
+
+result.subscribe({
+  next: (value) => console.log('late value:', value),
+  error: (err: Error) => console.log('B:', err.message),
+});
+// A: Export failed
+// B: Export failed
+```
+
+### Không complete thì không có kết quả
+
+Một stream có thể phát hàng nghìn giá trị nhưng không bao giờ complete. Khi nối nó vào `AsyncSubject`, subscriber không nhận giá trị nào vì subject vẫn đợi tín hiệu chốt. Đây là lý do mình không dùng `AsyncSubject` trực tiếp cho `interval`, WebSocket, input của người dùng hay store state sống lâu.
+
+Unsubscribe của một subscriber cũng không phải là `complete()` của subject. Subscriber ấy ngừng nhận notification; subject và producer có thể vẫn hoạt động, tùy cách bạn quản lý kết nối upstream.
+
+<Callout type="warn" title="Cancellation không đồng nghĩa với thành công">
+  Nếu bạn đặt `takeUntil(cancel$)` trước `AsyncSubject`, tín hiệu cancel sẽ làm stream trung gian complete. Subject có thể phát bản tạm mới nhất như thể đó là kết quả cuối. Nếu nghiệp vụ xem cancel là thất bại, hãy biểu diễn nó rõ ràng bằng error hoặc một result type riêng; đừng dùng complete như tín hiệu hủy một cách vô tình.
+</Callout>
+
+## Chia sẻ một tác vụ và cache kết quả cuối
+
+Giả sử nhiều consumer cùng cần kết quả của một tác vụ hữu hạn. Bạn muốn tác vụ chỉ chạy một lần, không ai nhận bản tạm, và consumer đến sau vẫn nhận kết quả thành công. `AsyncSubject` đảm nhiệm phần giữ/chốt kết quả; còn việc subscribe source, hủy upstream và reset cache cần được quyết định riêng.
+
+### Dùng share với connector AsyncSubject
+
+Khi đầu vào đã là Observable, mình ưu tiên `share` với connector thay vì tự quản lý một subject và một subscription. Ví dụ dưới đây mô phỏng tác vụ bằng hai chuỗi đồng bộ để thứ tự log dễ kiểm tra; bạn có thể thay source bằng tác vụ export hữu hạn thực tế.
+
+```ts
+import { AsyncSubject, defer, of, share } from 'rxjs';
+
+const exportSource$ = defer(() => {
+  console.log('start export');
+  return of('draft.csv', 'final.csv');
+});
+
+// Tạo pipeline một lần và dùng lại cùng exportResult$.
+const exportResult$ = exportSource$.pipe(
+  share({
+    connector: () => new AsyncSubject<string>(),
+    resetOnComplete: false,
+    resetOnError: true,
+    resetOnRefCountZero: true,
+  }),
+);
+
+exportResult$.subscribe({
+  next: (file) => console.log('A:', file),
+  complete: () => console.log('A: complete'),
+});
+
+exportResult$.subscribe({
+  next: (file) => console.log('B:', file),
+  complete: () => console.log('B: complete'),
+});
+```
+
+```text
+start export
+A: final.csv
+A: complete
+B: final.csv
+B: complete
+```
+
+A kích hoạt source; vì source đồng bộ nên nó complete trước khi B subscribe. `resetOnComplete: false` giữ lại subject đã chốt, nên B nhận cache mà không chạy `start export` lần nữa.
+
+| Cấu hình | Ý nghĩa trong ví dụ |
+| --- | --- |
+| `connector` | Tạo `AsyncSubject` để giấu các bản tạm và chỉ phát kết quả khi complete. |
+| `resetOnComplete: false` | Giữ kết quả thành công cho subscriber đến sau. Mặc định `share` reset khi complete, nên phải đổi rõ ràng nếu cần cache này. |
+| `resetOnError: true` | Subscriber hiện tại nhận lỗi; lần subscribe mới sau đó có thể tạo subject mới và chạy lại source. Không tự retry cho subscriber đã nhận lỗi. |
+| `resetOnRefCountZero: true` | Nếu mọi subscriber rời đi trước khi source kết thúc, hủy kết nối upstream và reset. Lần subscribe sau bắt đầu tác vụ mới. |
+
+<Callout type="info" title="Cache có lifetime, không chỉ có giá trị">
+  Ví dụ không có TTL hay invalidation tự động sau thành công. Kết quả còn khả dụng khi pipeline này vẫn được giữ trong bộ nhớ. Nếu cần export lại theo input mới, hãy tạo pipeline theo từng tác vụ hoặc thiết kế invalidation rõ ràng. Nếu dựng pipeline mới cho mỗi consumer, chúng không dùng chung một cache.
+</Callout>
+
+### Nối source thủ công và quản lý teardown
+
+Khi bạn thật sự cần một Observer để nối vào producer, cách nối cơ bản là `source$.subscribe(result)`. `asObservable()` chỉ giấu quyền gọi `next`, `error`, `complete` khỏi API đưa cho consumer; nó không tự quản lý upstream.
+
+```ts
+import { AsyncSubject, of } from 'rxjs';
+
+const source$ = of('draft.csv', 'final.csv');
+const result = new AsyncSubject<string>();
+const result$ = result.asObservable();
+
+result$.subscribe({
+  next: (file) => console.log('file:', file),
+  complete: () => console.log('done'),
+});
+
+// Subject nhận next/error/complete từ source.
+const upstream = source$.subscribe(result);
+// file: final.csv
+// done
+
+// Nếu source còn chạy, owner có thể dùng upstream.unsubscribe()
+// để hủy kết nối. Với of() ở đây, upstream đã đóng sau complete.
+```
+
+Subscription `upstream` thuộc về nơi khởi chạy tác vụ, không thuộc từng consumer. Hủy upstream không gửi `complete` hoặc `error` vào `result`, nên nếu hủy giữa chừng mà vẫn giữ subject, subscriber có thể chờ mãi. Owner cần quyết định hủy cả consumer hay gửi một tín hiệu kết thúc phù hợp với nghiệp vụ.
+
+Cũng đừng đưa cùng một cold source vào cùng subject bằng nhiều lần `source$.subscribe(result)`: mỗi lần subscribe có thể chạy thêm một producer. Với source đồng bộ, lần đầu có thể đã complete subject trước khi lần thứ hai bắt đầu; tác vụ thứ hai vẫn có thể chạy side effect nhưng kết quả bị subject bỏ qua.
+
+## Chọn AsyncSubject hay công cụ khác
+
+Câu hỏi nên hỏi trước là: “Consumer có cần thấy dữ liệu **trước** khi tác vụ kết thúc không?” Nếu có, `AsyncSubject` không phù hợp dù nó chỉ giữ một giá trị.
+
+| Công cụ | Trong khi source còn chạy | Khi đã complete thành công và có subscriber mới | Mình chọn khi |
+| --- | --- | --- | --- |
+| `Subject` | Phát từng giá trị cho subscriber hiện tại. | Chỉ complete, không replay dữ liệu cũ. | Cần event bus không lưu history. |
+| `BehaviorSubject` | Phát initial/current value khi subscribe, rồi phát mỗi update. | Chỉ complete, không phát current value nữa. | Cần state hiện tại và initial value. |
+| `ReplaySubject(1)` | Replay giá trị gần nhất khi subscribe, rồi phát mỗi update. | Replay giá trị trong buffer, rồi complete. | Cần giá trị gần nhất ngay cả khi tác vụ chưa chốt. |
+| `AsyncSubject` | Giữ giá trị cuối nhưng không phát. | Phát giá trị cuối nếu có, rồi complete. | Cần kết quả cuối của một tác vụ đã hoàn tất thành công. |
+
+`ReplaySubject(1)` còn có thể replay buffer trước khi báo lỗi cho subscriber đến sau; `AsyncSubject` đã error thì chỉ báo lỗi. Vì vậy hai loại subject không thay thế nhau chỉ vì cùng giữ một giá trị gần nhất.
+
+Nếu không cần tự nhận notification qua một subject, các lựa chọn sau thường đơn giản hơn:
+
+- **`takeLast(1)`**: mỗi subscription đợi source complete rồi phát giá trị cuối; source rỗng thì complete không có giá trị. Operator này không tự chia sẻ một lần chạy hay cache cho subscriber đến sau.
+- **`last()`**: hữu ích khi source rỗng phải là lỗi; không có giá trị khớp và không có default thì phát `EmptyError`. Nó cũng không tự multicasting.
+- **`lastValueFrom(source$)`**: chuyển kết quả cuối thành Promise; reject khi source rỗng nếu không có default và khi source error. Nếu source không complete, Promise vẫn pending. Mỗi lần gọi có thể tạo subscription mới; muốn nhiều consumer dùng chung thì giữ và dùng lại cùng Promise.
+- **`shareReplay({ bufferSize: 1, refCount: true })`**: chia sẻ/replay emission gần nhất, nhưng vẫn phát các emission trung gian. Chỉ chọn nó khi consumer được phép nhìn thấy các giá trị ấy.
+
+Mình chọn `AsyncSubject` khi “chỉ kết quả đã chốt mới được xuất hiện” là contract thực sự. Nếu chỉ muốn chia sẻ một HTTP response đơn lẻ, nó có thể không đem lại lợi ích rõ ràng so với pipeline chia sẻ/cache response thông thường; vấn đề cần thiết kế lúc đó thường là lifetime và invalidation của cache.
+
+## Những bẫy cần tránh
+
+| Hiểu nhầm | Cách xử lý |
+| --- | --- |
+| Gọi `next` xong là consumer nhận ngay. | Consumer chỉ nhận khi subject complete thành công. Dùng loại subject khác cho progress/state. |
+| `AsyncSubject` làm tác vụ chạy async. | Scheduler và producer quyết định timing; subject không tự đổi lịch thực thi. |
+| Consumer unsubscribe là hủy tác vụ chung. | Kiểm tra ownership upstream. Với `share`, refCount/reset quyết định teardown; với nối thủ công, owner phải hủy upstream. |
+| Gọi `complete()` trong `finalize` luôn an toàn. | `finalize` còn chạy khi error hoặc unsubscribe. Không dùng nó để chốt thành công vô điều kiện, vì cancellation có thể vô tình phát bản tạm. |
+| Giữ một object nghĩa là giữ snapshot bất biến. | Subject giữ reference, không clone. Tạo object mới hoặc áp dụng immutability nếu không muốn consumer nhìn thấy mutation. |
+| Một subject đã complete có thể dùng lại cho tác vụ tiếp theo. | Tạo subject mới. Với `share`, thiết kế reset/invalidation thay vì gửi thêm `next` vào subject đã kết thúc. |
+
+Giữ một giá trị cũng không có nghĩa là chi phí bộ nhớ luôn nhỏ: một object có thể tham chiếu tới dữ liệu lớn. Tránh giữ cache kết quả vô thời hạn nếu vòng đời nghiệp vụ không cần đến nó.
+
+## Kiểm chứng bằng TestScheduler
+
+Test sau kiểm tra cùng các mốc thời gian trong hai diagram: subscriber trước complete không thấy bản tạm, subscriber muộn nhận cache ngay, và error không phát giá trị đang giữ. Thêm một case rỗng để tránh mặc định rằng subject luôn có kết quả.
+
+Đây là mã test cho môi trường có RxJS và Node.js; import `rxjs/testing` cung cấp `TestScheduler`.
+
+```ts
+import { deepStrictEqual } from 'node:assert';
+import { AsyncSubject } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+function scheduler(): TestScheduler {
+  return new TestScheduler((actual, expected) => {
+    deepStrictEqual(actual, expected);
+  });
+}
+
+scheduler().run(({ hot, expectObservable }) => {
+  const values = { a: 'draft 1', b: 'draft 2', c: 'final' };
+  const result = new AsyncSubject<string>();
+
+  hot('-a-b-c|', values).subscribe(result);
+
+  // A ở frame 0; B ở frame 4; cả hai nhận c ở frame 6.
+  expectObservable(result).toBe('------(c|)', values);
+  expectObservable(result, '----^').toBe('------(c|)', values);
+
+  // C subscribe ở frame 8, sau khi subject đã complete.
+  expectObservable(result, '--------^').toBe('--------(c|)', values);
+});
+
+scheduler().run(({ hot, expectObservable }) => {
+  const failure = new Error('Export failed');
+  const values = { a: 'draft 1', b: 'draft 2' };
+  const result = new AsyncSubject<string>();
+
+  hot('-a-b-#', values, failure).subscribe(result);
+
+  expectObservable(result).toBe('-----#', undefined, failure);
+  expectObservable(result, '-------^').toBe('-------#', undefined, failure);
+});
+
+scheduler().run(({ hot, expectObservable }) => {
+  const result = new AsyncSubject<string>();
+  hot('---|').subscribe(result);
+
+  expectObservable(result).toBe('---|');
+  expectObservable(result, '-----^').toBe('-----|');
+});
+```
+
+Trong `TestScheduler.run`, mỗi `-` tương ứng một frame thời gian ảo; `(c|)` là hai notification cùng frame theo thứ tự `next` rồi `complete`. Dùng chuỗi subscription riêng để mô tả subscriber đến muộn, không trộn dấu `^` vào chuỗi notification gửi cho `hot()`.
+
+Bạn có thể thêm case `next(undefined)` rồi complete và case unsubscribe trước complete. Với case unsubscribe, kỳ vọng subscriber không nhận giá trị cuối; điều đó không chứng minh upstream đã bị hủy, vì teardown upstream là một contract khác cần test riêng.
+
+## Đọc tiếp
+
+Hãy thử thay `AsyncSubject` trong ví dụ đầu bằng `ReplaySubject(1)` và quan sát log trước `complete()`. Khi đã thấy khác biệt, chọn loại subject theo contract consumer cần, rồi kiểm tra riêng lifecycle kết nối và cache.
+
+<Cards>
+  <Card title="Subject" href="/docs/subjects-multicasting/subject" description="Nền tảng Observer và Observable dùng chung một nguồn notification." />
+  <Card title="ReplaySubject" href="/docs/subjects-multicasting/replay-subject" description="Replay dữ liệu gần nhất mà không chờ source hoàn tất." />
+  <Card title="BehaviorSubject" href="/docs/subjects-multicasting/behavior-subject" description="Phát state hiện tại cho subscriber mới khi subject còn hoạt động." />
+  <Card title="share" href="/docs/subjects-multicasting/share" description="Quản lý kết nối chung, refCount và reset của subject." />
+</Cards>
+
+Nguồn đối chiếu: [RxJS Subject guide](https://rxjs.dev/guide/subject), [AsyncSubject trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/AsyncSubject.ts) và [API share](https://rxjs.dev/api/index/function/share).

@@ -3,8 +3,399 @@ title: Subject
 description: Dùng Subject như một Observable đồng thời là Observer.
 ---
 
-Trang này sẽ trình bày **Subject** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn có một lệnh “đã lưu” và muốn cả toast lẫn danh sách đang mở cùng phản ứng, nhưng không muốn widget mở sau đó xử lý lại lệnh cũ. `Subject` là điểm phát chung cho tình huống này: bạn gọi `next` ở một nơi, các subscriber đang nghe nhận event ấy. Nó không giữ event để phát lại cho người đến muộn.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Ví dụ dùng **RxJS 7.8.2**, import từ `rxjs`. Bạn nên biết `Observable`, `subscribe` và ba notification `next`, `error`, `complete`. Marble dùng virtual frame để minh họa thứ tự, không ngụ ý Subject có timer hay tự phát bất đồng bộ.
 </Callout>
+
+## Mục lục
+
+- [Một điểm phát chung cho nhiều subscriber](#một-điểm-phát-chung-cho-nhiều-subscriber)
+- [API cần nhớ](#api-cần-nhớ)
+- [Ví dụ đầu tiên và subscriber đến muộn](#ví-dụ-đầu-tiên-và-subscriber-đến-muộn)
+- [Đọc vòng đời trên marble timeline](#đọc-vòng-đời-trên-marble-timeline)
+- [Complete error và unsubscribe khác nhau thế nào](#complete-error-và-unsubscribe-khác-nhau-thế-nào)
+  - [Complete kết thúc bình thường](#complete-kết-thúc-bình-thường)
+  - [Error kết thúc bằng lỗi](#error-kết-thúc-bằng-lỗi)
+  - [Hủy subscriber không phải hủy Subject](#hủy-subscriber-không-phải-hủy-subject)
+- [Giữ quyền phát event ở bên trong](#giữ-quyền-phát-event-ở-bên-trong)
+- [Nối Observable vào Subject và quản lý upstream](#nối-observable-vào-subject-và-quản-lý-upstream)
+- [Next đồng bộ không phải hàng đợi](#next-đồng-bộ-không-phải-hàng-đợi)
+  - [Callback chạy trước khi next trả về](#callback-chạy-trước-khi-next-trả-về)
+  - [Phát lồng nhau có thể đảo thứ tự quan sát](#phát-lồng-nhau-có-thể-đảo-thứ-tự-quan-sát)
+- [Khi nào không nên dùng Subject](#khi-nào-không-nên-dùng-subject)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Đọc tiếp](#đọc-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Một điểm phát chung cho nhiều subscriber
+
+Với một cold Observable, mỗi subscription có thể chạy producer riêng. Với Subject, subscribe chỉ đăng ký người nhận vào cùng một điểm phát; nó không chạy lại producer. Dữ liệu đến từ lời gọi `next` của code bên ngoài hoặc từ một Observable được nối vào Subject.
+
+`Subject<T>` có hai mặt:
+
+- **Mặt Observable:** consumer gọi `subscribe`, `pipe` hoặc nhận một Observable qua `asObservable()`.
+- **Mặt Observer:** producer gọi `next(value)`, `error(err)`, `complete()`; Subject cũng có thể được truyền làm observer cho `source$.subscribe(subject)`.
+
+```text
+producer ──next(value)──► Subject ──┬──► subscriber A
+                                  └──► subscriber B
+```
+
+Có thể nghĩ Subject như loa thông báo: người đang nghe cùng nhận thông báo, người đến sau không được nghe lại đoạn đã qua. Phép so sánh dừng ở đó: Subject không tạo thread riêng cho mỗi người nghe, không lưu lịch sử và không tự quản lý nguồn phát bên ngoài.
+
+Một Subject thường được dùng làm hot event stream vì việc phát không phụ thuộc vào từng subscription. Khi không có ai nghe, `next(value)` vẫn có thể được gọi, nhưng giá trị ấy không được lưu cho tương lai. **Multicast không đồng nghĩa với replay.**
+
+Mình dùng Subject ở ranh giới imperative, nơi một thao tác của ứng dụng cần đi vào pipeline RxJS. Nếu dữ liệu đã có dưới dạng Observable, mình ưu tiên biến đổi hoặc chia sẻ Observable đó bằng operator, thay vì thêm một Subject trung gian không có nhiệm vụ rõ ràng.
+
+## API cần nhớ
+
+| API | Tác dụng | Điều cần phân biệt |
+| --- | --- | --- |
+| `new Subject<T>()` | Tạo điểm phát cho giá trị kiểu `T` | Không có seed hay giá trị hiện tại |
+| `next(value)` | Gửi một giá trị tới subscriber đang nghe | Không replay cho subscriber tương lai |
+| `subscribe(observer)` | Đăng ký nhận notification, trả về `Subscription` | Không tự khởi động producer bên ngoài |
+| `pipe(...)` | Tạo pipeline từ Subject | Operator sau Subject thường chạy riêng cho từng subscriber |
+| `asObservable()` | Trả về Observable không cung cấp API ghi của Subject | Không thêm buffer, scheduling hay clone dữ liệu |
+| `complete()` | Phát terminal notification thành công | Không tự ngắt upstream độc lập |
+| `error(err)` | Phát terminal notification lỗi | Kết thúc Subject, không phải một event lỗi thông thường |
+| `subscription.unsubscribe()` | Hủy một subscription đã đăng ký | Không complete Subject hay các subscriber khác |
+
+Subject có thêm `unsubscribe()` trên chính instance trong RxJS 7.8.2, nhưng nó **không phải** phiên bản thay thế của `complete()`. Phần vòng đời bên dưới giải thích vì sao không nên dùng nó để báo kết thúc cho consumer.
+
+`Subject<void>` phù hợp khi event chỉ mang ý nghĩa “có một trigger”, nên bạn có thể gọi `next()` không có payload. Nếu consumer cần biết bản ghi nào đã đổi, hãy dùng kiểu payload cụ thể; một event `saved` không có ID sẽ buộc nơi đọc tự đoán hoặc tải lại toàn bộ dữ liệu.
+
+## Ví dụ đầu tiên và subscriber đến muộn
+
+Đoạn code này chạy đồng bộ, nên thứ tự output có thể suy ra trực tiếp từ vị trí từng lời gọi:
+
+```ts
+import { Subject } from 'rxjs';
+
+const events = new Subject<string>();
+
+// Chưa có subscriber: giá trị này không được giữ lại.
+events.next('before');
+
+const a = events.subscribe({
+  next: (value) => console.log('A:', value),
+  complete: () => console.log('A complete'),
+});
+
+events.next('saved');
+
+const b = events.subscribe({
+  next: (value) => console.log('B:', value),
+  complete: () => console.log('B complete'),
+});
+
+events.next('deleted');
+a.unsubscribe();
+events.next('restored');
+events.complete();
+
+console.log('closed:', a.closed, b.closed);
+
+// A: saved
+// A: deleted
+// B: deleted
+// B: restored
+// B complete
+// closed: true true
+```
+
+Không ai nhận `'before'`. B cũng không nhận `'saved'` vì lúc đó chưa đăng ký. Sau khi A unsubscribe, chỉ B nhận `'restored'`; A không nhận callback `complete` khi Subject kết thúc vì A đã rời stream trước đó.
+
+Nếu B cần ngay trạng thái hiện tại, chẳng hạn bản ghi đang chọn, Subject thuần không đủ. Việc giữ “event đã xảy ra” và giữ “state đang có” là hai contract khác nhau, không nên trộn chỉ để tiện gọi `next`.
+
+## Đọc vòng đời trên marble timeline
+
+Đọc các hàng theo cùng cột dọc. Producer phát `a`, `b`, `c` ở frame 2, 6, 10; A đăng ký ở frame 0, B đăng ký ở frame 4. Timeline này minh họa vòng đời, không phải phép đo thời gian của đoạn code trên.
+
+<MarbleDiagram
+  title="Subject"
+  rows={[
+    { label: 'producer', marble: '--a---b---c--|', kind: 'source' },
+    { label: 'sub A', marble: '^-------!', kind: 'subscription' },
+    { label: 'sub B', marble: '----^--------!', kind: 'subscription' },
+    { label: 'A nhận', marble: '--a---b-------', kind: 'output' },
+    { label: 'B nhận', marble: '------b---c--|', kind: 'output' },
+  ]}
+  values={{ a: 'event đầu', b: 'event thứ hai', c: 'event thứ ba' }}
+  caption="B không nhận a; A rời đi ở frame 8 nên không nhận c hay complete. Dấu ! của B ở frame 13 là subscription đóng do complete, không phải lệnh hủy thủ công."
+/>
+
+Ở frame 4, subscribe của B không tạo emission nào: Subject không có buffer để replay `a`. Frame 6, cả A và B nhận `b`. Frame 8, A unsubscribe; dòng “A nhận” không có dấu `|` vì hủy subscription không phát `complete`.
+
+Đến frame 13, B nhận `complete` rồi subscription đóng. Subject đã kết thúc không thể mở lại bằng `next`; một vòng đời mới cần instance mới.
+
+## Complete error và unsubscribe khác nhau thế nào
+
+### Complete kết thúc bình thường
+
+`complete()` báo rằng Subject sẽ không phát thêm giá trị. Các subscriber còn đăng ký nhận callback `complete` và subscription được đóng. Một subscriber đến sau nhận ngay `complete`, không nhận các giá trị cũ.
+
+```ts
+import { Subject } from 'rxjs';
+
+const subject = new Subject<number>();
+
+subject.subscribe({
+  next: (value) => console.log('A:', value),
+  complete: () => console.log('A complete'),
+});
+
+subject.next(1);
+subject.complete();
+subject.next(2); // Bị bỏ qua: Subject đã complete.
+
+const late = subject.subscribe({
+  next: (value) => console.log('late:', value),
+  complete: () => console.log('late complete'),
+});
+
+console.log('late closed:', late.closed);
+
+// A: 1
+// A complete
+// late complete
+// late closed: true
+```
+
+Callback của subscriber muộn chạy ngay trong lời gọi `subscribe`. Vì vậy, không nên giả định callback chỉ chạy sau khi `subscribe` trả về hoặc sau khi UI đã khởi tạo xong.
+
+### Error kết thúc bằng lỗi
+
+`error(err)` gửi lỗi tới các subscriber hiện tại và kết thúc Subject. Subscriber mới nhận lại cùng lỗi ngay khi subscribe, nhưng không nhận các giá trị trước đó.
+
+```ts
+import { Subject } from 'rxjs';
+
+const subject = new Subject<number>();
+const report = (err: unknown) => {
+  console.log(err instanceof Error ? err.message : String(err));
+};
+
+subject.subscribe({ error: report });
+subject.error(new Error('Connection lost'));
+subject.next(1); // Bị bỏ qua sau terminal error.
+subject.subscribe({ error: report });
+
+// Connection lost
+// Connection lost
+```
+
+Một Subject đã error không được hồi sinh bằng `next` hay `complete`. Nếu “lưu thất bại” chỉ là một event và ứng dụng còn tiếp tục cho phép lưu, hãy phát một payload như `{ type: 'save-failed', message: '...' }` qua `next`, thay vì giết event stream dùng chung bằng `error`.
+
+<Callout type="warn" title="Lỗi terminal cần được xử lý">
+  Ví dụ có thể error nên đăng ký callback `error` hoặc xử lý lỗi trong pipeline. `try/catch` quanh `subject.error(...)` không thay thế error handler của subscriber; lỗi không được xử lý có thể được RxJS báo ra ngoài luồng callback hiện tại.
+</Callout>
+
+### Hủy subscriber không phải hủy Subject
+
+Ba thao tác dưới đây có phạm vi khác nhau trong **RxJS 7.8.2**:
+
+| Thao tác | Subscriber hiện tại | Subscriber mới | Producer bên ngoài |
+| --- | --- | --- | --- |
+| `subscription.unsubscribe()` | Chỉ subscription đó ngừng nhận; không có callback complete | Vẫn có thể đăng ký Subject | Không tự bị hủy nếu là subscription độc lập |
+| `subject.complete()` | Nhận complete rồi đóng | Nhận complete ngay | Không tự bị hủy nếu đã nối thủ công |
+| `subject.error(err)` | Nhận error rồi đóng | Nhận error ngay | Không tự bị hủy nếu đã nối thủ công |
+| `subject.unsubscribe()` | Bỏ danh sách observer, không phát complete hay error | Không sử dụng được Subject nữa | Không tự bị hủy |
+
+`subject.unsubscribe()` trong phiên bản này khiến lời gọi `next` sau đó ném `ObjectUnsubscribedError`; subscribe vào nó cũng thất bại. Quan trọng hơn, thao tác ấy không đóng các Subscription của consumer như `complete()` và không báo terminal notification cho họ. Mình không dùng nó làm tín hiệu kết thúc nghiệp vụ.
+
+Component chỉ nên hủy subscription do nó sở hữu. Owner của Subject mới quyết định lúc nào gọi `complete()` cho toàn bộ người đọc. Một toast unmount không có quyền kết thúc stream event mà danh sách khác vẫn đang dùng.
+
+## Giữ quyền phát event ở bên trong
+
+Nếu export trực tiếp Subject, mọi consumer đều có thể gọi `next`, `error` hoặc `complete`. Khi đó một widget có thể vô tình kết thúc event stream của cả ứng dụng. Mặc định mình giữ Subject private và chỉ cung cấp Observable cùng các method nghiệp vụ rõ ràng.
+
+```ts
+import { Subject } from 'rxjs';
+
+type DocumentEvent = Readonly<{
+  type: 'saved';
+  documentId: string;
+}>;
+
+class DocumentEvents {
+  private readonly events = new Subject<DocumentEvent>();
+  readonly events$ = this.events.asObservable();
+
+  saved(documentId: string): void {
+    // Owner gọi sau khi thao tác lưu đã thành công.
+    this.events.next({ type: 'saved', documentId });
+  }
+
+  dispose(): void {
+    this.events.complete();
+  }
+}
+
+const documentEvents = new DocumentEvents();
+
+const toast = documentEvents.events$.subscribe((event) => {
+  console.log('toast:', event.documentId);
+});
+const list = documentEvents.events$.subscribe((event) => {
+  console.log('list:', event.documentId);
+});
+
+documentEvents.saved('doc-42');
+toast.unsubscribe();
+documentEvents.saved('doc-43');
+
+// Owner kết thúc cả instance khi phạm vi ứng dụng này kết thúc.
+documentEvents.dispose();
+console.log('list closed:', list.closed);
+
+// toast: doc-42
+// list: doc-42
+// list: doc-43
+// list closed: true
+```
+
+`asObservable()` che API ghi khỏi consumer thông thường, không tạo một execution mới. Nó cũng không phải hàng rào bảo mật, không clone payload và không ngăn mutation ở runtime. Các subscriber nhận cùng object reference; `Readonly` chỉ giúp kiểm tra ở TypeScript. Nếu cần snapshot độc lập hoặc bất biến sâu, bạn phải thiết kế riêng.
+
+Giữ event gắn với một phạm vi cụ thể, chẳng hạn phiên làm việc hoặc một feature, thường dễ quản lý hơn global event bus không có owner. Method `dispose()` ở trên thuộc vòng đời instance; nó không có nghĩa mỗi consumer được gọi nó khi ngừng đọc.
+
+## Nối Observable vào Subject và quản lý upstream
+
+Vì Subject là Observer, bạn có thể truyền nó cho `subscribe` để forward cả `next`, `error` và `complete`. Nhưng kết nối ấy có subscription riêng, không phải là một trong các subscription đọc Subject.
+
+Ví dụ không dùng timer dưới đây cho thấy rõ quyền sở hữu cleanup:
+
+```ts
+import { Observable, Subject } from 'rxjs';
+
+const source$ = new Observable<number>((subscriber) => {
+  console.log('source start');
+  subscriber.next(1);
+
+  // Source còn mở: chưa complete hay error.
+  return () => console.log('source cleanup');
+});
+
+const hub = new Subject<number>();
+const reader = hub.subscribe({
+  next: (value) => console.log('reader:', value),
+  complete: () => console.log('reader complete'),
+});
+
+const upstream = source$.subscribe(hub);
+hub.complete();
+console.log('closed:', reader.closed, upstream.closed);
+upstream.unsubscribe();
+
+// source start
+// reader: 1
+// reader complete
+// closed: true false
+// source cleanup
+```
+
+`hub.complete()` đóng người đọc nhưng không gọi teardown của `source$`. Với nguồn timer hay WebSocket được nối thủ công, tài nguyên bên ngoài có thể vẫn hoạt động. Bạn phải giữ `upstream` và hủy nó khi không còn cần nguồn; việc tất cả reader rời đi cũng không tự làm điều này.
+
+Một bẫy khác là nguồn đồng bộ: `source$.subscribe(hub)` có thể phát hết rồi complete trước khi dòng tiếp theo kịp đăng ký reader. Subject không replay, nên reader ấy chỉ thấy complete. Đăng ký reader trước khi nối nguồn nếu bạn chủ động quản lý kết nối; nếu chỉ muốn nhiều consumer dùng chung nguồn, thường nên chuyển sang [share](/docs/subjects-multicasting/share).
+
+<Callout type="info" title="Sharing quản lý kết nối chứ không chỉ phát chung">
+  `share()` mặc định kết nối source khi có subscriber đầu tiên, ngắt nguồn khi subscriber cuối rời đi nếu source còn chạy, và reset sau complete hoặc error. Nó không replay giá trị cũ. Nếu cần replay, xem `shareReplay` và chính sách cache của nó; đừng thay bằng Subject thủ công mà bỏ qua teardown.
+</Callout>
+
+## Next đồng bộ không phải hàng đợi
+
+### Callback chạy trước khi next trả về
+
+Subject không tự chuyển notification sang task khác. Khi không thêm operator đổi scheduling, callback subscriber chạy ngay trong lời gọi `next`:
+
+```ts
+import { Subject } from 'rxjs';
+
+const subject = new Subject<number>();
+subject.subscribe((value) => console.log('received:', value));
+
+console.log('before');
+subject.next(1);
+console.log('after');
+subject.complete();
+
+// before
+// received: 1
+// after
+```
+
+Một callback tính toán nặng sẽ kéo dài lời gọi `next`, nên multicast không đồng nghĩa với xử lý song song hay backpressure. Nếu callback trả về Promise, Subject cũng không chờ Promise ấy hoàn tất trước khi gửi giá trị tiếp theo; thứ tự hoàn tất của tác vụ async là việc bạn cần quản lý bằng pipeline thích hợp.
+
+Tương tự, phép `map` hay `tap` đặt sau Subject không tự được chia sẻ. Với hai subscriber cùng đăng ký `subject.pipe(map(...))`, phép biến đổi ấy chạy cho từng subscription. Nếu công việc cần chạy một lần rồi mới chia sẻ kết quả, đặt nó trước vị trí sharing trong một pipeline dùng chung.
+
+### Phát lồng nhau có thể đảo thứ tự quan sát
+
+Gọi `next` lần nữa từ một callback đang nhận event tạo ra reentrancy: lần phát mới chen vào trước khi lần phát cũ đi qua hết các subscriber. Với A đăng ký trước B, ví dụ sau có output dễ gây bất ngờ:
+
+```ts
+import { Subject } from 'rxjs';
+
+const subject = new Subject<number>();
+
+subject.subscribe((value) => {
+  console.log('A:', value);
+  if (value === 1) subject.next(2);
+});
+subject.subscribe((value) => console.log('B:', value));
+
+subject.next(1);
+subject.complete();
+
+// A: 1
+// A: 2
+// B: 2
+// B: 1
+```
+
+Khi A nhận `1`, nó gọi `next(2)` ngay. Cả A và B xử lý `2` trước khi lần phát `1` quay lại để gọi B. Subject vẫn phát cho người đang nghe, nhưng không bảo đảm một hàng đợi FIFO giữa những lần `next` lồng nhau.
+
+Mình tránh feedback bằng cách để consumer không ghi ngược vào cùng Subject, tách command khỏi event, và xác định một owner cho việc phát. Nếu thật sự cần scheduling để tuần tự hóa, hãy thiết kế và kiểm thử rõ điểm đặt scheduler; thêm `observeOn` riêng cho từng consumer không mặc nhiên sửa thứ tự cho cả hệ thống.
+
+## Khi nào không nên dùng Subject
+
+| Nhu cầu | Lựa chọn mặc định | Vì sao không chọn Subject thuần |
+| --- | --- | --- |
+| Biến đổi Observable có sẵn | `pipe` với operator phù hợp | Subject thêm quyền ghi và vòng đời không cần thiết |
+| Nghe DOM event | `fromEvent` | Có sẵn teardown cho event listener theo subscription |
+| Nhiều consumer dùng chung source, không replay | `share` | Không phải tự quản lý kết nối upstream |
+| State có giá trị ban đầu hợp lệ | `BehaviorSubject` | Subscriber mới cần giá trị hiện tại ngay |
+| Giữ một buffer cho subscriber muộn | `ReplaySubject` có giới hạn | Subject không có lịch sử |
+| Chia sẻ source và replay kết quả | `shareReplay` với cấu hình rõ ràng | Cần cả kết nối dùng chung lẫn buffer |
+| Chỉ công bố giá trị cuối khi complete | `AsyncSubject` | Subject phát từng `next` ngay |
+
+Không replay là một lựa chọn đúng cho event nhất thời như “yêu cầu refresh”, không phải thiếu sót cần luôn sửa bằng `ReplaySubject(1)`. Replay một command cũ cho consumer mới có thể gây thêm request hoặc lặp lại side effect. Ngược lại, dùng Subject cho state khiến UI mới phải chờ lần cập nhật tiếp theo mới có dữ liệu.
+
+Subject cũng không phải message broker: nó không lưu bền, không có acknowledgment, không tự retry và không phân phối mỗi job cho đúng một worker. Nếu cần các contract ấy, phải xây pipeline hoặc dùng hạ tầng phù hợp, không suy ra chúng từ tên “event bus”.
+
+## Bài tập tự kiểm tra
+
+1. Trong ví dụ đầu tiên, chuyển subscription B lên trước `events.next('saved')`. B nhận thêm gì? **B nhận `saved`**, nhưng vẫn không nhận `before` vì lúc đó chưa đăng ký.
+2. Sau `a.unsubscribe()`, A có nhận callback `complete` khi Subject complete không? **Không**: unsubscribe không phải terminal notification.
+3. Trong ví dụ upstream, bỏ `upstream.unsubscribe()`. Có dòng `source cleanup` không? **Không**: `hub.complete()` không hủy kết nối upstream độc lập.
+4. Subject đã error, một widget mới subscribe chỉ với callback `next`. Widget có nhận giá trị cũ không? **Không**; nó nhận terminal error mà không có error handler để xử lý. Hãy thêm handler hoặc xử lý lỗi trong pipeline.
+5. B trong ví dụ phát lồng nhau thấy `2` trước `1`. Có phải Subject đang chạy trên hai thread không? **Không**: đây là lời gọi đồng bộ lồng nhau.
+
+Chọn một event stream trong ứng dụng và ghi lại: ai được gọi `next`, subscriber muộn cần gì, ai kết thúc Subject, và ai dọn nguồn bên ngoài. Nếu chưa chỉ ra được owner của từng việc, hãy sửa phạm vi hoặc chuyển sang operator sharing trước khi thêm consumer mới.
+
+## Đọc tiếp
+
+<Cards>
+  <Card title="BehaviorSubject" href="/docs/subjects-multicasting/behavior-subject" description="State có seed và giá trị hiện tại cho subscriber mới." />
+  <Card title="ReplaySubject" href="/docs/subjects-multicasting/replay-subject" description="Buffer lịch sử có giới hạn và hành vi sau terminal notification." />
+  <Card title="AsyncSubject" href="/docs/subjects-multicasting/async-subject" description="Chỉ phát giá trị cuối khi công việc complete." />
+  <Card title="share" href="/docs/subjects-multicasting/share" description="Chia sẻ execution và quản lý kết nối upstream." />
+  <Card title="shareReplay" href="/docs/subjects-multicasting/share-replay" description="Chia sẻ có replay với chính sách kết nối và cache rõ ràng." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS Subject guide](https://rxjs.dev/guide/subject) — mental model Subject vừa là Observable vừa là Observer; phần multicasting dùng API cũ trong guide không phải khuyến nghị của bài này.
+- [Subject guide tại tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/docs_app/content/guide/subject.md) — mô tả theo phiên bản dùng trong ví dụ.
+- [Implementation Subject trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/Subject.ts) — phát đồng bộ, terminal notification, `asObservable` và sự khác biệt của `unsubscribe` trên Subject.
+- [Implementation share trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/share.ts) — cách quản lý kết nối và reset thay vì tự nối Subject.

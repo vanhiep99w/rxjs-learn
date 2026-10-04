@@ -3,8 +3,481 @@ title: Unit test custom operators
 description: Kiểm thử operator tùy biến theo input và output.
 ---
 
-Trang này sẽ trình bày **Unit test custom operators** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn gom một pipeline thành custom operator, chạy thử thấy đúng dữ liệu, nhưng khi người dùng xóa input hoặc unsubscribe thì nó còn hoạt động đúng không? Unit test cần kiểm tra cả **giá trị, thời điểm và vòng đời subscription**, chứ không chỉ array kết quả cuối cùng. Bài này đi từ operator chuẩn hóa chuỗi đến operator có debounce, rồi kiểm tra cancellation và state giữa các lần subscribe.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi và môi trường ví dụ">
+  Ví dụ dùng **RxJS 7.8.2**, TypeScript và cú pháp assertion của **Vitest**. Bạn cần biết `pipe`, `next`, `error`, `complete` và unsubscribe. Đây là mã cho một project đã có RxJS và test runner; repository tài liệu này không khai báo RxJS hay Vitest, nên đừng coi các đoạn mã là test suite có sẵn của site. Nếu dùng Jest, thay import từ `vitest` bằng `@jest/globals`.
 </Callout>
+
+## Mục lục
+
+- [Chốt contract trước khi viết test](#chốt-contract-trước-khi-viết-test)
+- [Operator mẫu chuẩn hóa query](#operator-mẫu-chuẩn-hóa-query)
+- [Test đồng bộ khi timing không phải contract](#test-đồng-bộ-khi-timing-không-phải-contract)
+- [Test notification bằng TestScheduler](#test-notification-bằng-testscheduler)
+  - [Khung test dùng lại](#khung-test-dùng-lại)
+  - [Giá trị và completion](#giá-trị-và-completion)
+  - [Nguồn rỗng và toàn giá trị bị lọc](#nguồn-rỗng-và-toàn-giá-trị-bị-lọc)
+  - [Error không được nuốt mất](#error-không-được-nuốt-mất)
+- [Unsubscribe phải dừng upstream](#unsubscribe-phải-dừng-upstream)
+- [State phải riêng cho từng subscription](#state-phải-riêng-cho-từng-subscription)
+- [Operator có debounce và virtual time](#operator-có-debounce-và-virtual-time)
+  - [Reset thời gian chờ và loại query trùng](#reset-thời-gian-chờ-và-loại-query-trùng)
+  - [Input rỗng vẫn phải reset debounce](#input-rỗng-vẫn-phải-reset-debounce)
+  - [Complete error và cancellation khi còn pending](#complete-error-và-cancellation-khi-còn-pending)
+- [Những cách test dễ bỏ sót lỗi](#những-cách-test-dễ-bỏ-sót-lỗi)
+- [Checklist và bài tập](#checklist-và-bài-tập)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Chốt contract trước khi viết test
+
+Mặc định mình test custom operator như một hàm nhận Observable và trả Observable: cấp nguồn có hành vi biết trước, rồi quan sát output. Không spy vào `map` hay `filter` bên trong, vì refactor implementation không nên làm test thất bại nếu contract vẫn giữ nguyên.
+
+Với một operator chuẩn hóa query, mình chọn contract sau. Đây là quyết định của ví dụ, không phải quy tắc bắt buộc cho mọi search box.
+
+| Khía cạnh | Contract cần kiểm tra |
+| --- | --- |
+| Giá trị | Trim hai đầu, đổi chữ thường, bỏ chuỗi rỗng |
+| Query trùng | Bỏ query bằng với query hợp lệ vừa phát; không bỏ mọi query đã từng xuất hiện |
+| Timing | Value hợp lệ đi qua ngay, không tự tạo delay |
+| Complete | Complete cùng frame với source, kể cả khi không phát value nào |
+| Error | Chuyển nguyên error xuống output và kết thúc execution |
+| Cancellation | Downstream unsubscribe thì subscription upstream cũng đóng |
+| State | Mỗi subscription có lịch sử query riêng; operator không tự share hay cache |
+
+Nếu operator của bạn có retry, fallback hoặc sharing, contract sẽ khác. Hãy ghi rõ số lần subscribe lại, fallback nào được phát và lúc nào upstream được đóng; đừng dùng kỳ vọng “truyền nguyên mọi thứ” cho một operator được thiết kế để đổi lifecycle.
+
+## Operator mẫu chuẩn hóa query
+
+Lưu implementation minh họa dưới tên `normalize-query.ts` trong project chứa test của bạn:
+
+```ts title="normalize-query.ts"
+import { distinctUntilChanged, filter, map } from 'rxjs';
+import type { MonoTypeOperatorFunction } from 'rxjs';
+
+export function normalizeQuery(): MonoTypeOperatorFunction<string> {
+  return (source$) => source$.pipe(
+    map((query) => query.trim().toLowerCase()),
+    filter((query) => query.length > 0),
+    distinctUntilChanged(),
+  );
+}
+```
+
+`MonoTypeOperatorFunction<string>` nói rằng input và output đều là chuỗi. Implementation ghép các operator có sẵn để RxJS quản lý error, completion và teardown; không cần tự `subscribe` rồi chuyển tiếp notification bằng tay.
+
+Thứ tự cũng thuộc contract. Vì `filter` nằm trước `distinctUntilChanged`, chuỗi rỗng không cập nhật lịch sử query. Input `"rxjs" → "" → "RXJS"` chỉ phát một lần `"rxjs"`. Nhưng `"rxjs" → "react" → "rxjs"` phát đủ ba lần, vì `distinctUntilChanged` chỉ so với value vừa phát, không phải một tập hợp lịch sử.
+
+## Test đồng bộ khi timing không phải contract
+
+Nếu chỉ cần kiểm tra phép biến đổi trên nguồn đồng bộ hữu hạn, `of` và `toArray` là đủ. Test này không cần clock hay callback `done`:
+
+```ts title="normalize-query.spec.ts — test đồng bộ"
+import { expect, it } from 'vitest';
+import { of, toArray } from 'rxjs';
+import { normalizeQuery } from './normalize-query';
+
+it('chuẩn hóa, bỏ blank và chỉ loại duplicate liên tiếp', () => {
+  let actual: string[] | undefined;
+
+  of(' RxJS ', 'rxjs', '   ', 'React', 'RXJS').pipe(
+    normalizeQuery(),
+    toArray(),
+  ).subscribe((values) => { actual = values; });
+
+  expect(actual).toEqual(['rxjs', 'react', 'rxjs']);
+});
+```
+
+Assertion nằm ngoài callback để test vẫn fail nếu output không phát gì: `actual` sẽ còn `undefined`. Cách này hợp lệ vì toàn bộ nguồn và pipeline đang đồng bộ. Khi thêm debounce, việc `subscribe` trả về không có nghĩa output đã có dữ liệu nữa; lúc đó hãy chuyển sang virtual time.
+
+<Callout type="warn" title="Array kết quả không mô tả đầy đủ stream">
+  `toArray` chỉ phát khi nguồn complete. Nó không chứng minh từng value đi qua đúng frame, không cho biết upstream đã được hủy lúc nào, và sẽ không phát nếu nguồn không complete. Dùng nó cho test giá trị đơn giản, không dùng thay toàn bộ test lifecycle.
+</Callout>
+
+## Test notification bằng TestScheduler
+
+Với RxJS, marble test là cách ghi “đầu vào ở frame nào, đầu ra ở frame nào” thành một assertion. Trong `TestScheduler.run`, một frame bằng **một millisecond ảo**: không có chuyện test thật phải ngủ để chờ đủ thời gian.
+
+### Khung test dùng lại
+
+Các test marble bên dưới dùng chung phần đầu file này. Mỗi test gọi `createScheduler()` để không mang clock hay lịch tác vụ của test trước sang test sau.
+
+```ts title="normalize-query.marble.spec.ts — phần đầu file"
+import { expect, it } from 'vitest';
+import { finalize } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+import { normalizeQuery } from './normalize-query';
+
+function createScheduler(): TestScheduler {
+  return new TestScheduler((actual, expected) => {
+    expect(actual).toEqual(expected);
+  });
+}
+```
+
+Callback truyền vào constructor là assertion thật. Nếu bạn để nó rỗng hoặc chỉ `console.log`, `expectObservable` không tự làm test fail.
+
+| Ký hiệu hoặc helper | Cách dùng trong bài |
+| --- | --- |
+| `-` | Tiến một frame; ký tự value cũng chiếm một frame trong chuỗi marble |
+| `a`, `b`, `x` | Value được tra từ bảng `values` |
+| `\|` | Complete |
+| `#` | Error; truyền error cụ thể vào đối số thứ ba của `cold` và `toBe` |
+| `(x\|)` | Value `x` và complete trong cùng frame |
+| `^`, `!` | Bắt đầu và kết thúc subscription, dùng trong subscription marbles |
+| `cold` | Tạo nguồn có timeline bắt đầu lại từ mỗi lần subscribe |
+| `expectObservable` | Assert notification và frame của output |
+| `expectSubscriptions` | Assert các khoảng subscribe của nguồn test |
+| `flush` | Chạy các tác vụ và assertion đã schedule đến thời điểm cần quan sát |
+
+`^` và `!` không phải value của output. Đừng đưa subscription marble vào `cold()`; nguồn và cửa sổ subscription được mô tả riêng.
+
+### Giá trị và completion
+
+Đọc theo cột dọc: query bị lọc tạo khoảng trống ở output, nhưng không làm các value sau bị dồn về trước.
+
+<MarbleDiagram
+  title="normalizeQuery()"
+  rows={[
+    { label: 'source', marble: '-a-b-c-d-e-f-|', kind: 'source' },
+    { label: 'output', marble: '-x-----y---x-|', kind: 'output' },
+  ]}
+  values={{
+    a: '" RxJS "',
+    b: '"rxjs" — duplicate',
+    c: '"   " — blank',
+    d: '"React"',
+    e: '" react " — duplicate',
+    f: '"RXJS" — khác query vừa phát',
+    x: '"rxjs"',
+    y: '"react"',
+  }}
+  caption="Output phát ở frame 1, 7, 11; source và output cùng complete ở frame 13."
+/>
+
+Ở frame 11, `"RXJS"` được phát thành `"rxjs"` vì query trước đó là `"react"`. Test dưới đây bắt cả lỗi normalize sai, lỗi loại mọi duplicate trong lịch sử và lỗi đổi thời điểm complete:
+
+```ts
+it('giữ frame của value hợp lệ và truyền complete', () => {
+  createScheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+    const source$ = cold<string>('-a-b-c-d-e-f-|', {
+      a: ' RxJS ', b: 'rxjs', c: '   ',
+      d: 'React', e: ' react ', f: 'RXJS',
+    });
+
+    expectObservable(source$.pipe(normalizeQuery())).toBe(
+      '-x-----y---x-|',
+      { x: 'rxjs', y: 'react' },
+    );
+    expectSubscriptions(source$.subscriptions).toBe('^------------!');
+  });
+});
+```
+
+### Nguồn rỗng và toàn giá trị bị lọc
+
+Không có value không có nghĩa là không có notification. Cả source rỗng và source toàn blank vẫn phải complete đúng thời điểm.
+
+```ts
+it('complete ngay với source rỗng', () => {
+  createScheduler().run(({ cold, expectObservable }) => {
+    const source$ = cold<string>('|');
+    expectObservable(source$.pipe(normalizeQuery())).toBe('|');
+  });
+});
+
+it('không phát blank nhưng vẫn complete', () => {
+  createScheduler().run(({ cold, expectObservable }) => {
+    const source$ = cold<string>('-a-b-|', { a: '', b: '   ' });
+    expectObservable(source$.pipe(normalizeQuery())).toBe('-----|');
+  });
+});
+```
+
+### Error không được nuốt mất
+
+Đưa chính error object vào kỳ vọng. Nhờ vậy, test không chỉ thấy một dấu `#` mà còn kiểm tra payload của error. `normalizeQuery` không có fallback, nên error không được biến thành complete hay một chuỗi query.
+
+```ts
+it('chuyển source error xuống output đúng frame', () => {
+  createScheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+    const failure = new Error('query source failed');
+    const source$ = cold<string>('-a-#', { a: ' RxJS ' }, failure);
+
+    expectObservable(source$.pipe(normalizeQuery())).toBe(
+      '-x-#', { x: 'rxjs' }, failure,
+    );
+    expectSubscriptions(source$.subscriptions).toBe('^--!');
+  });
+});
+```
+
+`toEqual` so sánh nội dung error theo semantics của runner, không chứng minh object identity. Nếu contract bắt buộc cùng instance, thêm assertion riêng bằng `toBe(failure)` trong một test observer phù hợp. Ngoài lỗi từ source, operator có callback do người gọi cung cấp cũng nên có test callback ném lỗi đồng bộ.
+
+## Unsubscribe phải dừng upstream
+
+Output im lặng sau cancellation chưa đủ để chứng minh upstream đã được đóng. Một implementation tự subscribe bên trong có thể vẫn để timer, listener hoặc request chạy dù subscriber bên ngoài không nhận được gì nữa. Vì vậy mình dùng cả `expectObservable`, `expectSubscriptions` và dấu hiệu cleanup.
+
+Test sau unsubscribe ở frame 4, trước `c` tại frame 5. Đọc hàng subscription để thấy execution upstream kết thúc sớm hơn source tự complete ở frame 9.
+
+<MarbleDiagram
+  title="normalizeQuery()"
+  rows={[
+    { label: 'source', marble: '-a-b-c-d-|', kind: 'source' },
+    { label: 'subscription', marble: '^---!', kind: 'subscription' },
+    { label: 'output', marble: '-x-y', kind: 'output' },
+  ]}
+  values={{
+    a: '"RxJS"', b: '"React"', c: '"Vue"', d: '"Svelte"',
+    x: '"rxjs"', y: '"react"',
+  }}
+  caption="Unsubscribe ở frame 4: chỉ x và y đi xuống output; không có complete gửi tới subscriber đã đóng."
+/>
+
+```ts
+it('đóng upstream và chạy cleanup khi downstream unsubscribe', () => {
+  createScheduler().run(({
+    cold, expectObservable, expectSubscriptions, flush,
+  }) => {
+    let cleanupCount = 0;
+    const source$ = cold<string>('-a-b-c-d-|', {
+      a: 'RxJS', b: 'React', c: 'Vue', d: 'Svelte',
+    });
+    const output$ = source$.pipe(
+      finalize(() => { cleanupCount += 1; }),
+      normalizeQuery(),
+    );
+
+    expectObservable(output$, '^---!').toBe(
+      '-x-y', { x: 'rxjs', y: 'react' },
+    );
+    expectSubscriptions(source$.subscriptions).toBe('^---!');
+
+    flush();
+    expect(cleanupCount).toBe(1);
+  });
+});
+```
+
+`expectObservable` schedule việc subscribe; nó không lập tức chạy stream ở dòng gọi. Vì vậy assertion side effect phải đặt sau `flush()` hoặc sau khi `run()` trả về. Nếu kiểm tra `cleanupCount` trước đó, bạn đang kiểm tra trước khi execution bắt đầu.
+
+<Callout type="warn" title="Unsubscribe không phải complete">
+  Kỳ vọng output sau cancellation không có dấu `|`. `finalize` chạy khi complete, error hoặc unsubscribe, nên việc callback cleanup đã chạy không chứng minh subscriber nhận `complete`. Test notification và test teardown trả lời hai câu hỏi khác nhau.
+</Callout>
+
+## State phải riêng cho từng subscription
+
+Test một subscriber có thể bỏ sót lỗi state bị đặt ở closure dùng chung. Chẳng hạn, biến `lastQuery` được khai báo trong factory `normalizeQuery()` rồi cập nhật trong `filter` sẽ được mọi subscription dùng chung, nếu implementation không tạo lại state khi subscribe.
+
+Test sau cố ý dùng **cùng một operator instance và cùng một output Observable**, nhưng subscribe hai lần ở frame 0 và frame 3. Nguồn cold chạy lại timeline riêng cho từng lần subscribe.
+
+```ts
+it('không chia sẻ lịch sử giữa hai subscription của cùng output', () => {
+  createScheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+    const source$ = cold<string>('-a-a-b-|', {
+      a: ' RxJS ', b: 'React',
+    });
+    const operator = normalizeQuery();
+    const output$ = source$.pipe(operator);
+
+    expectObservable(output$).toBe(
+      '-x---y-|', { x: 'rxjs', y: 'react' },
+    );
+    expectObservable(output$, '---^').toBe(
+      '----x---y-|', { x: 'rxjs', y: 'react' },
+    );
+    expectSubscriptions(source$.subscriptions).toBe([
+      '^------!',
+      '---^------!',
+    ]);
+  });
+});
+```
+
+Subscriber thứ hai vẫn phải nhận `"rxjs"` ở frame 4, dù subscriber thứ nhất đã nhận nó ở frame 1. Việc mỗi test tự tạo một operator instance mới sẽ không phát hiện trường hợp chia sẻ state này.
+
+Implementation hiện tại an toàn vì `distinctUntilChanged` tạo state cho từng subscription. Với accumulator, ưu tiên `scan`; nếu buộc phải dùng mutable state tùy biến, tạo state bên trong `defer(() => ...)` để mỗi lần subscribe có một bản riêng. Đừng thêm `share` chỉ để “sửa” số lần execution: sharing thay đổi contract, và cần bộ test riêng cho các subscriber cùng dùng một execution.
+
+## Operator có debounce và virtual time
+
+Giả sử UI chỉ muốn phát query sau một khoảng im lặng. Mình chọn operator `settledQuery` dưới đây: mọi input, kể cả blank và duplicate, đều reset debounce; sau thời gian chờ mới bỏ blank rồi loại query trùng với output trước.
+
+```ts title="settled-query.ts"
+import { debounceTime, distinctUntilChanged, filter, map } from 'rxjs';
+import type { MonoTypeOperatorFunction } from 'rxjs';
+
+export function settledQuery(
+  dueTime = 300,
+): MonoTypeOperatorFunction<string> {
+  return (source$) => source$.pipe(
+    map((query) => query.trim().toLowerCase()),
+    debounceTime(dueTime),
+    filter((query) => query.length > 0),
+    distinctUntilChanged(),
+  );
+}
+```
+
+Không ghép `normalizeQuery()` trước `debounceTime`: bước lọc blank và duplicate của nó sẽ làm debounce không còn thấy mọi lần nhập. Cùng một tập value cuối chưa chắc cùng hành vi timing.
+
+<Callout type="info" title="Không cần truyền scheduler cho debounceTime trong run">
+  Với RxJS 7.8.2, `TestScheduler.run` điều khiển các tác vụ timer của RxJS như `debounceTime` dùng `asyncScheduler` mặc định. Đặt cả việc tạo nguồn và pipeline trong callback `run`. Cơ chế này không biến native Promise, request HTTP thật hay `setTimeout` tự viết thành virtual time.
+</Callout>
+
+Thêm import này vào đầu file marble test khi ghép các ví dụ tiếp theo:
+
+```ts
+import { settledQuery } from './settled-query';
+```
+
+### Reset thời gian chờ và loại query trùng
+
+Ví dụ dùng `dueTime = 3` để dễ đếm cột, không phải khuyến nghị debounce UI trong 3 ms. Input `b` tới trước khi thời gian chờ của `a` kết thúc, nên chỉ query từ `b` được phát ở frame 6.
+
+<MarbleDiagram
+  title="settledQuery(3)"
+  rows={[
+    { label: 'source', marble: '-a-b----c----|', kind: 'source' },
+    { label: 'output', marble: '------x----y-|', kind: 'output' },
+  ]}
+  values={{
+    a: '"r"', b: '" RxJS "', c: '"React"',
+    x: '"rxjs"', y: '"react"',
+  }}
+  caption="b ở frame 3 thay a đang pending; x phát ở frame 6, y ở frame 11, complete ở frame 13."
+/>
+
+`c` tới frame 8, nên query `"react"` đi ra ở frame 11. Đây là hành vi của custom pipeline; bạn không cần test lại mọi nhánh nội bộ của `debounceTime`, nhưng cần bắt được việc dùng nhầm `throttleTime` hoặc đặt debounce sai vị trí.
+
+```ts
+it('chờ sau input mới nhất thay vì phát input đầu burst', () => {
+  createScheduler().run(({ cold, expectObservable }) => {
+    const source$ = cold<string>('-a-b----c----|', {
+      a: 'r', b: ' RxJS ', c: 'React',
+    });
+
+    expectObservable(source$.pipe(settledQuery(3))).toBe(
+      '------x----y-|', { x: 'rxjs', y: 'react' },
+    );
+  });
+});
+
+it('loại query đã normalize bằng output vừa phát', () => {
+  createScheduler().run(({ cold, expectObservable }) => {
+    const source$ = cold<string>('-a----b----|', {
+      a: ' RxJS ', b: 'RXJS',
+    });
+
+    expectObservable(source$.pipe(settledQuery(3))).toBe(
+      '----x------|', { x: 'rxjs' },
+    );
+  });
+});
+```
+
+### Input rỗng vẫn phải reset debounce
+
+Người dùng gõ `"rxjs"` ở frame 1 rồi xóa hết ở frame 3. Query cũ không được phát ở frame 4; blank thay nó trong pending slot và bị lọc sau debounce. Đặt `filter` trước debounce sẽ làm test này fail.
+
+```ts
+it('blank thay query pending nên query cũ không lọt ra', () => {
+  createScheduler().run(({ cold, expectObservable }) => {
+    const source$ = cold<string>('-a-b------|', {
+      a: 'rxjs', b: '   ',
+    });
+
+    expectObservable(source$.pipe(settledQuery(3))).toBe('----------|');
+  });
+});
+```
+
+Operator này không phát blank, nên cũng không gửi tín hiệu “xóa kết quả” tới UI và không tự hủy một request đã bắt đầu trước đó. Nếu sản phẩm cần hai hành vi ấy, thiết kế một contract khác cho blank hoặc cancellation, rồi thêm test tương ứng; đừng suy ra chúng từ việc query pending đã bị bỏ.
+
+### Complete error và cancellation khi còn pending
+
+Với `debounceTime`, source complete sẽ phát value pending ngay rồi complete. Source error thì bỏ value pending và chuyển error; downstream unsubscribe cũng bỏ pending nhưng không phát terminal notification.
+
+Ba test dùng cùng một query ở frame 1 và thời gian chờ 5 frame. Sự khác nhau ở frame 3 mới là điều cần chứng minh:
+
+```ts
+it('complete phát ngay query pending rồi complete cùng frame', () => {
+  createScheduler().run(({ cold, expectObservable }) => {
+    const source$ = cold<string>('-a-|', { a: ' RxJS ' });
+
+    expectObservable(source$.pipe(settledQuery(5))).toBe(
+      '---(x|)', { x: 'rxjs' },
+    );
+  });
+});
+
+it('error bỏ query pending và chuyển nguyên error payload', () => {
+  createScheduler().run(({ cold, expectObservable }) => {
+    const failure = new Error('input failed');
+    const source$ = cold<string>('-a-#', { a: ' RxJS ' }, failure);
+
+    expectObservable(source$.pipe(settledQuery(5))).toBe(
+      '---#', undefined, failure,
+    );
+  });
+});
+
+it('unsubscribe bỏ query pending và đóng upstream', () => {
+  createScheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+    const source$ = cold<string>('-a--------', { a: ' RxJS ' });
+
+    expectObservable(source$.pipe(settledQuery(5)), '^--!').toBe('---');
+    expectSubscriptions(source$.subscriptions).toBe('^--!');
+  });
+});
+```
+
+`---(x|)` nghĩa là `next` và `complete` ở frame 3, không phải `next` ở frame 3 và complete ở frame 4. Trong TestScheduler, nhóm `(ab)` phát các notification cùng frame nhưng phần chuỗi vẫn tiến số frame bằng độ dài nhóm, tính cả ngoặc; cần tính lại nếu còn sự kiện phía sau nhóm. Các diagram trên chỉ dùng ký tự đơn, nên không vướng khác biệt cách tính nhóm giữa renderer trực quan và TestScheduler.
+
+## Những cách test dễ bỏ sót lỗi
+
+| Cách test | Lỗi có thể bị bỏ sót | Cách thay thế |
+| --- | --- | --- |
+| Chỉ assert array value | Sai frame, sai complete hoặc upstream còn chạy | Bổ sung marble output và subscription marbles |
+| Đặt mọi assertion trong callback `next` | Không có emission thì assertion không chạy | Thu kết quả đồng bộ rồi assert bên ngoài, hoặc dùng `expectObservable` |
+| Tự `subscribe` rồi không trả teardown trong implementation | Downstream đóng nhưng upstream vẫn sống | Ghép operator có sẵn; nếu tự viết Observable, trả teardown và test nó |
+| Assertion side effect trước `flush` | Kiểm tra state trước execution | Assert sau `flush` hoặc sau `run` |
+| Tạo operator mới cho mỗi subscriber | Che lỗi state dùng chung | Reuse cùng output Observable trong một test nhiều subscription |
+| Mock cả logic normalize và debounce | Test đi qua mock thay vì code thật | Mock nguồn và boundary I/O, giữ custom operator thật |
+| Dùng cả fake timers của runner và TestScheduler trong cùng test | Hai clock khó kiểm soát và khó giải thích | Chọn một clock theo boundary được test |
+| Chờ thời gian thật cho debounce | Test phụ thuộc tải máy và event loop | Dùng `run` cho RxJS timers; test Promise hoặc I/O bằng async test riêng |
+
+Một test có HTTP thật là integration test, không còn là unit test thuần của operator. Nếu custom operator gọi một hàm trả Observable, inject hàm đó và trả `cold(...)` trong test để kiểm tra output và subscription của inner stream. Nếu nó trả native Promise, kiểm tra boundary Promise bằng async test của runner; TestScheduler không điều khiển microtask queue của Promise.
+
+Khi operator có `switchMap`, output assertion chỉ cho biết response nào được nhận. Muốn chứng minh request cũ đã bị unsubscribe, giữ reference tới từng inner Observable test và assert `inner$.subscriptions`; adapter HTTP thật có abort hay không cần một integration test riêng.
+
+## Checklist và bài tập
+
+Trước khi đưa custom operator vào ứng dụng, kiểm tra những điểm này theo contract của nó:
+
+- [ ] Có test value hợp lệ, blank, duplicate và value quay lại sau một query khác.
+- [ ] Có test nguồn rỗng, complete và error payload.
+- [ ] Nếu có timing, kỳ vọng ghi rõ frame của output và terminal notification.
+- [ ] Có cancellation sớm cùng assertion upstream subscriptions, không chỉ output im lặng.
+- [ ] Có nhiều subscription trên cùng operator/output để phát hiện state dùng chung.
+- [ ] Assertion side effect chạy sau virtual time, và mỗi test dùng scheduler mới.
+- [ ] Mock chỉ nằm ở nguồn hoặc boundary I/O, không thay custom operator đang được kiểm tra.
+
+Bài tập tiếp theo: thêm input `'-a-b------|'` với `a = ' RxJS '` và `b = 'RXJS'` vào test `settledQuery(3)`. Kỳ vọng là `'------x---|'` với `x = 'rxjs'`: duplicate vẫn reset debounce, nên query phát ở frame 6 thay vì frame 4. Sau đó thử đặt `distinctUntilChanged` trước debounce và xem test thất bại. Đây là cách kiểm tra bộ test có bắt được một refactor làm đổi contract, thay vì chỉ chạy qua happy path.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Đọc và viết timeline notification cùng subscription marbles." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Điều khiển virtual time và thời điểm assertion." />
+  <Card title="Kiểm thử async stream" href="/docs/testing/async-tests" description="Tách Promise bridge và công việc ngoài RxJS scheduler." />
+  <Card title="Integration tests" href="/docs/testing/integration-tests" description="Kiểm tra cancellation và dữ liệu tại boundary thật." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — Testing RxJS Code with Marble Diagrams](https://rxjs.dev/guide/testing/marble-testing): `run`, marble syntax, subscription assertions, `flush` và giới hạn với Promise.
+- [Hướng dẫn marble testing tại tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/docs_app/content/guide/testing/marble-testing.md): nguồn theo đúng phiên bản dùng trong ví dụ.
+- [RxJS — debounceTime](https://rxjs.dev/api/operators/debounceTime) và [implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/debounceTime.ts): pending value khi complete, error và teardown.
+- [RxJS — distinctUntilChanged](https://rxjs.dev/api/operators/distinctUntilChanged), [defer](https://rxjs.dev/api/index/function/defer) và [finalize](https://rxjs.dev/api/operators/finalize): state theo subscription và lifecycle cleanup.

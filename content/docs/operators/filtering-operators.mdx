@@ -3,8 +3,652 @@ title: Filtering operators
 description: Chọn, bỏ qua hoặc giới hạn emission theo điều kiện.
 ---
 
-Trang này sẽ trình bày **Filtering operators** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Ô tìm kiếm phát event sau mỗi phím gõ, nhưng bạn không muốn gọi API cho mọi event. Một stream trạng thái có thể phát cùng một giá trị nhiều lần, còn màn hình chỉ cần cập nhật khi giá trị đổi. **Filtering operator** giúp bạn quyết định emission nào được đi tiếp, khi nào được phát và khi nào subscription nên kết thúc.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Bài này dùng public API của **RxJS 7.8.2**, import operator trực tiếp từ `rxjs`. Bạn nên biết `pipe`, `subscribe` và ba notification `next`, `error`, `complete`. Cách phân nhóm bên dưới dựa trên nhu cầu sử dụng; phần timing dùng marble diagram trên cùng một trục virtual time.
 </Callout>
+
+## Mục lục
+
+- [Mental model và bản đồ chọn operator](#mental-model-và-bản-đồ-chọn-operator)
+- [filter chọn từng value theo predicate](#filter-chọn-từng-value-theo-predicate)
+  - [Predicate đồng bộ và index](#predicate-đồng-bộ-và-index)
+  - [Type guard thay cho ép kiểu](#type-guard-thay-cho-ép-kiểu)
+- [Loại emission trùng với distinct](#loại-emission-trùng-với-distinct)
+  - [distinctUntilChanged so với distinct](#distinctuntilchanged-so-với-distinct)
+  - [So sánh object và key](#so-sánh-object-và-key)
+- [Lấy hoặc bỏ một đoạn của stream](#lấy-hoặc-bỏ-một-đoạn-của-stream)
+  - [take và skip theo số lượng](#take-và-skip-theo-số-lượng)
+  - [takeWhile và skipWhile theo ranh giới](#takewhile-và-skipwhile-theo-ranh-giới)
+  - [first và các lựa chọn cần source complete](#first-và-các-lựa-chọn-cần-source-complete)
+- [takeUntil và skipUntil dùng notifier](#takeuntil-và-skipuntil-dùng-notifier)
+  - [Notifier phải phát next](#notifier-phải-phát-next)
+  - [Đặt takeUntil theo lifecycle cần hủy](#đặt-takeuntil-theo-lifecycle-cần-hủy)
+- [Lọc theo thời gian](#lọc-theo-thời-gian)
+  - [debounceTime chờ khoảng lặng](#debouncetime-chờ-khoảng-lặng)
+  - [throttleTime ưu tiên phản hồi đầu tiên](#throttletime-ưu-tiên-phản-hồi-đầu-tiên)
+  - [auditTime và sampleTime chọn giá trị mới nhất](#audittime-và-sampletime-chọn-giá-trị-mới-nhất)
+  - [Đối chiếu trên cùng timeline](#đối-chiếu-trên-cùng-timeline)
+  - [Complete và error khi còn value chờ](#complete-và-error-khi-còn-value-chờ)
+- [Ví dụ thực tế nối ô tìm kiếm với API](#ví-dụ-thực-tế-nối-ô-tìm-kiếm-với-api)
+- [Kiểm chứng bằng TestScheduler](#kiểm-chứng-bằng-testscheduler)
+- [Những bẫy cần tránh](#những-bẫy-cần-tránh)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Mental model và bản đồ chọn operator
+
+Đừng hiểu filtering là chỉ có `filter(predicate)`. Nhóm này còn có operator nhớ value trước đó, tạo cửa sổ thời gian hoặc complete sớm. Output thường vẫn giữ kiểu của source, nhưng số emission và lifecycle có thể thay đổi; type guard trong `filter` còn giúp thu hẹp kiểu.
+
+```text
+source next ──► điều kiện / lịch sử / cửa sổ ──► next được giữ lại
+                          │
+                          └──► bỏ emission hoặc complete sớm
+```
+
+Bỏ emission không có nghĩa là source chưa làm việc. Nếu đặt `filter` sau một HTTP request, request đã chạy trước khi response bị lọc. Tương tự, `skipUntil` vẫn subscribe source ngay, chỉ đóng cổng output cho tới khi notifier phát.
+
+| Nhu cầu | Chọn mặc định | Điểm cần nhớ |
+|---|---|---|
+| Kiểm tra từng value độc lập | `filter(predicate)` | Không tự complete khi predicate trả `false` |
+| Chỉ phát khi value thay đổi | `distinctUntilChanged()` | So với value cuối đã được phát |
+| Mỗi key chỉ đi qua một lần | `distinct(keySelector)` | Nhớ tập key trong subscription |
+| Chỉ cần N emission đầu | `take(N)` | Complete sớm và unsubscribe upstream |
+| Bỏ N emission đầu | `skip(N)` | Các emission sau đi qua bình thường |
+| Lấy đoạn đầu khi điều kiện còn đúng | `takeWhile(predicate)` | Dừng hẳn ở lần `false` đầu tiên |
+| Bỏ đoạn đầu khi điều kiện còn đúng | `skipWhile(predicate)` | Sau lần `false` đầu tiên không kiểm tra nữa |
+| Dừng khi có event teardown | `takeUntil(stop$)` | `stop$` phải phát `next` |
+| Bắt đầu cho value đi qua sau một event | `skipUntil(start$)` | Không replay value đã bỏ |
+| Chờ người dùng ngừng gõ | `debounceTime(ms)` | Input liên tục có thể khiến output chờ mãi |
+| Phản hồi ngay rồi bỏ bớt event trong một khoảng | `throttleTime(ms)` | Mặc định lấy đầu, không lấy cuối |
+| Cập nhật value cuối của từng đợt event | `auditTime(ms)` | Cửa sổ bắt đầu bởi source emission |
+| Lấy mẫu theo nhịp clock cố định | `sampleTime(ms)` | Clock bắt đầu từ subscription |
+
+Mình chọn `filter` cho điều kiện không có state, `distinctUntilChanged` cho state UI và `debounceTime` cho truy vấn tìm kiếm. Đừng dùng debounce hoặc throttle cho nghiệp vụ phải xử lý **mọi event**, như từng lệnh thanh toán: chúng chủ động bỏ dữ liệu, không tạo queue.
+
+## filter chọn từng value theo predicate
+
+### Predicate đồng bộ và index
+
+`filter(predicate)` gọi predicate cho mỗi source emission. Trả `true` thì value đi qua nguyên vẹn; trả `false` thì chỉ emission đó bị bỏ. `error` và `complete` vẫn đi qua, nên một stream không có value đạt điều kiện vẫn có thể complete bình thường.
+
+```ts
+import { filter, of } from 'rxjs';
+
+of(1, 2, 3, 4).pipe(
+  filter((value) => value % 2 === 0),
+).subscribe({
+  next: (value) => console.log(value),
+  complete: () => console.log('complete'),
+});
+
+// 2
+// 4
+// complete
+```
+
+Đọc theo cột dọc: value đạt điều kiện không bị dời thời điểm phát.
+
+<MarbleDiagram
+  title="filter(value => value % 2 === 0)"
+  rows={[
+    { label: 'source', marble: '-1-2-3-4-|', kind: 'source' },
+    { label: 'output', marble: '---2---4-|', kind: 'output' },
+  ]}
+  caption="1 và 3 bị bỏ; 2, 4 và complete giữ nguyên frame."
+/>
+
+Predicate còn nhận `index` bắt đầu từ `0`, đếm **mọi source emission đi tới operator này**, kể cả value bị bỏ. Nếu có một `filter` khác ở trước, index ở operator sau chỉ đếm những value đã qua operator trước. Mỗi subscription mới có bộ đếm riêng.
+
+Predicate phải đồng bộ. `filter(async value => ...)` trả Promise, không phải boolean, nên không đúng type signature; nếu bạn ép kiểu để chạy, Promise là truthy và RxJS không đợi kết quả. Với kiểm tra bất đồng bộ, hãy dùng higher-order mapping để chạy kiểm tra, rồi lọc kết quả boolean nhận được.
+
+Nếu predicate ném exception, output phát `error` và subscription đóng. `filter` không phải công cụ nuốt lỗi; nếu dữ liệu không hợp lệ là trường hợp dự kiến, predicate nên trả `false` thay vì throw.
+
+### Type guard thay cho ép kiểu
+
+Khi source có `null` hoặc union type, một type guard làm rõ cả quyết định runtime lẫn kiểu TypeScript của downstream:
+
+```ts
+import { filter, from, map } from 'rxjs';
+
+type User = { id: number; name: string };
+const values: Array<User | null | undefined> = [
+  null,
+  { id: 1, name: 'An' },
+  undefined,
+  { id: 2, name: 'Bình' },
+];
+
+function isPresent<T>(value: T | null | undefined): value is T {
+  return value !== null && value !== undefined;
+}
+
+from(values).pipe(
+  filter(isPresent),
+  map((user) => user.name), // user là User, không còn null | undefined
+).subscribe(console.log);
+
+// An
+// Bình
+```
+
+<Callout type="warn" title="filter(Boolean) không chỉ bỏ null">
+  `filter(Boolean)` bỏ mọi falsy value, bao gồm `0`, `false`, `''` và `NaN`. Nếu `0` là giá trị hợp lệ của counter hoặc `false` là một trạng thái cần hiển thị, dùng predicate rõ ràng như `isPresent` thay vì lọc truthiness.
+</Callout>
+
+## Loại emission trùng với distinct
+
+### distinctUntilChanged so với distinct
+
+Hai operator này trả lời hai câu hỏi khác nhau:
+
+- `distinctUntilChanged()` hỏi: “Value này có giống **value cuối output đã phát** không?”
+- `distinct()` hỏi: “Value này đã xuất hiện trong tập value được nhớ của subscription này chưa?”
+
+Đọc cùng một source dưới đây để thấy `a` quay lại sau `b` có được phát hay không.
+
+<MarbleDiagram
+  title="distinctUntilChanged() / distinct()"
+  rows={[
+    { label: 'source', marble: '-a-a-b-a-a-|', kind: 'source' },
+    { label: 'changed', marble: '-a---b-a---|', kind: 'output' },
+    { label: 'distinct', marble: '-a---b-----|', kind: 'output' },
+  ]}
+  values={{ a: 'trạng thái A', b: 'trạng thái B' }}
+  caption="distinctUntilChanged cho A quay lại ở frame 7; distinct chỉ giữ lần xuất hiện đầu của A và B."
+/>
+
+`a` tại frame 3 bị cả hai bỏ. Sau `b` tại frame 5, `a` tại frame 7 là một thay đổi hợp lệ với `distinctUntilChanged`, nhưng không phải value mới với `distinct`. Cả hai phát value đầu tiên mà không cần một value trước đó.
+
+Với state UI, mình thường chọn `distinctUntilChanged`: chuyển từ A sang B rồi về A vẫn phải render. `distinct` phù hợp hơn khi mỗi ID chỉ cần xử lý một lần trong một phiên hữu hạn.
+
+### So sánh object và key
+
+`distinctUntilChanged` mặc định dùng `===`. Hai object có cùng field nhưng khác reference vẫn được coi là khác. Hãy chọn comparator theo dữ liệu thật sự quyết định việc cập nhật:
+
+```ts
+import { distinctUntilChanged, distinctUntilKeyChanged, from } from 'rxjs';
+
+type Status = { orderId: string; phase: string; updatedAt: number };
+const states: Status[] = [
+  { orderId: 'A', phase: 'pending', updatedAt: 1 },
+  { orderId: 'A', phase: 'pending', updatedAt: 2 },
+  { orderId: 'A', phase: 'paid', updatedAt: 3 },
+];
+
+from(states).pipe(
+  distinctUntilChanged((previous, current) =>
+    previous.orderId === current.orderId && previous.phase === current.phase,
+  ),
+).subscribe((state) => console.log(state.updatedAt));
+
+// 1, 3
+
+// Khi source đã chỉ thuộc một order, có thể dùng shortcut cho một field:
+from(states).pipe(
+  distinctUntilKeyChanged('phase'),
+).subscribe((state) => console.log(state.phase));
+
+// pending, paid
+```
+
+Comparator trả `true` nghĩa là **coi như bằng nhau, bỏ current**; trả `false` mới phát current. Nó so với value cuối **đã phát**, không nhất thiết là source value liền trước. Điều này quan trọng nếu comparator có ngưỡng sai khác: những thay đổi nhỏ bị bỏ vẫn được so với mốc cuối đã phát.
+
+Với RxJS 7.8.2, bạn cũng có thể chọn key mà vẫn phát nguyên object. Khi truyền `keySelector` làm tham số thứ hai, overload TypeScript yêu cầu tham số đầu là một comparator, không nhận `undefined` trong strict mode. Dùng comparator `===` tường minh để so sánh hai **key**:
+
+```ts
+import { distinctUntilChanged, distinct, from } from 'rxjs';
+
+const updates = [
+  { id: 'A', revision: 1 },
+  { id: 'A', revision: 2 },
+  { id: 'B', revision: 1 },
+  { id: 'A', revision: 3 },
+];
+
+from(updates).pipe(
+  distinctUntilChanged(
+    (previousKey, currentKey) => previousKey === currentKey,
+    (update) => update.id,
+  ),
+).subscribe((update) => console.log(update.revision));
+// 1, 1, 3: chỉ phát khi id đổi so với lần output trước
+
+from(updates).pipe(
+  distinct((update) => update.id),
+).subscribe((update) => console.log(update.id));
+// A, B: mỗi id một lần
+```
+
+`distinct` dùng `Set`, không nhận comparator như `distinctUntilChanged`. Không có key selector thì object được nhận diện theo reference. `Set` dùng SameValueZero cho primitive, nên `distinct` coi hai `NaN` là trùng, còn mặc định `distinctUntilChanged` dùng `===` nên không coi chúng là bằng nhau.
+
+<Callout type="warn" title="State được nhớ cũng có chi phí">
+  `distinct` giữ tập key, có thể tăng mãi trên stream sống lâu với nhiều key mới. Tham số `flushes` cho phép xóa tập này khi một Observable khác phát `next`, ví dụ `distinct(event => event.id, reset$)`; đây là reset toàn bộ, không phải TTL cho từng key. `distinctUntilChanged` chỉ cần giữ key cuối, nhưng vẫn có thể sai nếu bạn mutate cùng object reference. Ưu tiên immutable value hoặc chọn một primitive key ổn định.
+</Callout>
+
+## Lấy hoặc bỏ một đoạn của stream
+
+### take và skip theo số lượng
+
+`take(N)` phát tối đa N emission đầu rồi complete ngay khi đủ. Nếu source complete trước, nó phát những gì đã có rồi complete, không báo lỗi vì thiếu N value. `take(0)` complete mà không subscribe source.
+
+`skip(N)` chỉ bỏ N emission đầu, không complete sớm. Nó cũng không lưu các value bị bỏ để phát lại.
+
+```ts
+import { of, skip, take } from 'rxjs';
+
+of('A', 'B', 'C', 'D').pipe(take(2)).subscribe({
+  next: console.log,
+  complete: () => console.log('done'),
+});
+// A, B, done
+
+of('A', 'B', 'C', 'D').pipe(skip(2)).subscribe(console.log);
+// C, D
+```
+
+Số lượng được tính tại vị trí operator trong pipeline, nên thứ tự có ý nghĩa:
+
+```ts
+import { filter, of, take } from 'rxjs';
+
+of(1, 2, 3, 4).pipe(
+  filter((value) => value % 2 === 0),
+  take(2),
+).subscribe(console.log);
+// 2, 4: lấy hai value đạt điều kiện
+
+of(1, 2, 3, 4).pipe(
+  take(2),
+  filter((value) => value % 2 === 0),
+).subscribe(console.log);
+// 2: chỉ xét hai source value đầu
+```
+
+### takeWhile và skipWhile theo ranh giới
+
+`filter` kiểm tra từng value độc lập, còn `takeWhile` và `skipWhile` tìm **ranh giới của một đoạn đầu**. Sau ranh giới đó, operator không quay lại trạng thái ban đầu.
+
+```ts
+import { filter, of, skipWhile, takeWhile } from 'rxjs';
+
+const source$ = of(1, 2, 5, 1, 2);
+
+source$.pipe(filter((value) => value < 3)).subscribe(console.log);
+// 1, 2, 1, 2
+
+source$.pipe(takeWhile((value) => value < 3)).subscribe(console.log);
+// 1, 2: complete khi gặp 5
+
+source$.pipe(takeWhile((value) => value < 3, true)).subscribe(console.log);
+// 1, 2, 5: inclusive giữ cả value làm predicate sai rồi complete
+
+source$.pipe(skipWhile((value) => value < 3)).subscribe(console.log);
+// 5, 1, 2: từ 5 trở đi không kiểm tra predicate nữa
+```
+
+Mặc định `takeWhile` không phát value làm predicate sai; tham số `inclusive: true` giữ value ranh giới đó. Cách này hữu ích khi bạn muốn hiển thị cả trạng thái terminal, như `completed`, trước khi stream kết thúc.
+
+Đừng dùng `takeWhile(() => alive)` như cơ chế teardown của component. Nếu `alive` chuyển thành `false` nhưng source không phát thêm, predicate không được gọi và subscription vẫn mở. Một event teardown với `takeUntil` diễn đạt yêu cầu này chính xác hơn.
+
+### first và các lựa chọn cần source complete
+
+`take(1)` là lựa chọn nhẹ khi “nếu có value thì lấy một cái”. `first(predicate)` diễn đạt “phải có một value đạt điều kiện”: nó complete ngay sau match đầu, nhưng báo `EmptyError` nếu source complete mà không có match, trừ khi cung cấp default value.
+
+```ts
+import { EMPTY, first, of, take } from 'rxjs';
+
+EMPTY.pipe(take(1)).subscribe({
+  complete: () => console.log('empty nhưng hợp lệ'),
+});
+
+EMPTY.pipe(first()).subscribe({
+  error: (error: Error) => console.log(error.name),
+});
+// EmptyError
+
+of(1, 2).pipe(
+  first((value) => value > 10, -1),
+).subscribe(console.log);
+// -1: default phát khi source complete mà không có match
+```
+
+Một số lựa chọn khác hữu ích khi bạn cần ý nghĩa mạnh hơn việc “bỏ vài emission”:
+
+| Operator | Hành vi | Bẫy chính |
+|---|---|---|
+| `last(predicate?)` | Chờ complete, phát match cuối | Không có match thì `EmptyError`, trừ khi có default |
+| `takeLast(N)` | Giữ tối đa N value cuối, phát khi complete | Không complete thì không có kết quả cuối; source error không flush buffer |
+| `skipLast(N)` | Giữ buffer N value; mỗi value mới đẩy value cũ nhất ra | Trễ theo số emission, không theo milliseconds; bỏ buffer cuối khi complete |
+| `elementAt(index)` | Lấy value ở index tính từ 0 rồi complete | Không đủ value thì `ArgumentOutOfRangeError`, trừ khi có default |
+| `single(predicate?)` | Kiểm tra đúng một value phù hợp, phát khi complete | Nhiều match thì `SequenceError`; source rỗng thì `EmptyError`; source có value nhưng không match thì `NotFoundError` |
+| `ignoreElements()` | Bỏ mọi `next`, giữ `error` và `complete` | Không làm source ngừng side effect |
+
+Vì `last`, `takeLast` và `single` cần biết source đã kết thúc, đừng dùng chúng trên event stream vô hạn mà không có ranh giới complete. Default value của `first` hoặc `last` cũng không cứu một source không bao giờ complete: operator chưa thể kết luận rằng không có match.
+
+## takeUntil và skipUntil dùng notifier
+
+### Notifier phải phát next
+
+`takeUntil(notifier$)` phát source value cho tới khi notifier phát **bất kỳ value nào**, kể cả `false` hoặc `undefined`. Khi đó output complete và subscription upstream được đóng. `skipUntil(notifier$)` làm ngược về cổng output: bỏ source value trước `next` đầu của notifier, rồi cho mọi value sau đi qua.
+
+Đọc notifier theo cùng trục frame với source trong hình sau.
+
+<MarbleDiagram
+  title="takeUntil(stop$)"
+  rows={[
+    { label: 'source', marble: '-a-b---c--d--|', kind: 'source' },
+    { label: 'stop$', marble: '-----x-------|', kind: 'source' },
+    { label: 'output', marble: '-a-b-|', kind: 'output' },
+    { label: 'source sub', marble: '^----!', kind: 'subscription' },
+  ]}
+  values={{ a: 'value A', b: 'value B', c: 'value C', d: 'value D', x: 'event teardown' }}
+  caption="stop$ phát tại frame 5: output complete ở frame 5 và unsubscribe source, không đợi source complete ở frame 13."
+/>
+
+Chỉ `a` ở frame 1 và `b` ở frame 3 đi qua. `c` và `d` minh họa những notification source có thể phát cho subscriber khác; subscription của pipeline này đã đóng trước đó.
+
+| Notifier làm gì? | `takeUntil` | `skipUntil` |
+|---|---|---|
+| Phát `next` | Complete output ngay | Mở cổng cho source value tiếp theo |
+| Complete mà chưa phát `next` | Không dừng source | Cổng vẫn đóng; output kết thúc theo source |
+| Error trước khi bị unsubscribe | Output error | Output error |
+
+Với `Subject<void>`, teardown đúng là `stop$.next(); stop$.complete();`. Chỉ gọi `complete()` không kích hoạt `takeUntil`. Notifier cũng không góp value vào output.
+
+<Callout type="warn" title="Notifier có value ban đầu và subscription đến muộn">
+  `takeUntil` subscribe notifier trước source. Một `BehaviorSubject(false)` vẫn phát ngay `false` và làm output complete trước khi source được subscribe. Ngược lại, `Subject` không replay: nếu event dừng đã xảy ra trước một subscription mới, subscription đó không biết event cũ. Quản lý lifecycle để không tạo subscription sau teardown; đừng mặc định rằng một Subject đã complete sẽ tự dừng mọi subscriber đến sau.
+</Callout>
+
+`skipUntil` cũng subscribe source trong lúc cổng đóng. Nếu yêu cầu là **chưa khởi động HTTP request cho tới khi có event**, dùng cấu trúc như `start$.pipe(take(1), switchMap(() => request$))`, không đặt `skipUntil` sau request.
+
+### Đặt takeUntil theo lifecycle cần hủy
+
+Khi pipeline có higher-order operator, đặt teardown phía sau công việc cần hủy:
+
+Đoạn dưới là **fragment minh họa vị trí operator**, không phải ví dụ chạy độc lập. Các khai báo `declare` chỉ mô tả kiểu để kiểm tra strict TypeScript; ứng dụng phải cung cấp stream query, hàm gọi API và notifier teardown thật, rồi subscribe pipeline.
+
+```ts
+import { switchMap, takeUntil } from 'rxjs';
+import type { Observable } from 'rxjs';
+
+type SearchItem = { id: string; label: string };
+declare const query$: Observable<string>;
+declare function search(query: string): Observable<SearchItem[]>;
+declare const stop$: Observable<void>;
+
+const results$ = query$.pipe(
+  switchMap((query) => search(query)),
+  takeUntil(stop$),
+);
+```
+
+Nếu đặt `takeUntil` trước `switchMap`, nó chỉ complete outer stream khi stop đến. `switchMap` có thể tiếp tục inner request đang chạy và chỉ complete khi inner kết thúc. Đặt phía sau thì teardown unsubscribe cả chuỗi, gồm inner đang hoạt động. Quy tắc tương tự áp dụng khi bạn cần hủy inner trong `mergeMap` hoặc `concatMap`.
+
+Vị trí cuối pipeline cũng ảnh hưởng tới value đang chờ của debounce: `source$.pipe(debounceTime(300), takeUntil(stop$))` hủy timer khi stop đến. Với thứ tự ngược lại, stop làm upstream của debounce complete và debounce có thể flush value đang chờ. Không có quy tắc “thứ tự nào cũng tương đương”; hãy chọn theo việc có muốn phát value cuối lúc teardown hay không.
+
+## Lọc theo thời gian
+
+### debounceTime chờ khoảng lặng
+
+`debounceTime(300)` giữ value mới nhất, chỉ phát khi 300 ms trôi qua mà không có source emission mới. Một value mới trong khoảng chờ thay thế value cũ và đẩy thời điểm phát ra sau.
+
+```ts
+import { debounceTime, distinctUntilChanged, fromEvent, map } from 'rxjs';
+
+// Chạy trong browser sau khi phần tử đã tồn tại.
+const input = document.querySelector<HTMLInputElement>('#search');
+if (!input) throw new Error('Thiếu input #search');
+
+const queries$ = fromEvent(input, 'input').pipe(
+  map(() => input.value.trim()),
+  debounceTime(300),
+  distinctUntilChanged(),
+);
+
+// queries$ chưa tạo listener cho tới khi được subscribe.
+// Ví dụ đầy đủ ở dưới thêm subscription và teardown.
+```
+
+Mình normalize chuỗi trước khi so sánh, vì `'rxjs'` và `'rxjs '` có cùng ý nghĩa tìm kiếm. Đặt `distinctUntilChanged` sau debounce ở đây nghĩa là so với query cuối đã được gửi downstream; mọi input event vẫn reset thời gian chờ. Nếu đặt distinct trước debounce, những input không đổi chuỗi sẽ không reset timer. Cả hai có thể hợp lệ, nhưng đó là hai yêu cầu khác nhau.
+
+Debounce phù hợp với một hành động sau khoảng lặng, không phù hợp nếu bạn cần cập nhật đều trong lúc stream liên tục phát. Người dùng kéo slider không ngừng thì output debounce có thể chưa phát lần nào.
+
+### throttleTime ưu tiên phản hồi đầu tiên
+
+`throttleTime(300)` mặc định dùng `{ leading: true, trailing: false }`: phát value đầu ngay, mở cửa sổ 300 ms, bỏ các value trong cửa sổ rồi chờ value tiếp theo để bắt đầu cửa sổ mới. Nó không tạo nhịp tick toàn cục.
+
+Đây cũng là fragment: `events$` là stream event do ứng dụng cung cấp, chẳng hạn từ `fromEvent` trên một button. `declare` không tạo stream runtime; ứng dụng cần thay bằng source thật và subscribe `responsive$`.
+
+```ts
+import { asyncScheduler, throttleTime } from 'rxjs';
+import type { Observable } from 'rxjs';
+
+declare const events$: Observable<Event>;
+const responsive$ = events$.pipe(
+  throttleTime(300, asyncScheduler, {
+    leading: true,
+    trailing: true,
+  }),
+);
+```
+
+Bật `trailing` để giữ cả value mới nhất trong cửa sổ và phát ở cuối cửa sổ, nếu còn value chưa phát. Trong RxJS 7.8.2, trailing emission mở cửa sổ throttle tiếp theo khi source còn hoạt động. Vì vậy `{ leading: true, trailing: true }` không đơn giản là hai emission trên từng block thời gian cố định.
+
+Với nút click, throttle có thể giúp giảm burst đầu vào, nhưng không bảo đảm request trước đã xong. Nếu yêu cầu là “bỏ click khi request đang chạy”, chọn `exhaustMap`; nếu cần chống ghi trùng trên server, vẫn phải có idempotency ở tầng API.
+
+### auditTime và sampleTime chọn giá trị mới nhất
+
+`auditTime(300)` bắt đầu cửa sổ khi source phát value và chưa có cửa sổ đang mở. Nó không reset timer theo value mới; đến cuối cửa sổ, nó phát value mới nhất rồi đợi source emission tiếp theo để mở cửa sổ mới. Đây là lựa chọn mình thường dùng cho scroll/resize khi cần cập nhật theo trạng thái cuối của từng đợt event.
+
+`sampleTime(300)` có clock riêng, tick mỗi 300 ms tính từ subscription. Mỗi tick phát value mới nhất **nếu source có emission mới từ lần sample trước**. Nếu không có input mới, nó không phát lại value cũ.
+
+Bạn cũng có thể dùng `sample(tick$)` để lấy mẫu theo một stream khác, chẳng hạn lấy trạng thái form mới nhất khi có click xác nhận. `sample` không phát gì nếu source chưa có value; nó không tự đọc state imperative của form.
+
+Các biến thể `debounce`, `throttle`, `audit` nhận duration selector trả `ObservableInput` thay vì một thời lượng cố định. Ví dụ `debounce(query => timer(query.length < 3 ? 500 : 200))` cho mỗi query một thời gian chờ khác nhau. Đừng suy luận rằng notifier chỉ complete cũng tương đương với phát `next`: hợp đồng của duration Observable khác nhau giữa các operator.
+
+### Đối chiếu trên cùng timeline
+
+Trong hình này, mọi operator dùng thời lượng **4 virtual frame** và bắt đầu subscription ở frame 0. Mỗi ký tự chiếm một frame; đây không phải 4 ms thực tế trừ khi scheduler của test quy ước như vậy. Đọc theo cột để so sánh lúc một value thật sự tới output.
+
+<MarbleDiagram
+  title="debounceTime(4) / throttleTime(4) / auditTime(4) / sampleTime(4)"
+  rows={[
+    { label: 'source', marble: '-a-b--c------d------|', kind: 'source' },
+    { label: 'debounce', marble: '----------c------d--|', kind: 'output' },
+    { label: 'throttle', marble: '-a----c------d------|', kind: 'output' },
+    { label: 'audit', marble: '-----b----c------d--|', kind: 'output' },
+    { label: 'sample', marble: '----b---c-------d---|', kind: 'output' },
+  ]}
+  values={{ a: 'input A', b: 'input B', c: 'input C', d: 'input D' }}
+  caption="Cùng input nhưng điểm mở cửa sổ và cách chọn value khác nhau. throttle dùng leading=true, trailing=false."
+/>
+
+Source phát `a`, `b`, `c`, `d` tại các frame 1, 3, 6, 13 và complete tại frame 20:
+
+- **Debounce:** `a` bị `b` thay thế, `b` lại bị `c` thay thế trước khi đủ 4 frame im lặng. `c` phát ở frame 10, `d` ở frame 17.
+- **Throttle mặc định:** `a` phát ngay ở frame 1 và chặn `b` trong cửa sổ tới frame 5. `c` tại frame 6 và `d` tại frame 13 đều tới khi không còn bị throttle nên đi qua ngay.
+- **Audit:** cửa sổ đầu mở tại frame 1, đóng tại frame 5 và phát `b`. `c` mở cửa sổ 6–10; `d` mở cửa sổ 13–17.
+- **Sample:** clock tick ở frame 4, 8, 12, 16. Lần lượt phát `b`, `c`, không phát gì, rồi phát `d`. Tick ở frame 12 không có input mới.
+
+Không có source emission trùng frame với timer cần quyết định value trong ví dụ này. Với ca trùng thời điểm, thứ tự thực thi trên scheduler có thể quyết định kết quả; hãy khóa hành vi bằng test thay vì suy từ hình vẽ.
+
+### Complete và error khi còn value chờ
+
+Thời gian chờ không phải hành vi duy nhất cần kiểm tra. Với **RxJS 7.8.2** và duration hữu hạn của các operator `Time`:
+
+| Operator | Khi source complete lúc còn value chờ |
+|---|---|
+| `debounceTime` | Flush value mới nhất ngay, rồi complete |
+| `throttleTime` mặc định | Complete ngay; không phát trailing value |
+| `throttleTime` có `trailing: true` | Nếu còn pending value trong cửa sổ đang mở, chờ cửa sổ kết thúc, phát nó rồi complete |
+| `auditTime` | Chờ cửa sổ đang mở kết thúc, phát value cuối rồi complete |
+| `sampleTime` | Complete ngay, không flush value chưa tới tick |
+
+Ví dụ `of('a', 'b').pipe(debounceTime(300))` phát `'b'` ngay khi source đồng bộ complete, **không** đợi đủ 300 ms. Đừng dùng source `of(...)` đồng bộ để minh họa khoảng lặng giữa các phím gõ.
+
+Nếu source error trong lúc đang chờ, các operator ở bảng trên chuyển tiếp error mà không flush pending value. Unsubscribe cũng không phải complete notification đi vào operator: nó hủy công việc đang chờ, không tự phát value cuối.
+
+## Ví dụ thực tế nối ô tìm kiếm với API
+
+Giả sử browser có một input và API `GET /api/search?q=...` trả JSON dạng `SearchItem[]`. Ví dụ dưới đây normalize query, đợi khoảng lặng, bỏ query trùng và hủy request cũ khi query mới được `switchMap` nhận. Mỗi lần gọi `connectSearch` tạo một lifecycle độc lập.
+
+```ts
+import {
+  Subject,
+  catchError,
+  debounceTime,
+  distinctUntilChanged,
+  fromEvent,
+  map,
+  of,
+  startWith,
+  switchMap,
+  takeUntil,
+} from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type SearchItem = { id: string; label: string };
+type SearchState =
+  | { status: 'idle' }
+  | { status: 'loading' }
+  | { status: 'ready'; items: SearchItem[] }
+  | { status: 'error'; message: string };
+
+function connectSearch(
+  input: HTMLInputElement,
+  render: (state: SearchState) => void,
+): () => void {
+  const stop$ = new Subject<void>();
+
+  fromEvent(input, 'input').pipe(
+    map(() => input.value.trim()),
+    debounceTime(300),
+    distinctUntilChanged(),
+    switchMap((query) => {
+      if (query.length < 2) {
+        return of<SearchState>({ status: 'idle' });
+      }
+
+      return ajax.getJSON<SearchItem[]>(
+        `/api/search?q=${encodeURIComponent(query)}`,
+      ).pipe(
+        map((items): SearchState => ({ status: 'ready', items })),
+        startWith<SearchState>({ status: 'loading' }),
+        catchError(() => of<SearchState>({
+          status: 'error',
+          message: 'Không tải được kết quả. Hãy thử lại.',
+        })),
+      );
+    }),
+    takeUntil(stop$),
+  ).subscribe(render);
+
+  render({ status: 'idle' });
+
+  return () => {
+    stop$.next();
+    stop$.complete();
+  };
+}
+
+// Gọi sau khi DOM đã sẵn sàng; ví dụ render tối giản bằng console.
+const input = document.querySelector<HTMLInputElement>('#search');
+if (!input) throw new Error('Thiếu input #search');
+const disconnect = connectSearch(input, (state) => console.log(state));
+// Chủ sở hữu màn hình gọi disconnect() khi unmount/teardown.
+```
+
+Ở đây mình **không dùng `filter(query => query.length >= 2)` trước `switchMap`**. Nếu người dùng xóa query, emission ngắn vẫn cần tới `switchMap` để hủy request trước và đưa UI về `idle`. Lọc nó mất thì request cũ có thể vẫn chạy và trả kết quả cho chuỗi đã bị xóa.
+
+Có một giới hạn timing cần nói rõ: vì debounce nằm trước `switchMap`, request cũ chỉ bị hủy khi query mới đi qua debounce, không phải ngay tại phím gõ đầu tiên. Kết quả cũ vẫn có thể tới trong khoảng 300 ms đó. Nếu sản phẩm yêu cầu hủy ngay ở mọi input, cần thiết kế lại ranh giới cancellation; xem bài `switchMap` ở phần học tiếp.
+
+`catchError` nằm trong inner request để một lỗi API không giết listener của ô tìm kiếm. `takeUntil` nằm sau `switchMap` để teardown hủy cả listener, timer debounce và request đang chạy. Ajax unsubscribe có thể abort request phía client, nhưng không bảo đảm server chưa xử lý công việc.
+
+Type parameter của `getJSON` chỉ mô tả kiểu kỳ vọng, không validate JSON runtime. Nếu API không đáng tin cậy, thêm validation trước khi dựng `ready` state. Ví dụ cũng không fetch query có sẵn ngay lúc mount; muốn vậy, cần thêm emission khởi tạo thay vì chỉ nghe event `input`.
+
+## Kiểm chứng bằng TestScheduler
+
+Khi sửa debounce, bạn nên test notification **và subscription**, không chỉ so một array kết quả. Test dưới đây kiểm tra source complete làm pending value được flush ngay, source error không flush và notifier complete không dừng `takeUntil`.
+
+```ts
+import { deepStrictEqual } from 'node:assert';
+import { debounceTime, takeUntil } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const completes$ = cold('-a-b-|');
+  expectObservable(completes$.pipe(debounceTime(4))).toBe('-----(b|)');
+
+  const errors$ = cold('-a-b-#');
+  expectObservable(errors$.pipe(debounceTime(4))).toBe('-----#');
+
+  const source$ = cold('-a-b---c--|');
+  const stop$ = cold('-----x');
+  expectObservable(source$.pipe(takeUntil(stop$))).toBe('-a-b-|');
+  expectSubscriptions(source$.subscriptions).toBe('^----!');
+
+  const continues$ = cold('-a-b---c--|');
+  const completesWithoutNext$ = cold('-----|');
+  expectObservable(
+    continues$.pipe(takeUntil(completesWithoutNext$)),
+  ).toBe('-a-b---c--|');
+});
+```
+
+Trong `run`, mỗi `-` là 1 ms virtual time. `(b|)` nghĩa là `b` và `complete` cùng frame 5, không phải complete sau thêm một frame. Subscription marble `^----!` được kiểm tra riêng; đừng đưa nó vào `cold()` để mô phỏng source notification.
+
+Bạn có thể mở rộng test bằng cách dùng source `'-a-b--c------d------|'` của hình timing và kiểm tra bốn output trong cùng một `run`. Scheduler giúp tránh test phụ thuộc vào tốc độ CPU hoặc timer thật.
+
+## Những bẫy cần tránh
+
+| Hiểu nhầm | Điều thực sự xảy ra | Cách sửa |
+|---|---|---|
+| `map` trả `undefined` nghĩa là bỏ emission | Downstream vẫn nhận một `undefined` | Dùng `filter` hoặc type guard |
+| `filter` predicate `false` sẽ dừng stream | Chỉ bỏ value hiện tại | Dùng `takeWhile` nếu cần ranh giới terminal |
+| `distinctUntilChanged` bỏ trùng trên toàn lịch sử | A → B → A vẫn phát đủ | Chỉ dùng `distinct` nếu thật sự muốn nhớ mọi key |
+| Comparator trả `true` thì phát value | `true` nghĩa là bằng nhau, nên bỏ | Viết comparator theo nghĩa equality |
+| `skip(1)` luôn bỏ đúng “state khởi tạo” | Nó bỏ bất kỳ emission đầu nào | Chỉ dùng khi hợp đồng source thật sự có emission khởi tạo |
+| `stop$.complete()` là teardown | `takeUntil` không nhận `next` nên không dừng | Phát `next` trước khi complete notifier |
+| Throttle bảo đảm request không chồng nhau | Cửa sổ thời gian không biết request đã xong chưa | Dùng flattening operator theo concurrency mong muốn |
+| Lọc phía downstream làm producer hết tốn tài nguyên | Producer và operator phía trước vẫn chạy | Đặt điều kiện trước công việc đắt tiền nếu semantics cho phép |
+
+Filtering cũng không phải backpressure: nó không yêu cầu producer phát chậm hơn và không bảo đảm mọi value được xử lý. Nếu cần giữ đủ event nhưng xử lý tuần tự, hãy xem `concatMap` và giới hạn queue; nếu cần batching, xem nhóm transformation.
+
+## Bài tập tự kiểm tra
+
+1. Với source `1, 2, 5, 1`, `filter(x => x < 3)`, `takeWhile(x => x < 3)` và `skipWhile(x => x < 3)` phát gì?
+2. Source hoàn thành mà chưa phát value: `take(1)` và `first()` khác nhau thế nào?
+3. Source `a` ở frame 1, `b` ở frame 3 rồi complete ở frame 5: `debounceTime(4)` có đợi tới frame 7 để phát `b` không?
+4. Notifier chỉ complete ở frame 5: `takeUntil` có dừng không? Nếu đổi thành `next(false)` thì sao?
+5. Vì sao `filter(query => query.length >= 2)` trước `switchMap` có thể khiến kết quả cũ quay lại sau khi xóa query?
+
+<Callout type="idea" title="Đối chiếu đáp án">
+  1. Lần lượt là `1, 2, 1`; `1, 2`; `5, 1`. 2. `take(1)` complete rỗng, `first()` phát `EmptyError`. 3. Không: source complete làm `b` và complete phát cùng frame 5. 4. Chỉ complete không dừng; `next(false)` vẫn dừng ngay. 5. Query ngắn bị bỏ trước khi tới `switchMap`, nên không kích hoạt việc thay inner request hoặc cập nhật state rỗng.
+</Callout>
+
+## Học tiếp
+
+Hãy bắt đầu bằng test cho trường hợp bạn muốn giữ hay bỏ value cuối khi teardown, rồi chọn vị trí `takeUntil` theo test đó. Nếu pipeline gọi API, bước tiếp theo là chọn lifecycle của inner Observable, không chỉ chọn bộ lọc cho outer stream.
+
+<Cards>
+  <Card title="Debounce, throttle và audit" href="/docs/thoi-gian-schedulers/debounce-throttle-audit" description="Đào sâu cửa sổ thời gian, scheduler và các cấu hình timing." />
+  <Card title="switchMap" href="/docs/higher-order-observables/switch-map" description="Hiểu thay inner, cancellation và kết quả request cũ." />
+  <Card title="exhaustMap" href="/docs/higher-order-observables/exhaust-map" description="Bỏ trigger mới khi công việc trước vẫn đang chạy." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm tra cả output và subscription bằng virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS Operators guide](https://rxjs.dev/guide/operators) — cách phân nhóm và composition operator.
+- [filter](https://rxjs.dev/api/operators/filter), [distinctUntilChanged](https://rxjs.dev/api/operators/distinctUntilChanged), [distinct](https://rxjs.dev/api/operators/distinct) — predicate, equality và bộ nhớ key.
+- [takeWhile](https://rxjs.dev/api/operators/takeWhile), [first](https://rxjs.dev/api/operators/first), [takeUntil](https://rxjs.dev/api/operators/takeUntil), [skipUntil](https://rxjs.dev/api/operators/skipUntil) — ranh giới và hợp đồng notifier.
+- [debounceTime](https://rxjs.dev/api/operators/debounceTime), [throttleTime](https://rxjs.dev/api/operators/throttleTime), [auditTime](https://rxjs.dev/api/operators/auditTime), [sampleTime](https://rxjs.dev/api/operators/sampleTime) — hành vi cửa sổ thời gian.
+- [Source operator tại tag RxJS 7.8.2](https://github.com/ReactiveX/rxjs/tree/7.8.2/src/internal/operators) — đối chiếu implementation cho complete, error và pending value theo đúng phiên bản của bài.
+- [TestScheduler](https://rxjs.dev/api/testing/TestScheduler) — test notification và subscription bằng scheduler ảo.

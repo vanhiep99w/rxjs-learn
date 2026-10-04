@@ -3,8 +3,601 @@ title: Utility operators
 description: Thực hiện side effect, thu thập dữ liệu và hỗ trợ debug.
 ---
 
-Trang này sẽ trình bày **Utility operators** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Pipeline đã trả đúng dữ liệu, nhưng bạn còn cần biết nó đang chạy tới đâu, tắt loading khi request bị hủy, hoặc ngừng chờ một nguồn im lặng quá lâu. Những việc này không nên chen vào callback biến đổi dữ liệu. Utility operators giúp bạn quan sát, cleanup và kiểm soát cách notification đi qua pipeline.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Ví dụ dùng **RxJS 7.8.2**, import trực tiếp từ `rxjs`. Bạn nên biết `pipe`, `subscribe` và sự khác nhau giữa `next`, `error`, `complete` với unsubscribe. Trang này nhóm operator theo công việc thực tế, không phải danh sách phân loại đầy đủ của RxJS: `toArray` cũng được giải thích ở nhóm transformation, còn timeout và scheduler có bài chuyên sâu riêng.
 </Callout>
+
+## Mục lục
+
+- [Chọn utility theo công việc](#chọn-utility-theo-công-việc)
+- [tap quan sát mà không đổi giá trị](#tap-quan-sát-mà-không-đổi-giá-trị)
+  - [Log đúng vị trí trong pipeline](#log-đúng-vị-trí-trong-pipeline)
+  - [Return value và async callback không được chờ](#return-value-và-async-callback-không-được-chờ)
+- [finalize cleanup khi execution kết thúc](#finalize-cleanup-khi-execution-kết-thúc)
+  - [Complete error và unsubscribe](#complete-error-và-unsubscribe)
+  - [Cleanup thuộc subscription nào](#cleanup-thuộc-subscription-nào)
+- [delay và delayWhen trì hoãn giá trị](#delay-và-delaywhen-trì-hoãn-giá-trị)
+  - [delay không trì hoãn việc subscribe source](#delay-không-trì-hoãn-việc-subscribe-source)
+  - [delayWhen chờ tín hiệu cho từng value](#delaywhen-chờ-tín-hiệu-cho-từng-value)
+- [timeout đặt giới hạn chờ emission](#timeout-đặt-giới-hạn-chờ-emission)
+  - [Chọn first each và fallback](#chọn-first-each-và-fallback)
+  - [Vị trí timeout thay đổi thứ được đo](#vị-trí-timeout-thay-đổi-thứ-được-đo)
+- [toArray thu thập một nguồn hữu hạn](#toarray-thu-thập-một-nguồn-hữu-hạn)
+- [timestamp và timeInterval đo thời gian](#timestamp-và-timeinterval-đo-thời-gian)
+- [materialize và dematerialize đổi notification thành dữ liệu](#materialize-và-dematerialize-đổi-notification-thành-dữ-liệu)
+- [observeOn và subscribeOn chọn ranh giới scheduling](#observeon-và-subscribeon-chọn-ranh-giới-scheduling)
+- [Ví dụ loading timeout và cache fallback](#ví-dụ-loading-timeout-và-cache-fallback)
+- [Kiểm chứng bằng virtual time](#kiểm-chứng-bằng-virtual-time)
+- [Checklist trước khi đưa vào ứng dụng](#checklist-trước-khi-đưa-vào-ứng-dụng)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Chọn utility theo công việc
+
+Mình thường tách ba câu hỏi: bạn muốn **quan sát**, **cleanup**, hay **đổi thời điểm và hình dạng notification**? Hai nhóm đầu có thể giữ nguyên dữ liệu; nhóm cuối có thể đổi contract mà downstream phải xử lý.
+
+| Công việc | Operator | Điều cần kiểm tra |
+| --- | --- | --- |
+| Log, cập nhật một side effect đồng bộ | `tap` | Có mutate object hoặc ném lỗi không? |
+| Cleanup cả khi hoàn tất, lỗi và cancellation | `finalize` | Callback thuộc execution nguồn hay từng subscriber? |
+| Giữ value thêm một khoảng thời gian | `delay` | Bạn cần trì hoãn value hay trì hoãn lúc bắt đầu công việc? |
+| Giữ từng value đến khi một nguồn khác phát tín hiệu | `delayWhen` | Duration có phát `next` không; thứ tự có thể đổi không? |
+| Giới hạn thời gian chờ value đầu hoặc value tiếp theo | `timeout` | Bạn đo first emission, khoảng lặng hay kết quả cuối? |
+| Gom toàn bộ value thành một array cuối | `toArray` | Source có hữu hạn và chắc chắn complete không? |
+| Gắn thời điểm quan sát hoặc đo khoảng cách giữa value | `timestamp`, `timeInterval` | Đồng hồ đo ở vị trí nào trong pipeline? |
+| Đưa cả error và complete vào data channel | `materialize`, `dematerialize` | Downstream đang xử lý data hay terminal notification? |
+| Schedule delivery hoặc schedule subscription | `observeOn`, `subscribeOn` | Công việc upstream có thực sự được trì hoãn không? |
+
+Utility không có nghĩa là “không ảnh hưởng kết quả”. Chẳng hạn, lỗi đồng bộ trong `tap` có thể làm output error; `timeout` có thể unsubscribe nguồn; `toArray` có thể giữ dữ liệu mãi nếu nguồn không complete.
+
+## tap quan sát mà không đổi giá trị
+
+Dùng `tap` khi muốn làm side effect bên cạnh một notification: log một value, tăng counter hoặc ghi nhận error. Return value của callback không tham gia vào output; nếu bạn cần đổi dữ liệu, dùng `map`.
+
+### Log đúng vị trí trong pipeline
+
+```ts
+import { filter, map, of, tap } from 'rxjs';
+
+of(1, 2, 3).pipe(
+  tap((value) => console.log('input:', value)),
+  filter((value) => value % 2 === 0),
+  map((value) => value * 10),
+  tap({
+    next: (value) => console.log('output:', value),
+    error: (error) => console.error('pipeline error:', error),
+    complete: () => console.log('tap complete'),
+  }),
+).subscribe((value) => console.log('subscriber:', value));
+
+// input: 1
+// input: 2
+// output: 20
+// subscriber: 20
+// input: 3
+// tap complete
+```
+
+`tap` đầu tiên thấy cả value bị `filter` loại. `tap` thứ hai chỉ thấy `20`, vì nó nằm sau bước lọc và nhân. Khi debug, chọn vị trí log theo câu hỏi: “source đã phát gì?” khác với “UI sẽ nhận gì?”.
+
+Đọc theo cột dọc trong diagram sau: mỗi value và terminal notification giữ nguyên frame khi chỉ thêm một `tap` không ném lỗi.
+
+<MarbleDiagram
+  title="tap(log)"
+  rows={[
+    { label: 'source', marble: '-a---b--|', kind: 'source' },
+    { label: 'output', marble: '-a---b--|', kind: 'output' },
+  ]}
+  values={{ a: 'value 1', b: 'value 2' }}
+  caption="tap quan sát notification rồi chuyển tiếp; không có một stream log riêng trong output."
+/>
+
+`a` đi qua ở frame 1, `b` ở frame 5, và complete ở frame 8. Đây là virtual timeline để minh họa contract; nguồn `of` trong ví dụ phía trên vẫn chạy đồng bộ.
+
+### Return value và async callback không được chờ
+
+```ts
+import { of, tap } from 'rxjs';
+
+of(2).pipe(
+  tap((value) => value * 100),
+).subscribe(console.log);
+// 2, không phải 200
+```
+
+Callback của `tap` không phải một phép biến đổi. Nếu bạn sửa field trên object, output vẫn mang cùng reference, nhưng object đã bị mutate. Vì vậy, “không dùng return value” không có nghĩa là “bảo đảm dữ liệu bất biến”.
+
+Nếu callback ném lỗi **đồng bộ**, `tap` đưa lỗi ấy vào error channel thay cho notification đang xử lý. Callback `error` của `tap` chỉ quan sát lỗi, không recover; dùng [catchError](/docs/loi-hoan-tat/catch-error) khi cần thay nguồn lỗi bằng một Observable khác.
+
+<Callout type="warn" title="tap không await Promise">
+  `tap(async value => ...)` không khiến pipeline chờ Promise. Rejection của Promise không tự đi vào error channel của pipeline và có thể thành unhandled rejection. Nếu tác vụ async là một bước bắt buộc, trả Observable hoặc Promise từ `concatMap`, `mergeMap` hay `switchMap`, rồi chọn policy concurrency/cancellation phù hợp. Gọi `subscribe` bên trong `tap` cũng tạo một execution riêng mà subscription bên ngoài không tự quản lý.
+</Callout>
+
+Mình dùng `tap` cho quan sát và side effect nhỏ, đồng bộ; không dùng nó để giấu một workflow async. Log production cũng nên có nhãn/correlation ID và tránh ghi token hay toàn bộ dữ liệu cá nhân.
+
+## finalize cleanup khi execution kết thúc
+
+Một loading indicator phải tắt cả khi request thành công, thất bại **và bị hủy**. Callback `complete` chỉ giải quyết một trong ba đường đó. `finalize(callback)` phù hợp với cleanup vì chạy khi subscription ở vị trí ấy được teardown.
+
+### Complete error và unsubscribe
+
+| Execution kết thúc bởi | `tap({ complete })` | `tap({ error })` | `finalize` |
+| --- | --- | --- | --- |
+| Complete bình thường | Chạy | Không chạy | Chạy |
+| Error | Không chạy | Chạy | Chạy |
+| Unsubscribe thủ công | Không chạy | Không chạy | Chạy |
+
+Ví dụ dưới đây không cần timer nên output có thể kiểm tra ngay:
+
+```ts
+import { finalize, Observable, tap } from 'rxjs';
+
+const source$ = new Observable<number>((subscriber) => {
+  console.log('source started');
+  subscriber.next(1);
+  return () => console.log('source teardown');
+});
+
+const subscription = source$.pipe(
+  tap({ complete: () => console.log('tap complete') }),
+  finalize(() => console.log('finalize')),
+).subscribe({
+  next: (value) => console.log('next:', value),
+  complete: () => console.log('subscriber complete'),
+});
+
+subscription.unsubscribe();
+subscription.unsubscribe();
+
+// source started
+// next: 1
+// source teardown
+// finalize
+```
+
+Nguồn chưa complete nhưng bạn đã unsubscribe, nên không có dòng `tap complete` hoặc `subscriber complete`. Gọi `unsubscribe()` lần hai không chạy lại cleanup cho subscription đã đóng.
+
+`finalize` không nhận value cuối, Error hoặc lý do kết thúc. Nếu cần phân biệt thành công với cancellation để ghi metric, theo dõi notification trong `tap` và giữ state **riêng cho từng subscription**, chẳng hạn tạo bên trong `defer`. Đừng xem việc `finalize` đã chạy là bằng chứng request thành công.
+
+### Cleanup thuộc subscription nào
+
+Với một cold source, hai subscription là hai execution, nên `finalize` có thể chạy hai lần. Vị trí của nó so với `retry` hoặc `share` cũng quan trọng:
+
+- `source$.pipe(finalize(cleanup), retry(2))`: cleanup chạy cho mỗi attempt nguồn kết thúc, kể cả attempt lỗi trước khi retry.
+- `source$.pipe(retry(2), finalize(cleanup))`: cleanup gắn với execution bao ngoài chuỗi retry; chạy khi chuỗi đó kết thúc hoặc bị hủy.
+- `source$.pipe(finalize(cleanup), share())`: cleanup gắn với execution nguồn được chia sẻ.
+- `source$.pipe(share(), finalize(cleanup))`: cleanup gắn với từng downstream subscription.
+
+Nguồn trước `share` có thể được subscribe lại theo cấu hình reset và ref counting, nên “trước share” không có nghĩa là “chỉ chạy một lần trong đời ứng dụng”. Xem [share](/docs/subjects-multicasting/share) khi quản lý resource dùng chung.
+
+<Callout type="warn" title="Cleanup không phải bước async được chờ">
+  Giữ `finalize` ngắn và tránh ném lỗi. RxJS không await Promise bạn trả từ callback, và lỗi phát sinh lúc teardown không nên được trông chờ sẽ recover bằng `catchError` downstream. Nếu cleanup async là một phần workflow bắt buộc, mô hình hóa nó bằng Observable ở luồng xử lý riêng với error handling rõ ràng.
+</Callout>
+
+## delay và delayWhen trì hoãn giá trị
+
+Có hai yêu cầu khác nhau: “bắt đầu request sau 500 ms” và “request chạy ngay nhưng hiển thị kết quả sau 500 ms”. `delay` giải quyết yêu cầu thứ hai, không phải thứ nhất.
+
+### delay không trì hoãn việc subscribe source
+
+```ts
+import { defer, delay, of, tap } from 'rxjs';
+
+const result$ = defer(() => {
+  console.log('work started');
+  return of('OK');
+});
+
+console.log('before subscribe');
+result$.pipe(
+  delay(500),
+  tap((value) => console.log('delivered:', value)),
+).subscribe();
+console.log('after subscribe');
+
+// before subscribe
+// work started
+// after subscribe
+// delivered: OK — sau khoảng 500 ms
+```
+
+`defer` chạy khi subscribe, trước dòng `after subscribe`; chỉ value `'OK'` được giữ lại. Nếu muốn bắt đầu công việc muộn, có thể dùng `timer(500).pipe(switchMap(() => result$))`, với điều kiện công việc thật sự lazy như `defer` ở trên. Một Promise đã tạo và bắt đầu chạy trước đó không được trì hoãn bằng cách này.
+
+Đọc source và output trên cùng trục thời gian. Trong hình, `delay(3)` dùng virtual frame, không phải đo thời gian wall-clock của ví dụ 500 ms.
+
+<MarbleDiagram
+  title="delay(3)"
+  rows={[
+    { label: 'source', marble: '-a--b-|', kind: 'source' },
+    { label: 'output', marble: '----a--(b|)', kind: 'output' },
+  ]}
+  values={{ a: 'value A', b: 'value B' }}
+  caption="Mỗi value trễ 3 frame; output đợi value còn đang chờ trước khi complete."
+/>
+
+`a` chuyển từ frame 1 sang 4, `b` từ frame 4 sang 7. Source complete ở frame 6; output complete ở frame 7, ngay sau khi giao `b`. Nhóm `(b|)` biểu diễn hai notification cùng frame mà renderer của dự án hỗ trợ.
+
+Trong RxJS 7.8.2, `delay` **không** đơn giản dịch mọi notification sang phải: source error được chuyển tiếp ngay và các value còn chờ bị bỏ. Nếu source complete mà không có value đang chờ, output complete ngay; `EMPTY.pipe(delay(500))` không đợi 500 ms. Khi unsubscribe, những delivery đang chờ cũng bị hủy.
+
+<Callout type="info" title="Delay không giảm số emission">
+  `delay` không tương đương debounce hoặc throttle. Nó giữ từng value để phát muộn hơn; một nguồn nhanh vẫn có thể tạo nhiều delivery đang chờ. Nếu bạn cần giảm tần suất xử lý, chọn operator theo yêu cầu ở [Debounce, throttle và audit](/docs/thoi-gian-schedulers/debounce-throttle-audit).
+</Callout>
+
+### delayWhen chờ tín hiệu cho từng value
+
+`delayWhen(value => duration$)` tạo một duration riêng cho từng value. Value được giao khi duration ấy phát **`next` đầu tiên**, sau đó duration được unsubscribe.
+
+```ts
+import { delayWhen, of, timer } from 'rxjs';
+
+of('slow', 'fast').pipe(
+  delayWhen((value) => timer(value === 'slow' ? 300 : 100)),
+).subscribe(console.log);
+
+// fast — sau khoảng 100 ms
+// slow — sau khoảng 300 ms
+```
+
+Các duration chạy đồng thời, nên value tới sau có thể được giao trước. Nếu thứ tự là yêu cầu bắt buộc, dùng `concatMap` để xếp hàng công việc thay vì xem `delayWhen` như một hàng đợi.
+
+Trong RxJS 7, duration `EMPTY` chỉ complete mà không `next` sẽ **nuốt value**, không giao nó ngay. Duration `NEVER` giữ value mãi và có thể làm output không complete dù source đã complete; duration error làm output error. Mình tránh API argument thứ hai `subscriptionDelay` đã deprecated; nếu cần chờ tín hiệu rồi mới mở source, biểu diễn việc đó bằng một pipeline riêng.
+
+## timeout đặt giới hạn chờ emission
+
+Một Observable có thể giữ subscription mở nhưng không phát gì. `timeout` đặt giới hạn chờ ở vị trí nó được đặt trong pipeline; khi hết hạn, nó unsubscribe nguồn và error hoặc chuyển sang fallback.
+
+### Chọn first each và fallback
+
+| Cấu hình | Giới hạn được kiểm tra |
+| --- | --- |
+| `timeout({ first: 1000 })` | Chờ value đầu từ lúc subscribe tối đa 1000 ms; không kiểm tra value sau đó. |
+| `timeout({ each: 1000 })` | Chờ value đầu tối đa 1000 ms và đặt lại giới hạn sau mỗi value. |
+| `timeout({ first: 3000, each: 1000 })` | Value đầu có 3000 ms; sau đó mỗi khoảng chờ có 1000 ms. |
+| `timeout({ first: deadlineDate })` | Value đầu phải tới trước một mốc thời gian tuyệt đối. |
+
+Không có `with`, output error bằng `TimeoutError`. Có `with`, factory chỉ được gọi khi timeout xảy ra và kết quả được dùng làm Observable thay thế:
+
+```ts
+import { map, of, timeout, timer } from 'rxjs';
+
+const remote$ = timer(800).pipe(map(() => 'remote'));
+
+remote$.pipe(
+  timeout({
+    first: 500,
+    with: () => of('cache'),
+  }),
+).subscribe({
+  next: console.log,
+  complete: () => console.log('complete'),
+});
+
+// cache — sau khoảng 500 ms
+// complete
+```
+
+Nguồn `timer(800)` bị unsubscribe khi timeout; `'remote'` không tới output muộn hơn. Fallback không tự chịu cùng giới hạn timeout này: muốn giới hạn cả fallback, hãy đặt một `timeout` riêng trong Observable do `with` trả về.
+
+`with` chỉ xử lý timeout do operator đó phát hiện, không bắt mọi error từ nguồn. Nếu cần xử lý lỗi mạng hay parsing, dùng `catchError` với policy riêng. Mình ưu tiên object config vì nói rõ ý định; `timeout(1000)` tương đương `timeout({ each: 1000 })`, không phải chỉ kiểm tra value đầu. Với code mới, thay `timeoutWith` deprecated bằng `timeout({ ..., with: () => fallback$ })`.
+
+### Vị trí timeout thay đổi thứ được đo
+
+```text
+source → timeout → delay → subscriber
+         đo source; delay sau đó không nằm trong giới hạn
+
+source → delay → timeout → subscriber
+                 đo delivery sau delay
+```
+
+Nếu đặt `timeout({ first: 1000 })` sau `filter`, một value bị loại không làm timeout biết nguồn đã phát. Đặt sau `toArray`, value đầu mà timeout nhìn thấy là **array cuối**, nên giới hạn ấy trở thành thời gian chờ kết quả toàn bộ batch, kể cả array rỗng.
+
+<Callout type="warn" title="Timeout chờ value không phải deadline cho completion">
+  Một source complete trước hạn thì output cũng complete, kể cả chưa có value; `timeout` không biến source rỗng thành lỗi. Sau khi nhận value đầu, cấu hình chỉ có `first` không còn kiểm tra nguồn có complete hay không. Với `each`, nguồn phát đều có thể sống mãi. Đừng dùng hai cấu hình ấy như một deadline tuyệt đối cho toàn bộ workflow.
+</Callout>
+
+Unsubscribe cũng không bảo đảm server dừng xử lý. Timer trong ví dụ thật sự bị hủy, nhưng Promise từ `fetch` không tự abort chỉ vì Observable bọc nó bị unsubscribe; cần nối teardown với `AbortController` hoặc dùng nguồn có cancellation phù hợp. Xem [Timeout và fallback](/docs/loi-hoan-tat/timeout-fallback).
+
+## toArray thu thập một nguồn hữu hạn
+
+`toArray()` chuyển `Observable<T>` thành `Observable<T[]>`: giữ value theo thứ tự nhận và phát một array khi nguồn **complete bình thường**.
+
+```ts
+import { EMPTY, of, toArray } from 'rxjs';
+
+of('A', 'B', 'C').pipe(toArray()).subscribe(console.log);
+// ['A', 'B', 'C'] — một emission
+
+EMPTY.pipe(toArray()).subscribe(console.log);
+// [] — vẫn một emission
+```
+
+Nếu nguồn error, array đang gom không được phát; nếu unsubscribe giữa chừng, nó cũng không được flush. Với event stream hay `interval` không có điểm dừng, subscriber có thể đợi mãi trong khi array tiếp tục chiếm bộ nhớ.
+
+```ts
+import { interval, take, toArray } from 'rxjs';
+
+interval(100).pipe(
+  take(3),
+  toArray(),
+).subscribe(console.log);
+// [0, 1, 2] — sau khoảng 300 ms
+```
+
+Ở đây, `take(3)` complete nguồn mà `toArray` nhìn thấy, nên array được giao. Đảo thành `toArray(), take(3)` không có tác dụng giới hạn input: `take` chỉ đếm array phía sau, còn array đầu tiên chưa xuất hiện.
+
+Mình chọn `toArray` cho nguồn hữu hạn, nhỏ và cần kết quả cuối. Nếu cần batch liên tục, dùng `bufferCount` hoặc `bufferTime`; nếu chỉ cần tổng hay một kết quả tích lũy, `reduce` tránh giữ toàn bộ value. Với nhiều request và muốn một kết quả cho mỗi request, vị trí `toArray` thường nằm trong inner, không phải cuối một outer event stream sống mãi. Xem [Transformation operators](/docs/operators/transformation-operators).
+
+## timestamp và timeInterval đo thời gian
+
+Hai operator này không tạo delay. Chúng đọc `scheduler.now()` khi nhận một `next`, rồi **đổi shape của value**:
+
+| Operator | Output cho mỗi value | Ý nghĩa |
+| --- | --- | --- |
+| `timestamp()` | `{ value, timestamp }` | Thời điểm operator quan sát value; mặc định là mốc thời gian theo ms từ Unix epoch. |
+| `timeInterval()` | `{ value, interval }` | Khoảng thời gian từ value trước tới value này; value đầu đo từ lúc subscribe tại operator. |
+
+Ví dụ dùng `TestScheduler` để không phụ thuộc timer thật:
+
+```ts
+import { timeInterval, timestamp } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler(() => {});
+
+scheduler.run(({ cold }) => {
+  const source$ = cold<string>('--a---b|');
+
+  source$.pipe(timestamp(scheduler)).subscribe(console.log);
+  source$.pipe(timeInterval(scheduler)).subscribe(console.log);
+});
+
+// Ở frame 2:
+// { value: 'a', timestamp: 2 }
+// TimeInterval { value: 'a', interval: 2 }
+// Ở frame 6:
+// { value: 'b', timestamp: 6 }
+// TimeInterval { value: 'b', interval: 4 }
+```
+
+Trong `run`, một frame là 1 ms virtual time; `timestamp` ở đây trả virtual time chứ không phải ngày giờ thật. Hai subscription vào cold source tạo hai execution riêng, nhưng dùng chung đồng hồ nên so sánh được.
+
+Đặt `timeInterval` sau `filter` sẽ đo khoảng cách giữa các value **được giữ**, không phải mọi value từ source. Đặt `timestamp` sau `delay` ghi thời điểm giao muộn; muốn giữ thời điểm nguồn được quan sát thì đặt nó trước `delay`.
+
+Đừng xem `timeInterval` là latency của request nếu chưa xác định điểm bắt đầu và kết thúc. Nó đo khoảng cách giữa emission, không tự biết lúc request được gửi. Với timer thật, các con số chỉ xấp xỉ vì event loop có thể bận; đo một workflow riêng nên lưu thời điểm bắt đầu theo từng execution trong `defer`.
+
+## materialize và dematerialize đổi notification thành dữ liệu
+
+Đôi khi bạn muốn ghi nhận cả error và complete như các event dữ liệu, chẳng hạn gom lịch sử kết quả của một execution. `tap` quan sát được terminal notification nhưng không biến nó thành value; `materialize()` làm việc đó.
+
+| Notification nguồn | Value do `materialize` phát |
+| --- | --- |
+| `next(value)` | Notification có `kind: 'N'` và `value` |
+| `error(error)` | Notification có `kind: 'E'` và `error`, rồi output complete |
+| `complete` | Notification có `kind: 'C'`, rồi output complete |
+
+```ts
+import { concat, materialize, of, throwError, toArray } from 'rxjs';
+
+concat(
+  of('A'),
+  throwError(() => new Error('failed')),
+).pipe(
+  materialize(),
+  toArray(),
+).subscribe({
+  next: (notifications) => {
+    console.log(notifications.map((notification) => notification.kind));
+  },
+  error: () => console.log('error callback'),
+  complete: () => console.log('complete'),
+});
+
+// ['N', 'E']
+// complete
+```
+
+Error nguồn đã thành một value `'E'`, nên `toArray` có thể gom nó và output complete bình thường. Không có thêm Notification `'C'` trong array: nguồn kết thúc bằng error, còn complete phía sau là terminal notification của output `materialize`.
+
+`dematerialize()` làm chiều ngược lại, đọc các Notification value và phát lại notification thật:
+
+```ts
+import { concat, dematerialize, materialize, of, throwError } from 'rxjs';
+
+concat(
+  of('A'),
+  throwError(() => new Error('failed')),
+).pipe(
+  materialize(),
+  dematerialize(),
+).subscribe({
+  next: console.log,
+  error: (error: Error) => console.log('error:', error.message),
+  complete: () => console.log('complete'),
+});
+
+// A
+// error: failed
+```
+
+Đừng đặt `dematerialize` sau một stream object tùy ý: input phải đúng Notification contract. Sau khi giải mã `'E'` hoặc `'C'`, downstream kết thúc; các value sau đó không còn được nhận.
+
+Mình không dùng `materialize` thay `catchError` cho fallback thông thường vì nó đổi data contract của cả pipeline. Nó cũng không giúp nguồn tự tiếp tục sau error và không tạo Notification cho unsubscribe. Hãy dùng khi terminal state thực sự cần đi qua các operator xử lý dữ liệu.
+
+## observeOn và subscribeOn chọn ranh giới scheduling
+
+Hai tên dễ lẫn, nhưng chúng tác động vào hai thời điểm khác nhau:
+
+- `subscribeOn(scheduler, delay?)` schedule **việc subscribe vào phần upstream**. Với nguồn lazy, công việc khởi tạo upstream chạy khi action subscribe được thực thi.
+- `observeOn(scheduler, delay?)` subscribe upstream như bình thường, nhưng schedule **delivery của `next`, `error` và `complete`** cho downstream.
+
+Ví dụ sau dùng `asyncScheduler` để thấy khác biệt với nguồn đồng bộ. Chạy từng biến thể riêng để đọc thứ tự log:
+
+```ts
+import { asyncScheduler, defer, observeOn, of, subscribeOn } from 'rxjs';
+
+const source$ = defer(() => {
+  console.log('source started');
+  return of('A');
+});
+
+console.log('before');
+source$.pipe(observeOn(asyncScheduler)).subscribe(console.log);
+console.log('after');
+
+// before
+// source started
+// after
+// A — được schedule sau đoạn đồng bộ
+
+// Nếu thay observeOn(asyncScheduler) bằng subscribeOn(asyncScheduler):
+// before
+// after
+// source started
+// A
+```
+
+`observeOn` không thay scheduler nội bộ của nguồn và không dời side effect đã chạy trước nó. `subscribeOn` cũng không trì hoãn một Promise đã bắt đầu trước lúc tạo subscription. Chỉ cách chọn scheduler quyết định đồng bộ hay bất đồng bộ; chẳng hạn `queueScheduler` với delay 0 có thể chạy đồng bộ, không nên suy ra “thêm scheduler là async”.
+
+Khác `delay`, `observeOn` schedule cả error. Nhưng đừng thêm `observeOn` như một cách tối ưu mặc định: một nguồn phát hàng loạt value đồng bộ vẫn có thể làm upstream chiếm event loop và tạo nhiều delivery chờ. Scheduling trên cùng JavaScript thread cũng không chuyển tính toán nặng sang worker. Xem [Scheduler model](/docs/thoi-gian-schedulers/scheduler-model) khi cần điều khiển sâu hơn.
+
+## Ví dụ loading timeout và cache fallback
+
+Giả sử một lần tải user cho phép đợi tối đa 500 ms rồi dùng cache. Loading phải tắt dù tải xong, timeout hay người dùng rời màn hình. Ví dụ này dùng timer mô phỏng thay vì HTTP thật, để bạn nhìn rõ subscription và output:
+
+```ts
+import { defer, finalize, map, of, tap, timeout, timer } from 'rxjs';
+
+type User = { id: number; name: string };
+const cachedUser: User = { id: 1, name: 'Cached user' };
+
+function setLoading(value: boolean) {
+  console.log('loading:', value);
+}
+
+const user$ = defer(() => {
+  setLoading(true);
+
+  const remote$ = timer(800).pipe(
+    map((): User => ({ id: 1, name: 'Remote user' })),
+  );
+
+  return remote$.pipe(
+    timeout({
+      first: 500,
+      with: () => {
+        console.log('timeout: use cache');
+        return of(cachedUser);
+      },
+    }),
+    tap((user) => console.log('selected user:', user.name)),
+    finalize(() => setLoading(false)),
+  );
+});
+
+const subscription = user$.subscribe({
+  next: (user) => console.log('render:', user.name),
+  error: (error) => console.error('load failed:', error),
+  complete: () => console.log('complete'),
+});
+
+// loading: true
+// timeout: use cache — sau khoảng 500 ms
+// selected user: Cached user
+// render: Cached user
+// complete
+// loading: false
+
+// Khi màn hình bị đóng trước khi kết thúc:
+// subscription.unsubscribe();
+```
+
+`defer` bật loading theo từng subscription, không bật ngay lúc khai báo `user$`. `timeout` hủy timer nguồn khi quá hạn; `tap` chỉ quan sát user đã được chọn; `finalize` nằm sau timeout để giữ loading tới khi cả fallback kết thúc.
+
+Nếu unsubscribe trước 500 ms, không có user hay callback `complete`, nhưng loading vẫn tắt. Ví dụ chỉ mô hình hóa một execution: nếu nhiều request song song cùng điều khiển một boolean loading dùng chung, request kết thúc sớm có thể tắt loading của request khác. Khi đó, dùng state theo request hoặc counter, và chọn flattening policy trước khi thêm side effect.
+
+## Kiểm chứng bằng virtual time
+
+Timer thật làm test chậm và dễ dao động. Với `TestScheduler.run`, bạn có thể kiểm tra cả output lẫn thời điểm unsubscribe mà không chờ wall-clock. Đây là ba contract quan trọng của trang: delay giữ value nhưng không giữ error, và timeout hủy nguồn khi chuyển fallback.
+
+```ts
+import assert from 'node:assert/strict';
+import { delay, of, timeout } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+function createScheduler() {
+  return new TestScheduler((actual, expected) => {
+    assert.deepStrictEqual(actual, expected);
+  });
+}
+
+createScheduler().run(({ cold, expectObservable }) => {
+  const source$ = cold<string>('-a--b-|');
+  expectObservable(source$.pipe(delay(3)))
+    .toBe('----a--(b|)');
+});
+
+createScheduler().run(({ cold, expectObservable }) => {
+  const error = new Error('failed');
+  const source$ = cold<string>('-a-#', undefined, error);
+  expectObservable(source$.pipe(delay(3)))
+    .toBe('---#', undefined, error);
+});
+
+createScheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source$ = cold<string>('--a-------b--|');
+  const result$ = source$.pipe(
+    timeout({ each: 4, with: () => of('f') }),
+  );
+
+  expectObservable(result$).toBe('--a---(f|)');
+  expectSubscriptions(source$.subscriptions).toBe('^-----!');
+});
+```
+
+Test đầu khớp diagram `delay(3)`: `b` và complete cùng frame 7. Test thứ hai error ở frame 3, trước lúc `a` dự kiến được giao ở frame 4, nên không có `a` xuống output.
+
+Test cuối nhận `a` ở frame 2; timeout đặt lại giới hạn 4 ms, chuyển sang `'f'` và complete tại frame 6. Subscription nguồn kết thúc ở frame 6, nên `b` dự kiến ở frame 10 không được giao. Chuỗi `^-----!` là subscription marble dành cho `expectSubscriptions`, không phải notification marble để đưa vào `cold()`.
+
+## Checklist trước khi đưa vào ứng dụng
+
+- **Side effect:** `tap` chỉ quan sát, hay đang giấu tác vụ async mà pipeline không chờ? Log có lộ dữ liệu nhạy cảm không?
+- **Cleanup:** cần chạy khi complete, error, cancellation hay cả ba? `finalize` đang thuộc từng attempt, từng subscriber hay execution dùng chung?
+- **Thời gian:** bạn muốn bắt đầu công việc muộn hay giao value muộn? Vị trí `delay`, `filter`, `toArray` có thay thứ timeout nhìn thấy không?
+- **Thu thập:** nguồn chắc chắn complete và dữ liệu đủ nhỏ để giữ trong memory không? Nếu chưa, chọn buffer hoặc accumulator phù hợp.
+- **Notification:** sau `materialize`, downstream hiểu `'E'` là data không? Sau `timestamp`, nó còn đang chờ value gốc hay object bọc?
+- **Cancellation:** unsubscribe thật sự dừng producer hay chỉ ngừng nhận kết quả? Resource có teardown tương ứng không?
+- **Test:** đã kiểm tra error và unsubscribe, không chỉ happy path chưa?
+
+## Bài tập tự kiểm tra
+
+1. `of(1).pipe(tap(() => 99))` phát gì? Nếu callback ném `Error` đồng bộ thì sao?
+2. Bạn subscribe vào nguồn không complete rồi unsubscribe. `tap({ complete })` và `finalize` khác nhau thế nào?
+3. `of('A').pipe(delayWhen(() => EMPTY))` có phát `'A'` trong RxJS 7 không?
+4. Vì sao `interval(100).pipe(toArray(), take(3))` chưa phát array? Đổi thứ tự operator có gì khác?
+5. Nguồn phát một value sau 100 ms rồi im lặng mãi. `timeout({ first: 500 })` có timeout sau đó không? Còn `timeout({ each: 500 })`?
+
+**Đối chiếu:** (1) Phát `1`; return `99` bị bỏ qua. Nếu callback ném lỗi, output error thay vì phát `1`. (2) Unsubscribe không gọi complete, nhưng chạy `finalize`. (3) Không; duration complete mà không `next` nuốt value. (4) `toArray` chờ nguồn vô hạn complete; đặt `take(3)` trước nó sẽ gom được `[0, 1, 2]`. (5) Chỉ có `first` thì không; `each` timeout sau 500 ms kể từ value đã nhận, tức khoảng 600 ms từ lúc subscribe.
+
+Thử thêm một marble test cho câu 5 và assert subscription nguồn. Khi đọc được cả lúc phát lẫn lúc dừng, bạn sẽ dễ phát hiện một pipeline “đúng dữ liệu nhưng sai lifecycle”.
+
+## Học tiếp
+
+<Cards>
+  <Card title="finalize" href="/docs/loi-hoan-tat/finalize" description="Cleanup, cancellation và vị trí trong workflow có retry." />
+  <Card title="Timeout và fallback" href="/docs/loi-hoan-tat/timeout-fallback" description="Giới hạn chờ, error policy và nguồn thay thế." />
+  <Card title="Transformation operators" href="/docs/operators/transformation-operators" description="Chọn toArray, reduce hoặc buffer theo nhu cầu giữ dữ liệu." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm tra notification và subscription bằng virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — Operators guide](https://rxjs.dev/guide/operators): phân biệt creation và pipeable operators, cùng các nhóm hành vi.
+- [tap ở tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/tap.ts) và [finalize](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/finalize.ts): chuyển tiếp notification, lỗi đồng bộ và teardown.
+- [delay](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/delay.ts), [delayWhen](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/delayWhen.ts) và [timeout](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/timeout.ts): implementation và contract timing cho phiên bản dùng trong bài.
+- [toArray](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/toArray.ts), [timestamp](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/timestamp.ts) và [timeInterval](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/timeInterval.ts): thu thập và đo thời gian quan sát.
+- [materialize](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/materialize.ts) và [dematerialize](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/dematerialize.ts): chuyển đổi giữa data channel và notification.
+- [observeOn](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/observeOn.ts) và [subscribeOn](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/subscribeOn.ts): ranh giới delivery và subscription scheduling.

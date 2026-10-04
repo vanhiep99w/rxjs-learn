@@ -3,8 +3,666 @@ title: Conditional & boolean operators
 description: Rẽ nhánh và kiểm tra điều kiện trên stream.
 ---
 
-Trang này sẽ trình bày **Conditional & boolean operators** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn cần biết một batch có hợp lệ không, tìm phần tử đầu tiên đạt điều kiện, hay trả giá trị mặc định khi stream không phát gì? Những câu hỏi này nhìn giống `filter`, nhưng kết quả bạn muốn thường là **một kết luận về stream**, không phải một stream gồm các phần tử được giữ lại.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Điểm dễ nhầm nhất là thời điểm có thể kết luận. Một giá trị sai đủ để `every` trả `false`, nhưng muốn trả `true` thì phải chờ source complete. Mình sẽ đi từ quy tắc này đến cách chọn operator, rồi ghép chúng vào một ví dụ kiểm tra batch.
+
+<Callout type="info" title="Phạm vi và kiến thức cần có">
+  Bài dùng API RxJS 7.8.x, import từ `rxjs`, và giả định bạn đã biết `pipe`, `next`, `complete`, `error` và unsubscribe. Năm operator chính là `every`, `find`, `findIndex`, `isEmpty` và `defaultIfEmpty`. `iif` được trình bày thêm để giải quyết nhu cầu rẽ nhánh, nhưng nó là creation function, không phải pipeable operator.
 </Callout>
+
+## Mục lục
+
+- [Chọn operator theo câu hỏi](#chọn-operator-theo-câu-hỏi)
+- [Khi nào đủ dữ kiện để kết luận](#khi-nào-đủ-dữ-kiện-để-kết-luận)
+- [every: tất cả emission có đạt điều kiện không](#every-tất-cả-emission-có-đạt-điều-kiện-không)
+  - [Kết luận sớm khi gặp giá trị sai](#kết-luận-sớm-khi-gặp-giá-trị-sai)
+  - [Stream rỗng vẫn trả true](#stream-rỗng-vẫn-trả-true)
+- [find và findIndex: tìm lần khớp đầu tiên](#find-và-findindex-tìm-lần-khớp-đầu-tiên)
+  - [Giá trị tìm được và vị trí trong stream](#giá-trị-tìm-được-và-vị-trí-trong-stream)
+  - [Không tìm thấy khác với không có emission](#không-tìm-thấy-khác-với-không-có-emission)
+  - [So sánh với filter và first](#so-sánh-với-filter-và-first)
+- [isEmpty: stream có phát giá trị nào không](#isempty-stream-có-phát-giá-trị-nào-không)
+  - [Array rỗng không phải stream rỗng](#array-rỗng-không-phải-stream-rỗng)
+  - [Kiểm tra có ít nhất một phần tử phù hợp](#kiểm-tra-có-ít-nhất-một-phần-tử-phù-hợp)
+- [defaultIfEmpty: fallback khi complete mà chưa phát gì](#defaultifempty-fallback-khi-complete-mà-chưa-phát-gì)
+  - [Fallback phụ thuộc vị trí trong pipeline](#fallback-phụ-thuộc-vị-trí-trong-pipeline)
+  - [Phân biệt fallback, giá trị ban đầu và lỗi](#phân-biệt-fallback-giá-trị-ban-đầu-và-lỗi)
+- [iif và defer: chọn source lúc subscribe](#iif-và-defer-chọn-source-lúc-subscribe)
+  - [Chỉ subscribe một nhánh chưa có nghĩa chỉ chạy một tác vụ](#chỉ-subscribe-một-nhánh-chưa-có-nghĩa-chỉ-chạy-một-tác-vụ)
+  - [Rẽ nhánh theo từng emission](#rẽ-nhánh-theo-từng-emission)
+- [Stream sống lâu, lỗi và cancellation](#stream-sống-lâu-lỗi-và-cancellation)
+- [Ví dụ hoàn chỉnh: kiểm tra một batch](#ví-dụ-hoàn-chỉnh-kiểm-tra-một-batch)
+- [Kiểm chứng bằng TestScheduler](#kiểm-chứng-bằng-testscheduler)
+- [Checklist và bài tập](#checklist-và-bài-tập)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Chọn operator theo câu hỏi
+
+Mình chọn operator theo **kiểu kết quả cần nhận** trước, rồi kiểm tra xem source có thể complete hay không. Đừng bắt đầu bằng một chuỗi `filter`, `map`, `take` nếu đã có operator diễn đạt đúng ý định.
+
+| Câu hỏi | API | Kết quả downstream | Khi có thể kết luận sớm |
+| --- | --- | --- | --- |
+| Mọi emission đều đạt điều kiện? | `every(predicate)` | Một `boolean` | Gặp emission không đạt → `false` |
+| Giá trị đầu tiên đạt điều kiện là gì? | `find(predicate)` | Một giá trị hoặc `undefined` | Gặp emission đạt điều kiện |
+| Lần đầu đạt điều kiện ở vị trí nào? | `findIndex(predicate)` | Một index từ `0`, hoặc `-1` | Gặp emission đạt điều kiện |
+| Stream có rỗng không? | `isEmpty()` | Một `boolean` | Gặp bất kỳ emission nào → `false` |
+| Không có emission thì trả gì? | `defaultIfEmpty(value)` | Các giá trị gốc, hoặc một fallback | Không có fallback sớm; phải chờ complete |
+| Subscribe source A hay B? | `iif(condition, a$, b$)` | Giá trị của source được chọn | Chọn nhánh tại mỗi lần subscribe |
+
+Bốn operator đầu đưa ra một kết quả rồi complete nếu đủ dữ kiện; chúng không biến mỗi emission thành một boolean riêng. `defaultIfEmpty` thì khác: nếu source có nhiều giá trị, nó chuyển tiếp tất cả, không gom thành một kết luận.
+
+Muốn kiểm tra **từng emission** và vẫn giữ stream hoạt động, dùng `map(value => predicate(value))`. Muốn giữ mọi giá trị đạt điều kiện, dùng `filter(predicate)`.
+
+## Khi nào đủ dữ kiện để kết luận
+
+Hình dung bạn kiểm tra các sản phẩm trong một thùng hàng. Gặp một sản phẩm lỗi là đủ để nói “không phải tất cả đều tốt”; muốn nói “tất cả đều tốt” thì phải biết thùng đã được kiểm tra hết. Trong RxJS, tín hiệu “đã hết” là `complete`, không phải một khoảng im lặng.
+
+| Operator | Khi source complete bình thường mà chưa đủ dữ kiện trước đó |
+| --- | --- |
+| `every(predicate)` | Phát `true`, kể cả không có emission nào |
+| `find(predicate)` | Phát `undefined` nếu chưa tìm thấy |
+| `findIndex(predicate)` | Phát `-1` nếu chưa tìm thấy |
+| `isEmpty()` | Phát `true` nếu chưa có emission |
+| `defaultIfEmpty(value)` | Phát fallback nếu chưa có emission, rồi complete |
+
+Các hình dưới dùng frame ảo bắt đầu từ `0`; đọc theo cột dọc để so thời điểm giữa source và output. `|` là complete, `!` là unsubscribe; `(f|)` nghĩa là phát `f` và complete cùng frame. Renderer của dự án hỗ trợ nhóm này. Chuỗi trong hình là timeline trực quan; khi dùng `TestScheduler`, subscription được viết riêng và cú pháp nhóm có quy tắc đếm frame riêng.
+
+Trong hình có short-circuit, hàng `source` thể hiện lịch source *có thể* phát nếu được nghe đến hết. Hàng `sub` cho thấy subscription thực tế dừng ở đâu; những giá trị sau `!` không đi vào operator nữa.
+
+## every: tất cả emission có đạt điều kiện không
+
+### Kết luận sớm khi gặp giá trị sai
+
+`every(predicate)` trả một boolean cho toàn bộ các emission mà subscription quan sát được. Predicate nhận `(value, index, source)`; index bắt đầu từ `0`. Với RxJS 7, nên dùng closure nếu cần biến bên ngoài thay vì overload `thisArg` đã deprecated.
+
+```ts
+import { every, of } from 'rxjs';
+
+of(2, 4, 5, 6).pipe(
+  every((value) => value % 2 === 0),
+).subscribe({
+  next: (allEven) => console.log(allEven),
+  complete: () => console.log('done'),
+});
+// false
+// done
+```
+
+`5` không chẵn, nên không cần kiểm tra `6`. Đọc cột ở frame `5` trong hình: đó là lúc operator phát `false`, complete output và đóng subscription upstream.
+
+<MarbleDiagram
+  title="every(x => x % 2 === 0)"
+  rows={[
+    { label: 'source', marble: '-a-b-c-d-|', kind: 'source' },
+    { label: 'sub', marble: '^----!', kind: 'subscription' },
+    { label: 'output', marble: '-----(f|)', kind: 'output' },
+  ]}
+  values={{ a: '2', b: '4', c: '5', d: '6', f: 'false' }}
+  caption="c = 5 ở frame 5 làm predicate sai; output không chờ source complete ở frame 9."
+/>
+
+Nếu tất cả giá trị đều đạt, kết luận chỉ xuất hiện tại frame complete. Trong hình tiếp theo, không có giá trị mới sau frame `3`, nhưng `every` vẫn chờ đến frame `7`.
+
+<MarbleDiagram
+  title="every(x => x % 2 === 0)"
+  rows={[
+    { label: 'source', marble: '-a-b---|', kind: 'source' },
+    { label: 'output', marble: '-------(t|)', kind: 'output' },
+  ]}
+  values={{ a: '2', b: '4', t: 'true' }}
+  caption="Không có phản ví dụ chưa đủ; source complete ở frame 7 mới xác nhận tất cả đều đạt."
+/>
+
+Vì vậy, `every` hợp với batch hữu hạn. Nếu chỉ muốn UI hiển thị “giá trị hiện tại có hợp lệ không”, mình dùng `map` chứ không dùng `every` trên event stream sống lâu.
+
+### Stream rỗng vẫn trả true
+
+```ts
+import { EMPTY, every } from 'rxjs';
+
+EMPTY.pipe(every(() => false)).subscribe(console.log);
+// true; predicate không được gọi
+```
+
+Quy tắc này giống `[].every(...)`: không có phần tử nào vi phạm. Nhưng “mọi phần tử đều hợp lệ” không đồng nghĩa “batch có ít nhất một phần tử”.
+
+<Callout type="warn" title="Đừng dùng every để kiểm tra batch không rỗng">
+  `defaultIfEmpty(false)` đặt sau `every(...)` không sửa được trường hợp này: `every` đã phát `true`, nên downstream không rỗng. Nếu nghiệp vụ yêu cầu vừa có dữ liệu vừa hợp lệ, hãy theo dõi thêm số phần tử trong cùng một lượt duyệt, như ví dụ batch ở cuối bài.
+</Callout>
+
+## find và findIndex: tìm lần khớp đầu tiên
+
+### Giá trị tìm được và vị trí trong stream
+
+`find(predicate)` phát giá trị đầu tiên làm predicate trả `true`, rồi complete. `findIndex(predicate)` làm tương tự nhưng phát **vị trí emission**, không phải giá trị hay ID nghiệp vụ.
+
+```ts
+import { find, findIndex, from } from 'rxjs';
+
+const products = [
+  { id: 'p-20', available: false },
+  { id: 'p-80', available: true },
+  { id: 'p-99', available: true },
+];
+
+from(products).pipe(
+  find((product) => product.available),
+).subscribe(console.log);
+// { id: 'p-80', available: true }
+
+from(products).pipe(
+  findIndex((product) => product.available),
+).subscribe(console.log);
+// 1, không phải 'p-80'
+```
+
+Đọc frame `3` trong hình: `b` là giá trị khớp đầu tiên, nên `find` không nghe tiếp `c`. `findIndex` trên cùng source cũng kết thúc tại frame này nhưng trả `1`.
+
+<MarbleDiagram
+  title="find(product => product.available)"
+  rows={[
+    { label: 'source', marble: '-a-b-c-|', kind: 'source' },
+    { label: 'sub', marble: '^--!', kind: 'subscription' },
+    { label: 'output', marble: '---(b|)', kind: 'output' },
+  ]}
+  values={{ a: 'p-20: unavailable', b: 'p-80: available', c: 'p-99: available' }}
+  caption="b khớp ở frame 3; output phát b và complete ngay, subscription đóng cùng frame."
+/>
+
+Index được tính trên stream đi **vào operator**. Nếu bạn `filter` trước `findIndex`, các emission đã bị loại không còn được đếm. Với hot source, index cũng không phải số thứ tự toàn bộ event từ khi producer được tạo; nó bắt đầu từ những emission subscription này nhận được.
+
+<Callout type="warn" title="Đừng kiểm tra index bằng truthiness">
+  `0` là vị trí hợp lệ nhưng falsy; `-1` là không tìm thấy nhưng truthy. Kiểm tra `index !== -1` hoặc `index >= 0`, không dùng `if (index)`.
+</Callout>
+
+### Không tìm thấy khác với không có emission
+
+Khi source complete mà không có match, `find` vẫn phát **một emission `undefined`**; `findIndex` vẫn phát **một emission `-1`**.
+
+```ts
+import { defaultIfEmpty, find, findIndex, map, of } from 'rxjs';
+
+of(1, 3).pipe(find((value) => value % 2 === 0))
+  .subscribe(console.log); // undefined
+
+of(1, 3).pipe(findIndex((value) => value % 2 === 0))
+  .subscribe(console.log); // -1
+
+of(1, 3).pipe(
+  find((value) => value % 2 === 0),
+  defaultIfEmpty(0),
+).subscribe(console.log); // undefined, không phải 0
+
+of(1, 3).pipe(
+  find((value) => value % 2 === 0),
+  map((value) => value ?? 0),
+).subscribe(console.log); // 0
+```
+
+`defaultIfEmpty` đếm emission, không xét emission đó có phải `undefined` hay không. Nếu `undefined` cũng là một giá trị hợp lệ trong source và bạn cần phân biệt “tìm thấy undefined” với “không tìm thấy”, hãy dùng kết quả có tag hoặc chuyển sang `filter` → `take(1)` → `defaultIfEmpty` với một sentinel không trùng miền dữ liệu.
+
+### So sánh với filter và first
+
+Chọn theo contract của trường hợp không có match, không chỉ theo happy path.
+
+| Pipeline | Khi có match | Khi source complete mà không có match |
+| --- | --- | --- |
+| `filter(predicate)` | Phát mọi match, không tự dừng ở match đầu | Complete, không phát gì |
+| `filter(predicate), take(1)` | Phát match đầu rồi complete | Complete, không phát gì |
+| `find(predicate)` | Phát match đầu rồi complete | Phát `undefined` rồi complete |
+| `first(predicate)` | Phát match đầu rồi complete | Báo `EmptyError` |
+| `first(predicate, fallback)` | Phát match đầu rồi complete | Phát fallback rồi complete |
+
+Mình dùng `find` khi “không tìm thấy” là kết quả bình thường mà caller cần xử lý. Dùng `first` không có fallback khi thiếu match là lỗi contract. Dùng `filter` và `take(1)` khi muốn downstream rỗng nếu không có match, chẳng hạn để `defaultIfEmpty` xử lý tiếp.
+
+## isEmpty: stream có phát giá trị nào không
+
+`isEmpty()` không nhận predicate. Nó phát `false` và complete ngay khi nhận emission đầu tiên; nếu source complete trước khi có emission, nó phát `true`.
+
+```ts
+import { EMPTY, isEmpty, of } from 'rxjs';
+
+EMPTY.pipe(isEmpty()).subscribe(console.log); // true
+of(0, 1).pipe(isEmpty()).subscribe(console.log); // false
+of(undefined).pipe(isEmpty()).subscribe(console.log); // false
+```
+
+Đọc frame `2` trong hình: chỉ cần nhận `a` là đủ để kết luận “không rỗng”. Không cần chờ `b` hoặc complete.
+
+<MarbleDiagram
+  title="isEmpty()"
+  rows={[
+    { label: 'source', marble: '--a--b--|', kind: 'source' },
+    { label: 'sub', marble: '^-!', kind: 'subscription' },
+    { label: 'output', marble: '--(f|)', kind: 'output' },
+  ]}
+  values={{ a: 'emission đầu', b: 'emission sau', f: 'false' }}
+  caption="Emission đầu ở frame 2 khiến isEmpty phát false và đóng subscription ngay."
+/>
+
+Nếu source là `----|`, output tương ứng là `----(t|)`: phải chờ frame `4` mới biết nó rỗng. Khoảng im lặng trước đó chưa phải bằng chứng.
+
+### Array rỗng không phải stream rỗng
+
+```ts
+import { from, isEmpty, map, of } from 'rxjs';
+
+of([]).pipe(isEmpty()).subscribe(console.log); // false
+from([]).pipe(isEmpty()).subscribe(console.log); // true
+
+of([]).pipe(
+  map((items) => items.length === 0),
+).subscribe(console.log); // true
+```
+
+Một HTTP request trả `[]` thường vẫn phát **một response chứa array**. `isEmpty()` sẽ trả `false`, vì nó kiểm tra Observable, không kiểm tra độ dài collection. Với response kiểu `Observable<Product[]>`, dùng `map(products => products.length === 0)`.
+
+### Kiểm tra có ít nhất một phần tử phù hợp
+
+RxJS 7.8.x không có pipeable operator `some` trong public API. Bạn có thể diễn đạt “có ít nhất một match” bằng cách lọc match, kiểm tra rỗng, rồi đảo boolean:
+
+```ts
+import { filter, from, isEmpty, map } from 'rxjs';
+
+from([12, 18, 25]).pipe(
+  filter((age) => age >= 18),
+  isEmpty(),
+  map((empty) => !empty),
+).subscribe(console.log);
+// true, kết luận ngay khi gặp 18
+```
+
+Không cần thêm `take(1)` ở đây vì `isEmpty` đã dừng tại emission đầu. Nếu không có match, pipeline phải chờ source complete mới trả `false`; với event stream vô hạn, nó có thể chờ mãi.
+
+## defaultIfEmpty: fallback khi complete mà chưa phát gì
+
+`defaultIfEmpty(fallback)` chuyển tiếp source bình thường. Chỉ khi source complete mà không có bất kỳ `next` nào, nó mới phát fallback rồi complete.
+
+```ts
+import { EMPTY, defaultIfEmpty, of } from 'rxjs';
+
+EMPTY.pipe(defaultIfEmpty('không có dữ liệu'))
+  .subscribe(console.log); // 'không có dữ liệu'
+
+of('a', 'b').pipe(defaultIfEmpty('không có dữ liệu'))
+  .subscribe(console.log); // 'a', 'b'
+
+of(null).pipe(defaultIfEmpty('không có dữ liệu'))
+  .subscribe(console.log); // null
+```
+
+Trong hình, source không phát gì trước khi complete ở frame `4`. Fallback xuất hiện tại chính frame đó, không xuất hiện ngay lúc subscribe.
+
+<MarbleDiagram
+  title="defaultIfEmpty('không có dữ liệu')"
+  rows={[
+    { label: 'source', marble: '----|', kind: 'source' },
+    { label: 'output', marble: '----(d|)', kind: 'output' },
+  ]}
+  values={{ d: 'không có dữ liệu' }}
+  caption="defaultIfEmpty chỉ phát fallback khi biết source đã complete mà chưa có next."
+/>
+
+### Fallback phụ thuộc vị trí trong pipeline
+
+“Rỗng” là trạng thái của stream **ngay trước operator**, không nhất thiết là của source ban đầu.
+
+```ts
+import { defaultIfEmpty, filter, of, take } from 'rxjs';
+
+of(1, 3, 5).pipe(
+  filter((value) => value % 2 === 0),
+  take(1),
+  defaultIfEmpty(0),
+).subscribe(console.log);
+// 0: source có dữ liệu, nhưng stream sau filter không có match
+
+of(1, 3, 5).pipe(
+  defaultIfEmpty(0),
+  filter((value) => value % 2 === 0),
+).subscribe(console.log);
+// Không có next: defaultIfEmpty đã thấy 1, 3, 5 nên không phát 0
+```
+
+Mình đặt fallback sau bước lọc nếu nghiệp vụ là “không có kết quả phù hợp”. Đặt trước lọc chỉ khi nghiệp vụ thật sự là “source gốc không có dữ liệu”.
+
+### Phân biệt fallback, giá trị ban đầu và lỗi
+
+| Nhu cầu | API phù hợp | Điều kiện kích hoạt |
+| --- | --- | --- |
+| Giá trị ban đầu trước dữ liệu thật | `startWith(value)` | Lúc subscribe, trước các emission source |
+| Giá trị thay thế cho stream rỗng | `defaultIfEmpty(value)` | Complete mà chưa có `next` |
+| Thay `null` hoặc `undefined` trong dữ liệu | `map(value => value ?? fallback)` | Mỗi emission nullish |
+| Source rỗng là lỗi nghiệp vụ | `throwIfEmpty(() => new Error(...))` | Complete mà chưa có `next` |
+| Khôi phục sau lỗi | `catchError(error => replacement$)` | `error` |
+| Không được chờ vô hạn | `timeout(...)` hoặc cửa sổ `takeUntil(...)` | Deadline theo chính sách đã chọn |
+
+`defaultIfEmpty` nhận **giá trị**, không nhận factory hay source thay thế. `defaultIfEmpty(loadData$)` sẽ phát chính đối tượng Observable, không subscribe vào nó. Nếu cần chọn một source khác, hãy thiết kế việc chọn source bằng `defer`, `iif` hoặc một bước flattening phù hợp.
+
+<Callout type="warn" title="Fallback rỗng không phải fallback lỗi">
+  `throwError(() => new Error('network')).pipe(defaultIfEmpty('fallback'))` vẫn error. Tương tự, `NEVER.pipe(defaultIfEmpty('fallback'))` không phát gì và không complete. Muốn đổi lỗi thành dữ liệu hay giới hạn chờ, cần khai báo chính sách đó riêng.
+</Callout>
+
+## iif và defer: chọn source lúc subscribe
+
+`iif(condition, trueResult, falseResult)` tạo một Observable mới. Tại **mỗi lần subscribe**, nó gọi `condition()` và subscribe đúng một nhánh. Trong RxJS 7.8.x, truyền cả hai nhánh rõ ràng; nếu không muốn phát gì ở nhánh false, dùng `EMPTY`.
+
+```ts
+import { EMPTY, iif, of } from 'rxjs';
+
+let allowed = false;
+
+const result$ = iif(
+  () => allowed,
+  of('được phép'),
+  EMPTY,
+);
+
+result$.subscribe({
+  next: console.log,
+  complete: () => console.log('done'),
+});
+// done
+
+allowed = true;
+result$.subscribe(console.log);
+// 'được phép'
+```
+
+Điều kiện không được kiểm tra một lần lúc khai báo `result$`, nhưng cũng không được kiểm tra liên tục. Nếu `allowed` đổi sau khi đã subscribe, `iif` không tự chuyển nhánh của subscription đang chạy.
+
+### Chỉ subscribe một nhánh chưa có nghĩa chỉ chạy một tác vụ
+
+JavaScript đánh giá arguments trước khi gọi hàm. Hai Promise dưới đây đều được tạo ngay, dù sau đó `iif` chỉ subscribe một nhánh:
+
+```ts
+import { from, iif } from 'rxjs';
+
+const usePrimary = true;
+
+// Không lazy: cả hai fetch đã chạy khi khai báo result$.
+const result$ = iif(
+  () => usePrimary,
+  from(fetch('/api/primary')),
+  from(fetch('/api/backup')),
+);
+```
+
+Đặt tác vụ có side effect trong `defer` để chỉ khởi động khi nhánh đó được subscribe:
+
+```ts
+import { defer, iif } from 'rxjs';
+
+let usePrimary = true;
+
+const result$ = iif(
+  () => usePrimary,
+  defer(() => fetch('/api/primary')),
+  defer(() => fetch('/api/backup')),
+);
+
+// Tương đương, và thường dễ đọc hơn khi logic chọn source phức tạp:
+const simpler$ = defer(() =>
+  fetch(usePrimary ? '/api/primary' : '/api/backup'),
+);
+```
+
+`defer` nhận factory trả `ObservableInput`, nên Promise từ `fetch` dùng được trực tiếp. Ví dụ này chỉ minh họa lúc request bắt đầu: cần kiểm tra `response.ok` và parse body nếu muốn dữ liệu nghiệp vụ; unsubscribe khỏi Promise wrapper không tự abort request mạng.
+
+Mình chọn `iif` khi có đúng hai source đã được đặt tên và điều kiện ngắn. Nếu phải chọn nhiều nhánh hoặc tạo source theo tham số, `defer(() => ...)` với `if`/`switch` thông thường dễ đọc hơn.
+
+### Rẽ nhánh theo từng emission
+
+Nếu mỗi action có điều kiện riêng, hãy rẽ nhánh bên trong operator flattening. Ví dụ độc lập dưới đây chọn chế độ preview cho từng action:
+
+```ts
+import { from, of, switchMap } from 'rxjs';
+
+type Action = { id: number; preview: boolean };
+
+const actions$ = from<Action[]>([
+  { id: 1, preview: true },
+  { id: 2, preview: false },
+]);
+
+const result$ = actions$.pipe(
+  switchMap((action) =>
+    action.preview
+      ? of({ id: action.id, mode: 'preview' })
+      : of({ id: action.id, mode: 'submit' }),
+  ),
+);
+
+result$.subscribe(console.log);
+```
+
+Ternary là đủ; không cần thêm `iif` chỉ để viết một `if`. Nếu thay `of` bằng async work, `switchMap` ưu tiên action mới và unsubscribe inner cũ. Với thao tác ghi cần xử lý đủ từng action, cân nhắc `concatMap`; chính sách concurrency/cancellation là quyết định riêng, không phải tác dụng của rẽ nhánh.
+
+## Stream sống lâu, lỗi và cancellation
+
+Những operator này kết luận trên các emission **subscription đã quan sát**, không đọc lại lịch sử của hot source và không dự đoán tương lai. Với source sống lâu, trước hết hãy xác định phạm vi cần kiểm tra: một batch, một cửa sổ thời gian, hay một phiên làm việc.
+
+Ví dụ giả định “có click trong 5 giây kể từ lúc subscribe không?” cần biến event stream thành một cửa sổ hữu hạn:
+
+```ts
+import { fromEvent, isEmpty, map, takeUntil, timer } from 'rxjs';
+
+const button = document.querySelector<HTMLButtonElement>('#confirm');
+if (!button) throw new Error('Không tìm thấy #confirm');
+
+const subscription = fromEvent(button, 'click').pipe(
+  takeUntil(timer(5_000)),
+  isEmpty(),
+  map((empty) => !empty),
+).subscribe((clicked) => console.log({ clicked }));
+
+// Khi owner bị hủy, gọi subscription.unsubscribe().
+```
+
+Có click thì trả `true` ngay; không có click thì trả `false` khi timer phát và `takeUntil` complete stream. Đây là kết luận về **cửa sổ 5 giây**, không phải về toàn bộ vòng đời của button. `takeUntil` dừng khi notifier phát `next`; notifier chỉ complete mà không phát thì không dừng source.
+
+| Tình huống | Hành vi |
+| --- | --- |
+| Source không complete, mọi giá trị đều đạt `every` | Không phát `true`; một giá trị sai vẫn cho phép phát `false` sớm |
+| Source không complete, `find`/`findIndex` chưa thấy match | Tiếp tục chờ; không tự phát `undefined`/`-1` |
+| Source không phát và không complete, như `NEVER` | `isEmpty` không phát `true`; `defaultIfEmpty` không phát fallback |
+| Source error trước khi operator kết luận | Output error, không tự đổi thành kết quả “rỗng” hoặc “không tìm thấy” |
+| Predicate ném exception | Output error; predicate phải trả boolean đồng bộ, không phải Promise |
+| Consumer gọi `unsubscribe()` | Không phải `complete`; không kích hoạt kết quả cuối hoặc fallback |
+| `takeUntil` đặt trước operator và notifier phát | Operator nhìn thấy complete của stream đã cắt ngắn và có thể kết luận trên phần đã quan sát |
+
+<Callout type="warn" title="Đừng biến hủy màn hình thành kết quả nghiệp vụ">
+  `source$.pipe(takeUntil(destroy$), every(isValid))` có thể phát `true` khi màn hình bị hủy, dù source chưa chạy xong. Đây là complete của stream đã cắt ngắn. Nếu destroy chỉ có nghĩa là ngừng nghe kết quả, đặt lifecycle boundary sau phép tính, chẳng hạn `source$.pipe(every(isValid), takeUntil(destroy$))`, hoặc unsubscribe ở owner. Cửa sổ quan sát có chủ đích và cancellation không phải cùng một contract.
+</Callout>
+
+Short-circuit đóng subscription upstream của pipeline đó. Nó không nhất thiết dừng producer đang được subscriber khác dùng chung, cũng không thể hủy tác vụ mà source không hỗ trợ teardown. Đừng suy ra “request mạng đã bị abort” chỉ từ việc `find` hay `isEmpty` complete sớm.
+
+## Ví dụ hoàn chỉnh: kiểm tra một batch
+
+Giả sử một batch import phải có ít nhất một dòng, và mọi dòng đều có số lượng dương, hữu hạn. Dùng `every` riêng sẽ chấp nhận batch rỗng; subscribe hai lần để tính `isEmpty` và `every` riêng có thể chạy source hai lần nếu đó là cold source có side effect.
+
+Mình chọn `reduce` để lấy cả số dòng và trạng thái hợp lệ trong **một lượt duyệt**, dùng bộ nhớ trạng thái cố định thay vì giữ toàn bộ batch trong array.
+
+```ts
+import { from, map, reduce, type Observable } from 'rxjs';
+
+type Row = { sku: string; quantity: number };
+type BatchStats = { count: number; allValid: boolean };
+type BatchResult =
+  | { status: 'empty'; count: number }
+  | { status: 'invalid'; count: number }
+  | { status: 'valid'; count: number };
+
+function validateBatch(rows$: Observable<Row>): Observable<BatchResult> {
+  return rows$.pipe(
+    reduce<Row, BatchStats>(
+      (stats, row) => ({
+        count: stats.count + 1,
+        allValid:
+          stats.allValid &&
+          row.sku.trim().length > 0 &&
+          Number.isFinite(row.quantity) &&
+          row.quantity > 0,
+      }),
+      { count: 0, allValid: true },
+    ),
+    map((stats): BatchResult => {
+      if (stats.count === 0) {
+        return { status: 'empty', count: 0 };
+      }
+      return {
+        status: stats.allValid ? 'valid' : 'invalid',
+        count: stats.count,
+      };
+    }),
+  );
+}
+
+validateBatch(from<Row[]>([])).subscribe(console.log);
+// { status: 'empty', count: 0 }
+
+validateBatch(from([
+  { sku: 'A', quantity: 2 },
+  { sku: 'B', quantity: 0 },
+])).subscribe(console.log);
+// { status: 'invalid', count: 2 }
+
+validateBatch(from([
+  { sku: 'A', quantity: 2 },
+])).subscribe(console.log);
+// { status: 'valid', count: 1 }
+```
+
+Có seed nên `reduce` vẫn phát trạng thái ban đầu khi source rỗng. Nó chờ complete để đếm đủ dòng, kể cả khi đã gặp dòng sai. Đổi lại, nếu yêu cầu chỉ là “mọi dòng có hợp lệ không?” và batch rỗng được phép, `every` ngắn hơn và dừng sớm khi gặp lỗi dữ liệu.
+
+Lỗi đọc batch vẫn đi qua error channel, không bị gộp vào `status: 'invalid'`. Trước khi dùng kết quả để submit, phải phân biệt lỗi dữ liệu, batch rỗng và lỗi hạ tầng; đây là ba quyết định khác nhau.
+
+## Kiểm chứng bằng TestScheduler
+
+Test không chỉ cần kiểm tra giá trị mà còn cần kiểm tra **thời điểm kết luận và thời điểm unsubscribe**. Ví dụ dưới dùng `node:assert/strict` trong môi trường Node đã có RxJS; không cần đưa nó vào bundle UI.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { defaultIfEmpty, every, find, findIndex, isEmpty } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+// Mỗi case có scheduler riêng, tránh mang frame của case trước sang.
+function run(test: Parameters<TestScheduler['run']>[0]): void {
+  const scheduler = new TestScheduler((actual, expected) => {
+    deepStrictEqual(actual, expected);
+  });
+  scheduler.run(test);
+}
+
+// every dừng tại phản ví dụ, tương ứng hình ở trên.
+run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('-a-b-c-d-|', { a: 2, b: 4, c: 5, d: 6 });
+  expectObservable(source.pipe(every((x) => x % 2 === 0)))
+    .toBe('-----(f|)', { f: false });
+  expectSubscriptions(source.subscriptions).toBe('^----!');
+});
+
+// Không có phản ví dụ thì phải chờ complete.
+run(({ cold, expectObservable }) => {
+  const source = cold('-a-b---|', { a: 2, b: 4 });
+  expectObservable(source.pipe(every((x) => x % 2 === 0)))
+    .toBe('-------(t|)', { t: true });
+});
+
+// find trả match đầu; findIndex trả vị trí 1, không phải giá trị 4.
+run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('-a-b-c-|', { a: 1, b: 4, c: 6 });
+  expectObservable(source.pipe(find((x) => x % 2 === 0)))
+    .toBe('---(b|)', { b: 4 });
+  expectObservable(source.pipe(findIndex((x) => x % 2 === 0)))
+    .toBe('---(i|)', { i: 1 });
+  expectSubscriptions(source.subscriptions).toBe(['^--!', '^--!']);
+});
+
+// Không match vẫn có emission undefined/-1 tại frame complete.
+run(({ cold, expectObservable }) => {
+  const source = cold('-a-b-|', { a: 1, b: 3 });
+  expectObservable(source.pipe(find((x) => x % 2 === 0)))
+    .toBe('-----(u|)', { u: undefined });
+  expectObservable(source.pipe(findIndex((x) => x % 2 === 0)))
+    .toBe('-----(n|)', { n: -1 });
+});
+
+// isEmpty dừng ngay tại emission đầu.
+run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('--a--b--|');
+  expectObservable(source.pipe(isEmpty()))
+    .toBe('--(f|)', { f: false });
+  expectSubscriptions(source.subscriptions).toBe('^-!');
+});
+
+// Cùng source rỗng: ba contract khác nhau.
+run(({ cold, expectObservable }) => {
+  const source = cold<number>('----|');
+  expectObservable(source.pipe(every((x) => x > 0)))
+    .toBe('----(t|)', { t: true });
+  expectObservable(source.pipe(isEmpty()))
+    .toBe('----(t|)', { t: true });
+  expectObservable(source.pipe(defaultIfEmpty(0)))
+    .toBe('----(d|)', { d: 0 });
+});
+
+// Error không kích hoạt fallback.
+run(({ cold, expectObservable }) => {
+  const error = new Error('network');
+  const source = cold<number>('----#', {}, error);
+  expectObservable(source.pipe(defaultIfEmpty(0)))
+    .toBe('----#', {}, error);
+});
+
+// Unsubscribe khỏi source im lặng không kích hoạt fallback.
+run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold<number>('----------');
+  expectObservable(source.pipe(defaultIfEmpty(0)), '^----!')
+    .toBe('');
+  expectSubscriptions(source.subscriptions).toBe('^----!');
+});
+```
+
+Các test dùng cold source để mỗi subscription có lịch phát riêng. Hai subscription trong test `find`/`findIndex` là có chủ đích để so API, không phải khuyến nghị subscribe hai lần vào request thực tế. Nếu sửa timeline, hãy cập nhật cả expected output lẫn expected subscriptions.
+
+## Checklist và bài tập
+
+Trước khi chọn operator, kiểm tra những câu này:
+
+- [ ] Tôi cần một boolean, một giá trị, một index hay một stream tiếp tục phát?
+- [ ] “Rỗng” là không có emission hay một emission chứa collection rỗng?
+- [ ] Source có complete không, và ai quyết định ranh giới quan sát?
+- [ ] Batch rỗng có được xem là hợp lệ không?
+- [ ] Không tìm thấy là `undefined`, `-1`, không có emission, fallback hay error?
+- [ ] Nếu operator dừng sớm, source có hỗ trợ teardown tác vụ bên ngoài không?
+- [ ] Tôi có đang vô tình chạy cold source hai lần để tính hai kết luận không?
+- [ ] Condition/predicate có đồng bộ và không khởi động side effect ngoài ý muốn không?
+- [ ] Cancellation có đang bị biến thành kết quả nghiệp vụ bởi vị trí `takeUntil` không?
+
+Thử dự đoán rồi kiểm tra ba thay đổi trong test:
+
+1. Đổi `c: 5` thành `c: 8` ở test `every`: output và subscription kết thúc ở frame nào?
+2. Thêm `defaultIfEmpty(0)` sau `find` trong test không match: expected output có đổi không? Sau đó thay `find` bằng `filter` và `take(1)` để đối chiếu.
+3. Dùng `of([])` và `from([])` với `isEmpty`: vì sao một bên `false`, một bên `true`?
+
+Ghi lại riêng giá trị kết quả, frame kết luận và nguyên nhân kết thúc. Nếu chỉ dự đoán được giá trị mà chưa giải thích được lúc nào phát, hãy quay lại ranh giới complete trước khi ghép pipeline dài hơn.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Filtering operators" href="/docs/operators/filtering-operators" description="Giữ, bỏ qua và giới hạn emission thay vì kết luận về cả stream." />
+  <Card title="Creation operators" href="/docs/operators/creation-operators" description="Tạo source lazy với defer và hiểu lifecycle của EMPTY, NEVER, Promise." />
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Phân biệt complete, unsubscribe và khả năng hủy producer thật sự." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Kiểm tra output và subscription bằng virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — Operators guide](https://rxjs.dev/guide/operators) — phân nhóm operator và phân biệt creation với pipeable operator.
+- [RxJS 7.8.2 — `every` source](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/every.ts) — short-circuit khi predicate sai và kết quả `true` lúc complete.
+- [RxJS 7.8.2 — `find` source](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/find.ts) và [`findIndex` source](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/findIndex.ts) — match đầu tiên, index từ `0` và kết quả khi không tìm thấy.
+- [RxJS 7.8.2 — `isEmpty` source](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/isEmpty.ts) và [`defaultIfEmpty` source](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/defaultIfEmpty.ts) — phân biệt không có `next` với emission chứa giá trị rỗng.
+- [RxJS 7.8.2 — `iif` source](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/iif.ts) — chọn một trong hai `ObservableInput` bằng `defer` tại thời điểm subscribe.

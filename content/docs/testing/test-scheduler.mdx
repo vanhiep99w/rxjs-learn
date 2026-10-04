@@ -3,8 +3,442 @@ title: TestScheduler
 description: Chạy assertion với virtual time.
 ---
 
-Trang này sẽ trình bày **TestScheduler** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn muốn kiểm tra rằng input mới hủy request cũ, hoặc một giá trị chỉ được phát sau đúng khoảng debounce. Nếu test phải chờ timer thật, nó vừa chậm vừa dễ lệch vì tải của máy chạy CI. `TestScheduler` cho bạn tạo source giả, điều khiển thời gian và đối chiếu cả notification lẫn subscription mà không ngủ thật.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Bài này dùng API `TestScheduler.run()` của RxJS 7.8.2. Bạn nên biết `Observable`, `pipe()` và `unsubscribe()`; các ví dụ sẽ giải thích đủ marble syntax để bắt đầu. Code dành cho môi trường test đã có RxJS, không yêu cầu thêm dependency vào site tài liệu này.
 </Callout>
+
+## Mục lục
+
+- [TestScheduler kiểm tra điều gì](#testscheduler-kiểm-tra-điều-gì)
+- [Test đầu tiên với run](#test-đầu-tiên-với-run)
+- [Vòng đời của run](#vòng-đời-của-run)
+- [Các helper cần dùng](#các-helper-cần-dùng)
+- [Đọc frame và khoảng thời gian](#đọc-frame-và-khoảng-thời-gian)
+  - [Ký hiệu notification và subscription](#ký-hiệu-notification-và-subscription)
+  - [Time progression và lỗi lệch một frame](#time-progression-và-lỗi-lệch-một-frame)
+- [Chọn cold hay hot](#chọn-cold-hay-hot)
+  - [Cold bắt đầu lại theo mỗi subscription](#cold-bắt-đầu-lại-theo-mỗi-subscription)
+  - [Hot có timeline chung](#hot-có-timeline-chung)
+- [Kiểm tra cancellation với switchMap](#kiểm-tra-cancellation-với-switchmap)
+- [Kiểm tra error và recovery](#kiểm-tra-error-và-recovery)
+- [Giới hạn subscription cho stream vô hạn](#giới-hạn-subscription-cho-stream-vô-hạn)
+- [Assertion side effect sau flush](#assertion-side-effect-sau-flush)
+- [Ranh giới của virtual time](#ranh-giới-của-virtual-time)
+- [Chẩn đoán test sai](#chẩn-đoán-test-sai)
+- [Checklist trước khi thêm test](#checklist-trước-khi-thêm-test)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## TestScheduler kiểm tra điều gì
+
+Một assertion thông thường có thể xác nhận bạn nhận được `[1, 2]`. Nhưng với RxJS, từng ấy chưa đủ: hai giá trị đến ở thời điểm nào, stream complete hay error, và upstream có bị hủy đúng lúc không?
+
+`TestScheduler` kế thừa `VirtualTimeScheduler`, rồi thêm source giả và công cụ ghi notification theo frame. Có hai contract nên kiểm tra riêng:
+
+| Contract | Helper | Ví dụ câu hỏi |
+| --- | --- | --- |
+| Notification downstream | `expectObservable()` | Giá trị nào đến ở frame nào? Khi nào complete hoặc error? |
+| Lifecycle upstream | `expectSubscriptions()` | Source bắt đầu lúc nào? Subscription đóng lúc nào? Có nhiều execution không? |
+
+Mình chọn `run()` mặc định cho unit test pipeline RxJS. Clock ảo giống một lịch hẹn: scheduler nhảy đến công việc tiếp theo thay vì đợi từng millisecond. Tuy nhiên, nó chỉ điều khiển công việc thuộc cơ chế scheduling được virtualize; nó không tua nhanh HTTP thật hay toàn bộ browser event loop.
+
+## Test đầu tiên với run
+
+Ví dụ này dùng `node:test` và `node:assert/strict` để không phụ thuộc assertion API của Jest hay Vitest. Đặt code trong file test TypeScript và chạy bằng runner TypeScript mà dự án của bạn đang dùng. Các ví dụ tiếp theo dùng cùng kiểu assertion, nhưng bỏ lớp `it()` để tập trung vào pipeline.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { it } from 'node:test';
+import { map } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+it('nhân đôi giá trị mà không đổi timeline', () => {
+  const scheduler = new TestScheduler((actual, expected) => {
+    deepStrictEqual(actual, expected);
+  });
+
+  scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+    const source$ = cold('--a-b--|', { a: 1, b: 2 });
+    const result$ = source$.pipe(map((value) => value * 2));
+
+    expectObservable(result$).toBe('--x-y--|', { x: 2, y: 4 });
+    expectSubscriptions(source$.subscriptions).toBe('^------!');
+  });
+});
+```
+
+Đọc theo cột dọc để đối chiếu thời điểm source và output. `map` đổi giá trị, không dời thời điểm phát:
+
+<MarbleDiagram
+  title="map(value => value * 2)"
+  frameLabel="1 khoảng = 1 ms ảo"
+  rows={[
+    { label: 'source', marble: '--a-b--|', kind: 'source' },
+    { label: 'subscription', marble: '^------!', kind: 'subscription' },
+    { label: 'output', marble: '--x-y--|', kind: 'output' },
+  ]}
+  values={{ a: '1', b: '2', x: '2 sau map', y: '4 sau map' }}
+  caption="Source phát ở frame 2 và 4; output giữ các mốc đó. Cả hai complete ở frame 7, khi subscription đóng."
+/>
+
+Ở frame `2`, `a` tương ứng số `1`, nên output là `x` tương ứng số `2`. Frame `4` cũng vậy. `|` ở frame `7` là completion notification; `!` ở frame `7` trong hàng subscription ghi nhận subscription đã đóng do completion, không phải một error.
+
+<Callout type="warn" title="Callback phải thực sự assert">
+  Constructor nhận hàm so sánh sâu, không phải test framework. Nếu callback chỉ `console.log(actual, expected)` hoặc trả về `false` mà không ném lỗi, test sai vẫn có thể pass. Với Jest/Vitest, dùng `expect(actual).toEqual(expected)`; với Node, dùng `deepStrictEqual` như trên.
+</Callout>
+
+## Vòng đời của run
+
+Điểm dễ nhầm nhất là `expectObservable()` không thu kết quả ngay tại dòng gọi. Nó đăng ký một subscription để scheduler thực thi khi flush.
+
+```text
+Tạo TestScheduler mới
+  → run(): thiết lập clock và provider ảo
+  → callback: tạo source, pipeline, đăng ký expectation
+  → callback return: tự flush công việc và chạy assertion
+  → khôi phục cấu hình/provider, trả về cho caller
+```
+
+Trong run mode của RxJS 7.8.2:
+
+- Một frame bằng **một millisecond ảo**; khoảng trắng trong marble string không làm thời gian tiến lên.
+- Công việc timer qua provider của RxJS được điều khiển bằng scheduler. Các API như `timer`, `interval`, `delay` và `debounceTime` dùng scheduler mặc định vẫn có thể được test mà không truyền `scheduler` vào từng lời gọi.
+- `maxFrames` được đặt thành `Infinity` trong phạm vi `run()`. Test phải có điểm dừng nếu pipeline tiếp tục tự lên lịch.
+- Callback chạy đồng bộ. Sau khi callback return, `run()` tự flush rồi khôi phục các thiết lập tạm thời.
+
+Tạo `TestScheduler` mới cho từng test, như trong ví dụ đầu. `run()` không phải nút reset toàn bộ clock và state của một instance đã dùng.
+
+<Callout type="warn" title="Đừng trộn run mode và cách dùng legacy">
+  Ngoài `run()`, RxJS 7.8.2 mặc định có `frameTimeFactor = 10`, `maxFrames = 750` và cần quản lý flush cùng scheduler tường minh. Sao chép expected từ ví dụ legacy vào `run()` có thể đổi đơn vị thời gian. Trong code mới, giữ mọi helper và expectation của test bên trong một callback `run()` đồng bộ.
+</Callout>
+
+## Các helper cần dùng
+
+Destructure helper từ tham số callback; không cần gọi trực tiếp các phương thức `createColdObservable()` hay `createHotObservable()` trong cách dùng mới.
+
+| Helper | Vai trò | Lưu ý |
+| --- | --- | --- |
+| `cold(marbles, values?, error?)` | Tạo source có timeline tương đối với mỗi subscription | Không dùng `^` hoặc `!` trong notification string |
+| `hot(marbles, values?, error?)` | Tạo source có timeline chung | `^` trong source string định vị frame `0`, không tạo subscription thật |
+| `expectObservable(result$, subscriptionMarbles?)` | Ghi notification và so bằng `.toBe(marbles, values?, error?)` | Mặc định subscribe ở frame `0`; có thể chỉ định thời điểm subscribe/unsubscribe |
+| `expectSubscriptions(source$.subscriptions)` | So log subscription bằng `.toBe(...)` | Nhận một string hoặc array string khi source được subscribe nhiều lần |
+| `time(marbles)` | Lấy khoảng thời gian từ vị trí dấu `\|` | Dùng dạng `'---\|'` cho `3` ms ảo |
+| `flush()` | Thực thi công việc đã schedule và assertion timeline đang chờ | Cần khi muốn assert state ngay bên trong callback |
+| `animate(marbles)` | Chỉ định các mốc animation frame trong run mode | Dành cho test liên quan `animationFrameScheduler`/`animationFrames`; không phải timer thường |
+
+Bạn không cần dùng hết helper trong mỗi test. Với `map`, một source và output là đủ để kiểm tra phép biến đổi; với `switchMap`, thêm subscription assertion vì cancellation là một phần của contract.
+
+## Đọc frame và khoảng thời gian
+
+### Ký hiệu notification và subscription
+
+Có hai loại chuỗi khác nhau. Notification marble dành cho `cold()`, `hot()` và expected output; subscription marble dành cho cửa sổ subscribe và log lifecycle.
+
+| Ký hiệu | Ý nghĩa |
+| --- | --- |
+| `-` | Tiến một frame |
+| `a`, `b`, `x` | Phát một giá trị; tra trong `values` nếu có, nếu không dùng chính ký tự đó |
+| `\|` | Complete |
+| `#` | Error; truyền error cụ thể ở đối số tương ứng |
+| `(ab)` hoặc `(a\|)` | Các notification trong nhóm xảy ra cùng frame |
+| `^` | Subscribe trong subscription marble; trong hot source, đánh dấu gốc thời gian |
+| `!` | Subscription đóng; chỉ dùng trong subscription marble |
+
+`--a-b--|` đặt `a` ở frame `2`, `b` ở frame `4`, complete ở frame `7`. **Ký tự value cũng tiến con trỏ một frame** sau khi đặt emission, không chỉ dấu `-`.
+
+Nhóm `(ab)` phát `a` rồi `b` trong cùng frame, nhưng parser của `TestScheduler` tiến con trỏ theo độ dài cả nhóm, gồm dấu ngoặc. Vì vậy `'(ab)-c|'` đặt `a`, `b` ở frame `0`, `c` ở frame `5`, complete ở frame `6`. Nhóm là cùng thời điểm, không có nghĩa thời gian phía sau nhóm đứng yên.
+
+<Callout type="info" title="Chuỗi hiển thị và chuỗi test có parser khác nhau">
+  `MarbleDiagram` của site không hiểu token như `10ms` hoặc gốc thời gian âm của hot source. Nó có hỗ trợ nhóm, nhưng chỉ tiến một cột sau nhóm, khác parser của `TestScheduler`. Các sơ đồ trong bài dùng frame đơn giản và trục tuyệt đối; các test có nhóm/time progression được giữ trong code block để tránh lệch hình.
+</Callout>
+
+### Time progression và lỗi lệch một frame
+
+Run mode hỗ trợ token có đơn vị như `10ms`, `1s`, `2m`, nên bạn không phải viết hàng nghìn dấu `-`. Tách token khỏi value bằng khoảng trắng:
+
+```text
+10ms a 9ms b 9ms (c|)
+```
+
+Chuỗi này đặt `a` ở frame `10`, `b` ở `20`, `c` và complete ở `30`. Sau `a`, con trỏ đã ở `11`, nên cộng `9ms` mới đến `20`. Nếu viết `10ms a 10ms b`, `b` sẽ nằm ở `21`, không phải `20`.
+
+`time()` là một tiện ích khác: `time('---|')` trả về `3`, hữu ích để đặt `debounceTime(due)` cùng quy ước với expected. Trong RxJS 7.8.2, nó tính theo vị trí ký tự `|`, **không parse time-progression token**. Đừng dùng `time('10ms |')` với kỳ vọng nhận `10`; truyền số `10` trực tiếp nếu đó là duration bạn cần.
+
+## Chọn cold hay hot
+
+Chọn theo hành vi producer bạn muốn mô phỏng, không theo tên operator đang test. `cold()` hợp khi mỗi subscription bắt đầu một execution riêng, như request giả. `hot()` hợp khi sự kiện đã phát trên timeline chung, như input của người dùng; subscribe muộn thì bỏ lỡ sự kiện cũ.
+
+### Cold bắt đầu lại theo mỗi subscription
+
+Test này subscribe ở frame `4`. Source phát `a` sau hai frame tính từ subscribe, nên `a` đến ở frame tuyệt đối `6`:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source$ = cold('--a--b|');
+
+  expectObservable(source$, '----^').toBe('------a--b|');
+  expectSubscriptions(source$.subscriptions).toBe('----^-----!');
+});
+```
+
+`b` đến ở `9`, complete ở `10`. Chuỗi expected vẫn tính từ frame `0` của test, **không** tính từ thời điểm subscribe. Còn source `cold('--a--b|')` thì luôn tính tương đối với mỗi subscription.
+
+### Hot có timeline chung
+
+Giữ subscribe ở frame `4`, nhưng source hot đã phát `a` ở `0` và `b` ở `3`. Consumer không nhận hai giá trị đó:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ hot, expectObservable, expectSubscriptions }) => {
+  const source$ = hot('a--b--c--|');
+
+  expectObservable(source$, '----^').toBe('------c--|');
+  expectSubscriptions(source$.subscriptions).toBe('----^----!');
+});
+```
+
+`c` vẫn đến ở frame `6`, complete ở `9`: subscribe muộn không dời source. `hot()` không tự replay sự kiện trước subscribe; nếu muốn kiểm tra replay, phải đưa cơ chế replay thật vào pipeline.
+
+Một hot source có thể dùng `^` để đặt gốc thời gian, chẳng hạn `hot('a-^--b|')`: `a` nằm ở frame `-2`, `b` ở `3`. Dấu `^` này chỉ định tọa độ của source; thời điểm consumer subscribe vẫn do `expectObservable()` quyết định.
+
+## Kiểm tra cancellation với switchMap
+
+Giả sử mỗi input bắt đầu một request giả phát hai giá trị. Input mới phải hủy request đang chạy. Chỉ nhìn output chưa đủ: pipeline có thể ngừng chuyển giá trị xuống consumer nhưng vẫn giữ subscription cũ.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { switchMap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ hot, cold, expectObservable, expectSubscriptions }) => {
+  const input$ = hot('-a---b---|');
+  const request$ = cold('--x---y|');
+  const result$ = input$.pipe(switchMap(() => request$));
+
+  expectObservable(result$).toBe('---x---x---y|');
+  expectSubscriptions(input$.subscriptions).toBe('^--------!');
+  expectSubscriptions(request$.subscriptions).toBe([
+    '-^---!',       // A: subscribe 1, bị hủy 5.
+    '-----^------!', // B: subscribe 5, complete 12.
+  ]);
+});
+```
+
+Đọc theo trục thời gian chung: mỗi hàng inner đã được dời đến frame subscribe thật. Đây là hình diễn giải execution, không phải string để truyền thẳng vào `cold()`.
+
+<MarbleDiagram
+  title="switchMap(() => request$)"
+  frameLabel="1 khoảng = 1 ms ảo"
+  rows={[
+    { label: 'input', marble: '-a---b---|', kind: 'source' },
+    { label: 'request A', marble: '-^-x-!', kind: 'inner' },
+    { label: 'request B', marble: '-----^-x---y|', kind: 'inner' },
+    { label: 'output', marble: '---x---x---y|', kind: 'output' },
+  ]}
+  values={{ a: 'input A', b: 'input B', x: 'giá trị đầu của request', y: 'giá trị cuối của request' }}
+  caption="B đến ở frame 5 và hủy A. Input complete ở 9, nhưng output đợi B complete ở 12."
+/>
+
+Request A subscribe ở frame `1`, phát `x` ở `3`. Khi B đến ở `5`, A bị unsubscribe, nên `y` vốn dự kiến ở `7` không được phát. Request B phát `x` ở `7`, `y` ở `11`, rồi complete ở `12`.
+
+Input complete ở `9` không hủy inner cuối của `switchMap`; output đợi B kết thúc. Array subscription expected chính là bằng chứng có hai execution riêng, một bị hủy và một hoàn thành bình thường.
+
+<Callout type="warn" title="Cancellation của Observable chưa chứng minh HTTP đã abort">
+  Test này chứng minh `switchMap` unsubscribe upstream. Request giả không biết gì về network. Muốn khẳng định request thật bị abort, cần test adapter HTTP và teardown của nó ở ranh giới integration.
+</Callout>
+
+## Kiểm tra error và recovery
+
+Error là notification có thời điểm và payload, không chỉ là “test ném lỗi”. Truyền cùng error cụ thể vào source và expected để assertion không dựa vào error mặc định:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const failure = new Error('request failed');
+  const values = { a: 1 };
+  const source$ = cold('--a-#', values, failure);
+
+  expectObservable(source$).toBe('--a-#', values, failure);
+  expectSubscriptions(source$.subscriptions).toBe('^---!');
+});
+```
+
+`a` đến ở frame `2`, error ở `4`, subscription đóng ở `4`. Không thêm `|` sau `#`: error và complete đều là terminal notification, stream chỉ có một trong hai.
+
+Nếu contract là đổi error thành fallback, hãy test output sau `catchError`, không giữ `#` trong expected:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { catchError, of } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const failure = new Error('request failed');
+  const source$ = cold('--a-#', { a: 1 }, failure);
+  const result$ = source$.pipe(catchError(() => of(0)));
+
+  expectObservable(result$).toBe('--a-(z|)', { a: 1, z: 0 });
+  expectSubscriptions(source$.subscriptions).toBe('^---!');
+});
+```
+
+Fallback `of(0)` phát đồng bộ ngay lúc nhận error rồi complete, nên `z` và `|` cùng frame `4`. Source vẫn kết thúc bằng error; output kết thúc bằng completion vì đã được recover. Hai contract không mâu thuẫn nhau.
+
+## Giới hạn subscription cho stream vô hạn
+
+`interval` không tự complete. Vì `run()` flush với `maxFrames = Infinity`, đăng ký nó mà không có điểm dừng có thể khiến test chạy mãi. Dùng `take(n)` khi số lượng emission là contract; dùng subscription window khi chỉ muốn quan sát một đoạn mà không đổi pipeline.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { interval } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ expectObservable }) => {
+  const ticks$ = interval(10);
+
+  // Subscribe 0; ^ tiến một frame, cộng 24ms để unsubscribe 25.
+  expectObservable(ticks$, '^ 24ms !').toBe(
+    '10ms a 9ms b',
+    { a: 0, b: 1 },
+  );
+});
+```
+
+Consumer nhận `0` ở frame `10`, `1` ở `20`, rồi unsubscribe ở `25`, trước tick `30`. Expected không có `|`, vì **unsubscribe không tạo completion notification**.
+
+Cửa sổ này chỉ hủy subscription mà `expectObservable()` tạo. Nếu test còn gọi `subscribe()` ở nơi khác, hoặc pipeline giữ producer sống sau khi consumer rời đi, công việc đó vẫn cần teardown riêng. Đừng dùng giới hạn thời gian để che một subscription leak.
+
+## Assertion side effect sau flush
+
+Một assertion trên state bên trong callback thường chạy trước khi source phát. Gọi helper `flush()` sau khi đăng ký expectation để assertion state quan sát cùng execution với assertion timeline:
+
+```ts
+import { deepStrictEqual, strictEqual } from 'node:assert/strict';
+import { finalize, tap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions, flush }) => {
+  const seen: string[] = [];
+  let finalized = false;
+  const source$ = cold('--a--b|');
+  const result$ = source$.pipe(
+    tap((value) => seen.push(value)),
+    finalize(() => { finalized = true; }),
+  );
+
+  expectObservable(result$).toBe('--a--b|');
+  expectSubscriptions(source$.subscriptions).toBe('^-----!');
+  deepStrictEqual(seen, []);
+  strictEqual(finalized, false);
+
+  flush();
+
+  deepStrictEqual(seen, ['a', 'b']);
+  strictEqual(finalized, true);
+});
+```
+
+Sau flush, stream đã complete ở frame `6` và `finalize` đã chạy. Khi callback return, `run()` vẫn tự flush, nhưng ví dụ này không còn công việc nên không phát thêm giá trị.
+
+Đừng gọi thêm `result$.subscribe()` chỉ để side effect chạy. Mỗi lần `expectObservable()` đã tạo một subscription; với cold pipeline, subscribe thêm là thêm một execution và có thể làm request hoặc counter chạy hai lần. Cũng đừng coi helper `flush()` là “advance đến mốc bất kỳ”: nó xử lý công việc đang chờ trong giới hạn scheduler, không nhận tham số duration.
+
+## Ranh giới của virtual time
+
+`run()` điều khiển các provider mà RxJS dùng, không monkey-patch mọi API thời gian của ứng dụng. Một lời gọi trực tiếp `setTimeout`, `Date.now()` hay native Promise vẫn thuộc runtime thật. `from(Promise.resolve(...))` không trở thành source marble chỉ vì được đặt trong callback.
+
+<Callout type="warn" title="Callback run phải đồng bộ">
+  Không dùng `run(async (...) => ...)`. `run()` không await Promise được callback trả về; nó flush và khôi phục provider trước khi phần sau `await` tiếp tục. Test có thể nhìn như dùng virtual time nhưng thực tế đang trộn hai clock.
+</Callout>
+
+Cách tách mình khuyên dùng là để logic stream nhận Observable đầu vào. Unit test truyền `cold()` hoặc `hot()` vào đó để kiểm tra timing, error và cancellation. Async/integration test riêng sẽ kiểm tra Promise resolve/reject, event thật và teardown của adapter.
+
+Tương tự, thêm `observeOn(scheduler)` ở cuối không virtualize producer phía trước nó. Operator này chỉ lập lịch notification downstream; I/O và side effect upstream vẫn cần strategy test phù hợp.
+
+Với pipeline thuần RxJS, tránh bật fake timers của Jest/Vitest cùng lúc với `TestScheduler.run()` nếu không có nhu cầu cụ thể. Hai cơ chế điều khiển thời gian khiến lỗi khó chẩn đoán hơn. Khi adapter gọi timer trực tiếp, test adapter bằng fake timers hoặc runtime thật, rồi test logic RxJS bằng virtual time.
+
+## Chẩn đoán test sai
+
+Khi assertion lệch, đọc `actual` và `expected` như danh sách notification có frame, không chỉ như hai string. Phân biệt lỗi giá trị, lỗi thời điểm và lỗi lifecycle trước khi sửa expected.
+
+| Triệu chứng | Nguyên nhân thường gặp | Cách xử lý |
+| --- | --- | --- |
+| Không có notification hoặc state chưa đổi | Chưa flush; source dùng Promise/I/O ngoài clock ảo | Flush trước assertion state; thay adapter bằng source giả trong unit test |
+| Lệch một frame | Quên value hoặc `^` cũng tiến con trỏ | Tính mốc số trước, rồi viết `-`/time token |
+| Lệch sau nhóm `(ab)` | Bỏ qua độ dài cả nhóm trong parser test | Tính cả ngoặc khi xác định frame của notification tiếp theo |
+| Subscribe muộn nhưng expected vẫn có dữ liệu cũ | Dùng hot source mà nghĩ nó replay | Bỏ emission bị lỡ; test replay bằng pipeline có replay thật |
+| Test chạy mãi | Stream tiếp tục schedule, không có teardown | Thêm điểm dừng đúng contract và kiểm tra các subscription khác |
+| Output đúng nhưng request cũ vẫn sống | Chỉ assert notification, không assert cancellation | Thêm `expectSubscriptions()` cho source/inner liên quan |
+| Side effect chạy hai lần | Có cả `subscribe()` và `expectObservable()` | Giữ một execution; dùng `flush()` để quan sát state |
+| Test sau có frame không như dự đoán | Dùng lại scheduler của test trước | Tạo instance mới cho mỗi test |
+| Expected có `\|` nhưng actual không complete | Nhầm unsubscribe với completion | Bỏ completion khỏi expected; dùng `!` trong subscription string |
+| Test pass dù expected sai | Callback không ném lỗi khi khác nhau | Dùng assertion sâu thật, không chỉ log hoặc trả boolean |
+
+Một bẫy khác nằm ở object mutable: `TestScheduler` ghi nhận value theo reference, không deep-clone mỗi emission. Nếu pipeline sửa cùng một object nhiều lần, các notification cũ có thể trỏ tới state cuối. Ưu tiên tạo object/array mới cho mỗi emission, hoặc tạo snapshot rõ ràng ở ranh giới mà contract cần kiểm tra; đừng sửa expected để hợp thức hóa mutation ngoài ý muốn.
+
+Nếu hai action cùng frame, thứ tự enqueue còn có thể ảnh hưởng kết quả. Khi test một ranh giới debounce hoặc cancellation, xác định rõ input và timer nào được chạy trước thay vì nghĩ “cùng frame” là không có thứ tự.
+
+## Checklist trước khi thêm test
+
+- [ ] Tạo scheduler mới và dùng callback assertion thực sự ném lỗi.
+- [ ] Giữ callback `run()` đồng bộ; không có Promise/I/O thật được kỳ vọng chạy bằng clock ảo.
+- [ ] Chọn cold/hot theo producer, nhất là khi consumer subscribe muộn.
+- [ ] Tính frame cho value và terminal notification; kiểm tra riêng error/completion/cancellation.
+- [ ] Mỗi execution tự lên lịch đều có điểm dừng.
+- [ ] Kiểm tra subscription khi cancellation, retry hoặc multicasting là contract.
+- [ ] Assert side effect sau flush, không subscribe thêm chỉ để kích hoạt pipeline.
+- [ ] Object được emit không bị mutation làm mất snapshot cần kiểm tra.
+
+Để luyện tập, đổi ví dụ `switchMap` thành `mergeMap` và tự viết lại cả output lẫn array subscription expected trước khi chạy. Request A sẽ không bị hủy ở frame `5`; câu hỏi cần trả lời là các giá trị của A và B xen kẽ thế nào, chứ không chỉ “có thêm một `y`”. Sau đó thay request thứ hai bằng một source error để kiểm tra liệu error có đóng toàn bộ pipeline và inner đang chạy hay không.
+
+## Nguồn tham khảo
+
+- [RxJS: Testing code with marble diagrams](https://rxjs.dev/guide/testing/marble-testing) — run mode, marble syntax và subscription assertions.
+- [TestScheduler trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/testing/TestScheduler.ts) — helper, parser, provider delegation và vòng đời `run()`.
+- [ColdObservable trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/testing/ColdObservable.ts) — timeline tương đối và log subscription.
+- [HotObservable trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/testing/HotObservable.ts) — timeline chung và log subscription.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Đào sâu notation và cách biểu diễn nhiều timeline." />
+  <Card title="Virtual time" href="/docs/thoi-gian-schedulers/virtual-time" description="Hiểu clock, hàng đợi Action và giới hạn của virtual scheduler." />
+  <Card title="Unit test custom operators" href="/docs/testing/unit-test-operators" description="Áp dụng helper vào contract của operator do bạn viết." />
+  <Card title="Async tests" href="/docs/testing/async-tests" description="Kiểm tra Promise và các ranh giới ngoài clock ảo." />
+</Cards>

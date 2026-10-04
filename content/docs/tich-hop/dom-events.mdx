@@ -3,8 +3,514 @@ title: DOM events
 description: Biến sự kiện giao diện thành stream có thể kết hợp.
 ---
 
-Trang này sẽ trình bày **DOM events** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Một ô tìm kiếm cần đợi người dùng ngừng gõ, một danh sách cần bắt click ở các nút được thêm sau, còn thao tác kéo thả phải kết hợp nhiều event và dừng đúng lúc. Nếu mỗi event có một callback riêng, phần khó thường nằm ở việc phối hợp chúng và gỡ listener khi giao diện biến mất. RxJS giúp bạn mô tả các quy tắc đó thành pipeline, thay vì tự giữ timer và cờ trạng thái ở nhiều nơi.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi ví dụ">
+  Các ví dụ dùng RxJS 7 và TypeScript với DOM types, chạy trong trình duyệt qua bundler sau khi HTML tương ứng đã có. Mỗi ví dụ độc lập và trả về một hàm cleanup; hãy gọi hàm đó trước khi gỡ giao diện. Với React hoặc Next.js, setup trong effect ở phía client, không đọc `document` trong quá trình SSR.
 </Callout>
+
+## Mục lục
+
+- [Khi nào nên biến event thành stream](#khi-nào-nên-biến-event-thành-stream)
+- [Tạo stream bằng fromEvent](#tạo-stream-bằng-fromevent)
+  - [Ví dụ đếm click](#ví-dụ-đếm-click)
+  - [Listener và subscription không phải cùng một vòng đời](#listener-và-subscription-không-phải-cùng-một-vòng-đời)
+- [Đọc dữ liệu từ event đúng lúc](#đọc-dữ-liệu-từ-event-đúng-lúc)
+  - [Target và currentTarget](#target-và-currenttarget)
+  - [Listener options và preventDefault](#listener-options-và-preventdefault)
+- [Input có debounce và hỗ trợ bộ gõ](#input-có-debounce-và-hỗ-trợ-bộ-gõ)
+- [Event delegation cho danh sách động](#event-delegation-cho-danh-sách-động)
+- [Kéo thả bằng Pointer Events](#kéo-thả-bằng-pointer-events)
+- [Cleanup cho toàn bộ pipeline](#cleanup-cho-toàn-bộ-pipeline)
+  - [Dừng nhiều stream bằng takeUntil](#dừng-nhiều-stream-bằng-takeuntil)
+  - [Đặt cleanup sau higher order operator](#đặt-cleanup-sau-higher-order-operator)
+- [Chia sẻ một listener cho nhiều consumer](#chia-sẻ-một-listener-cho-nhiều-consumer)
+- [Kiểm tra trước khi đưa vào ứng dụng](#kiểm-tra-trước-khi-đưa-vào-ứng-dụng)
+- [Đọc tiếp](#đọc-tiếp)
+- [Tài liệu tham khảo](#tài-liệu-tham-khảo)
+
+## Khi nào nên biến event thành stream
+
+Mình chọn RxJS khi thao tác giao diện có **quy tắc phối hợp theo thời gian hoặc vòng đời**: đợi khoảng lặng, chỉ lấy giá trị mới nhất, hủy tác vụ cũ, hoặc nghe `pointermove` chỉ trong một phiên kéo. Những quy tắc này hợp với operator hơn là một nhóm callback tự quản lý trạng thái.
+
+Nếu một nút chỉ đổi một class khi click, `addEventListener` hoặc event handler của framework thường đủ. Đừng đưa RxJS vào chỉ để thay cú pháp callback. Trong React, chẳng hạn, một `onClick` cập nhật state không cần thêm native listener.
+
+Mô hình cơ bản rất ngắn:
+
+```text
+DOM event → fromEvent → chọn dữ liệu → phối hợp bằng operator → cập nhật UI
+                ↑                                                 │
+         subscribe gắn listener                unsubscribe gỡ listener
+```
+
+Pipeline không tự chạy khi được khai báo. `subscribe()` mới kết nối nó với nguồn event.
+
+## Tạo stream bằng fromEvent
+
+Với DOM, dạng thường dùng là `fromEvent<T>(target, eventName, options?)`. `target` là một `EventTarget` như element, `document` hoặc `window`; `T` là kiểu event bạn mong đợi.
+
+```ts
+import { fromEvent } from 'rxjs';
+
+const clicks$ = fromEvent<MouseEvent>(document, 'click');
+```
+
+Generic `MouseEvent` giúp TypeScript kiểm tra các thuộc tính như `clientX`; nó không xác thực dữ liệu lúc runtime. Viết `fromEvent<KeyboardEvent>(document, 'click')` không làm click biến thành keyboard event. Tên event và generic vẫn phải khớp với API trình duyệt.
+
+### Ví dụ đếm click
+
+Tạo HTML này trước khi gọi hàm setup:
+
+```html
+<button id="counter-button" type="button">Thêm một lượt</button>
+<output id="counter-value" aria-live="polite">0</output>
+```
+
+```ts
+import { fromEvent, map, scan } from 'rxjs';
+
+function mountCounter(): () => void {
+  const button = document.querySelector<HTMLButtonElement>('#counter-button');
+  const output = document.querySelector<HTMLOutputElement>('#counter-value');
+
+  if (!button || !output) {
+    throw new Error('Thiếu HTML của counter');
+  }
+
+  const subscription = fromEvent<MouseEvent>(button, 'click').pipe(
+    map(() => 1),
+    scan((count, increment) => count + increment, 0),
+  ).subscribe((count) => {
+    output.textContent = String(count);
+  });
+
+  return () => subscription.unsubscribe();
+}
+
+const disposeCounter = mountCounter();
+// Khi unmount: gọi disposeCounter() trước khi gỡ HTML.
+```
+
+Sau ba lần click, output là `3`. `scan` giữ bộ đếm trong subscription; setup lại sẽ tạo bộ đếm mới. Giá trị seed `0` của `scan` không tự được phát ra, nên HTML đặt giá trị ban đầu là `0`.
+
+### Listener và subscription không phải cùng một vòng đời
+
+DOM là nguồn event **hot**: người dùng có thể click dù không ai đang subscribe. Nhưng mỗi subscription vào `fromEvent` lại đăng ký một handler riêng. Vì vậy hai consumer subscribe vào cùng biến `clicks$` vẫn tạo hai listener nếu bạn chưa dùng `share()`.
+
+| Thao tác | Điều thực sự xảy ra |
+| --- | --- |
+| Gọi `fromEvent(button, 'click')` | Tạo Observable, chưa gắn listener |
+| Gọi `subscribe()` | Gắn handler bằng `addEventListener` |
+| Click button | Handler chuyển event vào pipeline đang nghe |
+| Gọi `unsubscribe()` | Teardown gỡ handler bằng `removeEventListener` |
+| Gỡ button khỏi DOM | Không tự unsubscribe pipeline |
+
+Không có replay: subscribe sau một click thì bạn không nhận lại click đó. `fromEvent` cũng không tự complete khi người dùng ngừng tương tác hoặc khi element bị gỡ khỏi DOM.
+
+<Callout type="warn" title="Gỡ node không thay thế cleanup">
+  Một detached node không nhất thiết gây leak nếu không còn gì tham chiếu tới nó, nhưng việc gỡ node không thực thi teardown của RxJS. Timer, inner subscription và listener trên `window` hoặc `document` vẫn có thể hoạt động. Hãy kết thúc subscription theo vòng đời của phần giao diện sở hữu nó.
+</Callout>
+
+## Đọc dữ liệu từ event đúng lúc
+
+Event là thông báo rằng một việc vừa xảy ra, không phải snapshot bất biến của cả DOM. Nếu giữ nguyên event qua `debounceTime` rồi mới đọc giá trị input, bạn đang đọc DOM ở thời điểm sau đó. Mặc định mình chuyển event thành dữ liệu nhỏ như chuỗi hoặc tọa độ **trước operator trì hoãn**.
+
+### Target và currentTarget
+
+- `event.target` là đối tượng nơi event phát sinh; click icon trong button có thể cho `target` là icon.
+- `event.currentTarget` là đối tượng có listener đang được gọi; với delegation, đó là container.
+
+`currentTarget` chỉ có ý nghĩa trong lúc handler đang chạy; sau khi dispatch kết thúc, nó có thể là `null`. Vì vậy đừng giữ event qua timer rồi cast `currentTarget` thành element.
+
+Khi đã biết input đang nghe, dùng reference của nó để tránh cast mù:
+
+```ts
+import { debounceTime, fromEvent, map } from 'rxjs';
+
+function mountValueLogger(input: HTMLInputElement): () => void {
+  const subscription = fromEvent<Event>(input, 'input').pipe(
+    map(() => input.value), // Đọc đồng bộ, tạo snapshot chuỗi.
+    debounceTime(300),
+  ).subscribe((value) => console.log(value));
+
+  return () => subscription.unsubscribe();
+}
+```
+
+Hàm này nhận một input do ứng dụng cung cấp. Nếu hai event mang giá trị `r` rồi `rx`, pipeline nhận hai chuỗi riêng; nó không giữ DOM event để đọc lại sau 300 ms.
+
+### Listener options và preventDefault
+
+Tham số `options` được chuyển tới API listener của DOM. Các lựa chọn hay dùng:
+
+| Option | Khi nào dùng | Điểm cần nhớ |
+| --- | --- | --- |
+| `capture: true` | Nghe ở capture phase, trước bubble phase | Không đồng nghĩa với chặn propagation |
+| `passive: true` | Listener không cần hủy hành vi mặc định, chẳng hạn chỉ quan sát scroll | Không gọi `preventDefault()` trong listener passive |
+| `once: true` | Muốn DOM tự gỡ listener sau event đầu | Không khiến Observable của RxJS tự complete |
+
+Nếu mục tiêu là nhận một event rồi kết thúc stream, dùng `take(1)` thay vì chỉ dựa vào `{ once: true }`. Tương tự, native listener bị gỡ bởi `AbortSignal` không có nghĩa subscription RxJS đã complete; với pipeline có timer hoặc inner stream, vẫn cần teardown phía RxJS.
+
+`preventDefault()` phải chạy trong lúc dispatch event và chỉ có tác dụng với event có thể hủy. Ví dụ chặn submit để ứng dụng tự xử lý:
+
+```ts
+import { fromEvent, map, tap } from 'rxjs';
+
+function mountForm(form: HTMLFormElement): () => void {
+  const subscription = fromEvent<SubmitEvent>(form, 'submit', {
+    passive: false,
+  }).pipe(
+    tap((event) => event.preventDefault()),
+    map(() => new FormData(form)),
+  ).subscribe((data) => {
+    console.log('Dữ liệu chuẩn bị gửi:', Array.from(data.entries()));
+  });
+
+  return () => subscription.unsubscribe();
+}
+```
+
+Ở đây `tap` chạy đồng bộ trong native handler, trước khi browser tiếp tục hành vi submit. Nếu đặt `debounceTime`, `delay` hoặc `observeOn` trước nó, lời gọi `preventDefault()` sẽ quá muộn. RxJS không tự chặn default action hay propagation; chỉ thêm những hành vi đó khi UX thực sự cần.
+
+## Input có debounce và hỗ trợ bộ gõ
+
+Một ô tìm kiếm thường cần giá trị hiện tại, bỏ các giá trị lặp và đợi người dùng dừng gõ. Với bộ gõ dùng composition, không nên xử lý chuỗi đang ghép dở như thể người dùng đã nhập xong.
+
+HTML tối thiểu:
+
+```html
+<label for="search-input">Từ khóa</label>
+<input id="search-input" type="search" autocomplete="off" />
+<output id="search-preview" aria-live="polite"></output>
+```
+
+Ví dụ này chỉ hiển thị từ khóa ổn định, không gọi API nên bạn có thể thử riêng mà không cần backend:
+
+```ts
+import {
+  debounceTime,
+  distinctUntilChanged,
+  filter,
+  fromEvent,
+  map,
+  merge,
+  startWith,
+} from 'rxjs';
+
+function mountSearchPreview(): () => void {
+  const input = document.querySelector<HTMLInputElement>('#search-input');
+  const preview = document.querySelector<HTMLOutputElement>('#search-preview');
+
+  if (!input || !preview) {
+    throw new Error('Thiếu HTML của search preview');
+  }
+
+  const committedInput$ = merge(
+    fromEvent<InputEvent>(input, 'input').pipe(
+      filter((event) => !event.isComposing),
+    ),
+    fromEvent<CompositionEvent>(input, 'compositionend'),
+  );
+
+  const subscription = committedInput$.pipe(
+    map(() => input.value.trim()),
+    startWith(input.value.trim()),
+    debounceTime(300),
+    distinctUntilChanged(),
+  ).subscribe((query) => {
+    preview.textContent = query ? `Từ khóa: ${query}` : 'Chưa có từ khóa';
+  });
+
+  return () => subscription.unsubscribe();
+}
+
+const disposeSearchPreview = mountSearchPreview();
+// Khi unmount: disposeSearchPreview().
+```
+
+`input` theo dõi thay đổi giá trị do người dùng, bao gồm dán văn bản; `keyup` không thay thế được nó. `compositionend` bổ sung thông báo khi bộ gõ chốt chuỗi. Một số browser còn phát `input` ngay sau đó, nhưng `distinctUntilChanged()` loại kết quả trùng sau debounce. Giá trị ban đầu cũng đi qua khoảng chờ 300 ms trong ví dụ này.
+
+Có hai giới hạn cần phân biệt. Gán `input.value` bằng JavaScript không tự phát `input` event; nếu ứng dụng cần theo dõi cập nhật lập trình, nên có stream state riêng. Ngoài ra, việc bỏ qua event đang composition không hủy một timer debounce đã bắt đầu trước composition; đây là preview đơn giản, không phải bộ quản lý toàn bộ trạng thái nhập liệu.
+
+Khi nối API tìm kiếm, thường thêm `switchMap` sau bước ổn định từ khóa để bỏ kết quả từ request cũ. Request cũ chỉ bị unsubscribe khi **từ khóa mới đi qua debounce**, không phải ngay mỗi phím bấm. Xử lý chuỗi rỗng trong `switchMap`, chẳng hạn trả về danh sách rỗng, thay vì filter nó trước rồi để kết quả cũ treo trên UI. Cách gọi API và xử lý lỗi nằm ở [HTTP và Ajax](/docs/tich-hop/http-ajax).
+
+## Event delegation cho danh sách động
+
+Nếu mỗi item có một listener, item thêm sau cần setup riêng và item xóa đi cần cleanup riêng. Delegation nghe event ở container rồi tìm nút mà người dùng thực sự chọn, nên phù hợp với danh sách thay đổi thường xuyên.
+
+```html
+<ul id="task-list">
+  <li>
+    Đọc tài liệu
+    <button type="button" data-action="remove"><span>Xóa</span></button>
+  </li>
+  <li>
+    Thử ví dụ
+    <button type="button" data-action="remove"><span>Xóa</span></button>
+  </li>
+</ul>
+```
+
+```ts
+import { filter, fromEvent, map } from 'rxjs';
+
+function mountTaskList(): () => void {
+  const list = document.querySelector<HTMLUListElement>('#task-list');
+  if (!list) throw new Error('Thiếu task list');
+
+  const subscription = fromEvent<MouseEvent>(list, 'click').pipe(
+    map((event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return null;
+
+      return target.closest<HTMLButtonElement>('button[data-action="remove"]');
+    }),
+    filter((button): button is HTMLButtonElement =>
+      button !== null && list.contains(button),
+    ),
+  ).subscribe((button) => {
+    const item = button.closest('li');
+    // Chỉ xóa item trực tiếp của danh sách này, không xóa container bên ngoài.
+    if (item?.parentElement === list) item.remove();
+  });
+
+  return () => subscription.unsubscribe();
+}
+
+const disposeTaskList = mountTaskList();
+// Khi unmount: disposeTaskList().
+```
+
+Click vào `<span>` vẫn tìm được button nhờ `closest()`. Item thêm vào cùng `ul` sau khi setup cũng hoạt động vì listener nằm ở container. Kiểm tra `contains()` và `parentElement` giới hạn hành động vào đúng danh sách.
+
+Delegation dựa vào cách event lan truyền, không phải tính năng riêng của RxJS. `focus` không bubble như `focusin`; listener capture có thể là lựa chọn khác khi phù hợp. Nếu callback bên dưới gọi `stopPropagation()`, listener bubble ở container có thể không nhận event. Shadow DOM còn có retargeting; khi vượt qua boundary đó, hãy xem `event.composedPath()` và chính sách `composed` của loại event thay vì giả định `target` luôn là node gốc.
+
+## Kéo thả bằng Pointer Events
+
+Kéo thả là một phiên tương tác: `pointerdown` mở phiên, `pointermove` cập nhật vị trí, còn `pointerup` hoặc `pointercancel` kết thúc nó. Pointer Events dùng chung cho chuột, bút và cảm ứng; `pointerId` giúp không trộn hai pointer khác nhau.
+
+Ví dụ dưới đây dùng pointer capture để handle vẫn nhận event khi pointer đi ra ngoài element. HTML và CSS minh họa:
+
+```html
+<div id="drag-handle" class="drag-handle">Kéo ô này</div>
+<style>
+  .drag-handle {
+    width: 140px;
+    padding: 16px;
+    background: #e2e8f0;
+    color: #0f172a;
+    touch-action: none;
+    user-select: none;
+    cursor: grab;
+  }
+</style>
+```
+
+```ts
+import {
+  filter,
+  finalize,
+  fromEvent,
+  map,
+  merge,
+  switchMap,
+  take,
+  takeUntil,
+} from 'rxjs';
+
+function mountDrag(): () => void {
+  const handle = document.querySelector<HTMLDivElement>('#drag-handle');
+  if (!handle) throw new Error('Thiếu drag handle');
+
+  let position = { x: 0, y: 0 };
+
+  const subscription = fromEvent<PointerEvent>(handle, 'pointerdown').pipe(
+    filter((event) => event.isPrimary && event.button === 0),
+    switchMap((down) => {
+      const origin = { ...position };
+      handle.setPointerCapture(down.pointerId);
+
+      const end$ = merge(
+        fromEvent<PointerEvent>(handle, 'pointerup'),
+        fromEvent<PointerEvent>(handle, 'pointercancel'),
+        fromEvent<PointerEvent>(handle, 'lostpointercapture'),
+      ).pipe(
+        filter((event) => event.pointerId === down.pointerId),
+        take(1),
+      );
+
+      return fromEvent<PointerEvent>(handle, 'pointermove').pipe(
+        filter((event) => event.pointerId === down.pointerId),
+        map((move) => ({
+          x: origin.x + move.clientX - down.clientX,
+          y: origin.y + move.clientY - down.clientY,
+        })),
+        takeUntil(end$),
+        finalize(() => {
+          if (handle.hasPointerCapture(down.pointerId)) {
+            handle.releasePointerCapture(down.pointerId);
+          }
+        }),
+      );
+    }),
+  ).subscribe((nextPosition) => {
+    position = nextPosition;
+    handle.style.transform = `translate(${position.x}px, ${position.y}px)`;
+  });
+
+  return () => subscription.unsubscribe();
+}
+
+const disposeDrag = mountDrag();
+// Trước khi gỡ handle: disposeDrag().
+```
+
+Mỗi `pointerdown` hợp lệ tạo một inner stream. `switchMap` đóng phiên trước nếu có phiên mới; `takeUntil(end$)` đóng phiên hiện tại khi thả, hủy hoặc mất capture. `finalize` giải phóng capture kể cả khi teardown đến từ việc unmount, chứ không chỉ từ một event kết thúc.
+
+`touch-action: none` ngăn browser dùng vùng này cho thao tác pan/zoom mặc định. Chỉ áp dụng lên vùng kéo thật sự cần, không khóa thao tác cảm ứng của cả trang. Khi event quá dày và render tốn kém, có thể cân nhắc `auditTime(0, animationFrameScheduler)` sau khi map tọa độ; cần kiểm tra cả vị trí cuối vì giới hạn tần suất có thể giữ một giá trị đang chờ lúc phiên kết thúc.
+
+<Callout type="warn" title="Ví dụ kéo không phải widget hoàn chỉnh">
+  Ví dụ dùng vị trí `pointermove` cuối cùng, chưa có giới hạn vùng kéo hay hỗ trợ bàn phím. Widget production cần cách thao tác tương đương bằng keyboard hoặc các nút điều khiển, và nên chốt tọa độ từ `pointerup` nếu nghiệp vụ cần vị trí thả chính xác. Đừng dùng một vùng chỉ hỗ trợ kéo để thay thế thao tác bắt buộc với mọi người dùng.
+</Callout>
+
+## Cleanup cho toàn bộ pipeline
+
+Trả về `() => subscription.unsubscribe()` như các ví dụ trên là cách rõ nhất khi một subscription sở hữu toàn bộ thao tác. Unsubscribe hủy cả timer lẫn inner subscription do operator quản lý. Nó không gọi callback `complete` của observer, nhưng vẫn chạy teardown và `finalize`.
+
+### Dừng nhiều stream bằng takeUntil
+
+Nếu một widget có nhiều pipeline độc lập, một notifier chung có thể kết thúc tất cả:
+
+```ts
+import { fromEvent, Subject, takeUntil } from 'rxjs';
+
+function mountInspector(button: HTMLButtonElement): () => void {
+  const destroy$ = new Subject<void>();
+
+  fromEvent<MouseEvent>(button, 'click').pipe(
+    takeUntil(destroy$),
+  ).subscribe(() => console.log('click'));
+
+  fromEvent<Event>(window, 'resize', { passive: true }).pipe(
+    takeUntil(destroy$),
+  ).subscribe(() => console.log('resize'));
+
+  return () => {
+    destroy$.next();
+    destroy$.complete();
+  };
+}
+```
+
+**`takeUntil` dừng khi notifier phát giá trị, không phải khi notifier chỉ complete.** Vì vậy gọi riêng `destroy$.complete()` là chưa đủ. Một `Subject` thường không replay tín hiệu destroy cho subscription tạo sau đó; hãy coi cleanup là kết thúc vòng đời widget và không mở thêm subscription mới trên instance đã dispose.
+
+Đọc sơ đồ theo cột để thấy event nào còn đi qua trước thời điểm destroy:
+
+<MarbleDiagram
+  title="takeUntil(destroy$)"
+  rows={[
+    { label: 'DOM events', marble: '-a--b--c--d-', kind: 'source' },
+    { label: 'destroy$', marble: '--------x---', kind: 'source' },
+    { label: 'listener', marble: '^-------!---', kind: 'subscription' },
+    { label: 'output', marble: '-a--b--c|---', kind: 'output' },
+  ]}
+  values={{
+    a: 'event ở frame 1',
+    b: 'event ở frame 4',
+    c: 'event ở frame 7',
+    d: 'event ở frame 10, sau destroy',
+    x: 'tín hiệu destroy',
+  }}
+  caption="Destroy ở frame 8 khiến output complete và listener bị gỡ; DOM vẫn có thể phát event sau đó."
+/>
+
+`a`, `b`, `c` ở frame 1, 4, 7 đều được chuyển tiếp. `x` ở frame 8 complete output và unsubscribe nguồn, nên `d` ở frame 10 không tới consumer. Đây là frame minh họa, không phải khoảng thời gian đo từ một browser thật.
+
+### Đặt cleanup sau higher order operator
+
+Nếu dùng notifier để đóng cả tác vụ con, đặt `takeUntil(destroy$)` ở cuối phần pipeline cần quản lý:
+
+```ts
+import { fromEvent, Subject, switchMap, takeUntil } from 'rxjs';
+
+function mountPointerLogger(handle: HTMLElement): () => void {
+  const destroy$ = new Subject<void>();
+
+  fromEvent<PointerEvent>(handle, 'pointerdown').pipe(
+    switchMap(() => fromEvent<PointerEvent>(window, 'pointermove')),
+    takeUntil(destroy$),
+  ).subscribe((event) => console.log(event.clientX, event.clientY));
+
+  return () => {
+    destroy$.next();
+    destroy$.complete();
+  };
+}
+```
+
+Đây chỉ là ví dụ về vị trí cleanup, không phải logic kéo thả hoàn chỉnh. Nếu đặt `takeUntil` **trước** `switchMap`, destroy chỉ complete outer stream; `switchMap` vẫn chờ inner đang chạy complete. Inner `pointermove` không tự complete nên listener có thể tiếp tục tồn tại. Đặt notifier sau operator đó sẽ unsubscribe cả chuỗi.
+
+`fromEvent` không tự biến các lỗi trong callback cập nhật UI thành một stream có thể retry. Với xử lý có thể thất bại, đặt logic và chính sách lỗi trong pipeline phù hợp; đừng trông chờ `retry()` sửa được một DOM node đã bị thay hoặc một selector trả về `null`.
+
+## Chia sẻ một listener cho nhiều consumer
+
+Chỉ cần `share()` khi nhiều consumer thực sự phải dùng chung subscription upstream. Hai subscription vào cùng biến Observable không mặc nhiên dùng chung listener.
+
+```ts
+import { fromEvent, map, share } from 'rxjs';
+
+function mountSharedClicks(button: HTMLButtonElement): () => void {
+  const point$ = fromEvent<MouseEvent>(button, 'click').pipe(
+    map((event) => ({ x: event.clientX, y: event.clientY })),
+    share(),
+  );
+
+  const analytics = point$.subscribe((point) => console.log('analytics', point));
+  const preview = point$.subscribe((point) => console.log('preview', point));
+
+  return () => {
+    analytics.unsubscribe();
+    preview.unsubscribe();
+  };
+}
+```
+
+Với mặc định của `share()` trong RxJS 7, hai consumer đang hoạt động dùng một listener. Khi consumer cuối unsubscribe, listener được gỡ; một consumer mới sau đó có thể tạo kết nối mới. Đặt `map` trước `share` cũng chia sẻ bước chuyển event thành dữ liệu.
+
+Không dùng `shareReplay` chỉ vì muốn chia sẻ click. Một consumer mới thường không nên tự xử lý lại click cũ, và replay native event còn giữ reference tới DOM. Nếu cần giá trị hiện tại, chuyển event thành state nhỏ rồi chọn cơ chế state hoặc replay có chủ đích.
+
+## Kiểm tra trước khi đưa vào ứng dụng
+
+Dùng các ví dụ như một bài kiểm tra nhỏ trước khi nối vào feature thật:
+
+| Thử thao tác | Kết quả cần thấy |
+| --- | --- |
+| Mount counter, click ba lần | Hiển thị `3` |
+| Dispose rồi click counter | Không có cập nhật mới |
+| Gõ nhanh rồi dừng ở search preview | Chỉ hiển thị từ khóa ổn định sau khoảng chờ |
+| Nhập bằng bộ gõ có composition | Không xử lý từng chuỗi đang ghép dở; kiểm tra trên browser mục tiêu |
+| Thêm item mới vào task list, click chữ bên trong nút Xóa | Item mới vẫn được xóa mà không setup listener riêng |
+| Kéo ra ngoài handle rồi thả | Pointer capture duy trì phiên; thả xong không tiếp tục di chuyển |
+| Dispose ngay khi đang kéo | Inner listener được gỡ và capture được giải phóng |
+| Mount, dispose, mount lại | Một thao tác chỉ tạo một lần xử lý ở instance mới |
+
+Nếu một click tạo hai tác vụ, kiểm tra setup bị gọi hai lần và subscription chưa cleanup trước khi nghĩ tới debounce. Debounce có thể che triệu chứng duplicate listener, nhưng không sửa vòng đời sai.
+
+Khi viết integration test, `dispatchEvent()` phát event đồng bộ; timer debounce vẫn cần fake timer hoặc scheduler test riêng. Gán `input.value` rồi dispatch `input` để kiểm tra pipeline, và dispatch event có `bubbles: true` nếu đang test delegation. Pointer capture và composition cần thêm kiểm tra trên browser thật vì môi trường DOM giả không mô phỏng đầy đủ hành vi tương tác.
+
+## Đọc tiếp
+
+<Cards>
+  <Card title="Debounce, throttle và audit" href="/docs/thoi-gian-schedulers/debounce-throttle-audit" description="Chọn giá trị nào được giữ khi event phát dồn dập." />
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Hiểu cleanup cho nguồn, timer và subscription." />
+  <Card title="HTTP và Ajax" href="/docs/tich-hop/http-ajax" description="Nối input ổn định với request và xử lý lỗi." />
+  <Card title="React" href="/docs/tich-hop/react" description="Đặt setup và teardown đúng vòng đời component." />
+</Cards>
+
+## Tài liệu tham khảo
+
+- [RxJS: fromEvent](https://rxjs.dev/api/index/function/fromEvent) — API chuyển event thành Observable.
+- [RxJS 7.8.2: implementation của fromEvent](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/fromEvent.ts) — đăng ký handler khi subscribe và gỡ trong teardown.
+- [MDN: addEventListener](https://developer.mozilla.org/en-US/docs/Web/API/EventTarget/addEventListener) — capture, passive và once.
+- [MDN: Event.currentTarget](https://developer.mozilla.org/en-US/docs/Web/API/Event/currentTarget) — giới hạn của reference trong thời gian dispatch.
+- [MDN: Pointer Events](https://developer.mozilla.org/en-US/docs/Web/API/Pointer_events) — pointer capture, pointercancel và touch-action.

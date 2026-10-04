@@ -282,7 +282,15 @@ Giá trị `token` do hàm add trả về được chuyển sang hàm remove. Đ
 import { bindNodeCallback } from 'rxjs';
 import { readFile } from 'node:fs';
 
-const readFile$ = bindNodeCallback(readFile);
+function readTextFile(
+  path: string,
+  encoding: BufferEncoding,
+  callback: (error: NodeJS.ErrnoException | null, content: string) => void,
+): void {
+  readFile(path, encoding, callback);
+}
+
+const readFile$ = bindNodeCallback(readTextFile);
 
 readFile$('config.json', 'utf8').subscribe({
   next: (content) => console.log(content),
@@ -290,6 +298,8 @@ readFile$('config.json', 'utf8').subscribe({
   complete: () => console.log('complete'),
 });
 ```
+
+`readFile` có nhiều overload cho kết quả `Buffer` hoặc `string`, nên truyền trực tiếp vào `bindNodeCallback()` có thể khiến TypeScript suy luận nhầm số argument. Wrapper `readTextFile` chốt signature `(path, encoding, callback)` cho nhánh đọc text: `readFile$` nhận hai argument và trả về `Observable<string>`, không cần ép kiểu hay dùng `any`. Ví dụ chạy trong Node.js và cần file `config.json` trong working directory; nếu file không tồn tại, subscriber nhận `error` thay vì `next` và `complete`.
 
 Function gốc chỉ được gọi khi Observable kết quả có subscriber. Tuy nhiên, wrapper không tự phát minh cancellation cho API callback; muốn hủy, API gốc phải cung cấp cơ chế hủy và bạn phải nối cơ chế đó vào teardown.
 

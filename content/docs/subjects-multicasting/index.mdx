@@ -3,22 +3,331 @@ title: Subjects & Multicasting
 description: Sử dụng Subject và các chiến lược chia sẻ stream an toàn.
 ---
 
-Đây là trang khung cho nhóm **Subjects & Multicasting** trong lộ trình học RxJS.
+Giả sử hai widget cùng cần dữ liệu từ một HTTP Observable, nhưng mỗi widget gọi `subscribe` và bạn thấy hai request giống nhau. Hoặc widget mở sau không nhận được dữ liệu đã phát trước đó. Hai vấn đề này khác nhau: một bên cần **chia sẻ execution**, bên kia cần **replay giá trị**. Subject và các operator multicasting giúp bạn quyết định cả hai, nhưng không phải lựa chọn nào cũng làm cả hai việc.
+
+Trang này là bản đồ cho nhóm **Subjects & Multicasting**. Bạn sẽ phân biệt nguồn event với state, chọn giữa các biến thể Subject, rồi xác định khi nào dùng `share` hoặc `shareReplay` thay vì tự nối subscription.
+
+<Callout type="info" title="Trước khi bắt đầu">
+  Bạn nên biết [Vòng đời stream](/docs/nen-tang/vong-doi-stream), [Cold và hot](/docs/observable-subscription/cold-va-hot) và [Unicast và multicast](/docs/observable-subscription/unicast-va-multicast). Ví dụ dùng public API của **RxJS 7.8.2**, import từ `rxjs`; không dùng các API multicasting deprecated.
+</Callout>
 
 ## Mục lục
 
-- [Phạm vi dự kiến](#phạm-vi-dự-kiến)
-- [Các bài trong nhóm](#các-bài-trong-nhóm)
+- [Chia sẻ execution khác với phát lại dữ liệu](#chia-sẻ-execution-khác-với-phát-lại-dữ-liệu)
+- [Subject là điểm phát chung](#subject-là-điểm-phát-chung)
+  - [Một nơi ghi nhiều nơi đọc](#một-nơi-ghi-nhiều-nơi-đọc)
+  - [Subscriber đến muộn nhìn thấy gì](#subscriber-đến-muộn-nhìn-thấy-gì)
+- [Chọn biến thể Subject theo ý nghĩa dữ liệu](#chọn-biến-thể-subject-theo-ý-nghĩa-dữ-liệu)
+  - [Event state lịch sử và kết quả cuối](#event-state-lịch-sử-và-kết-quả-cuối)
+  - [Khi Subject đã complete hoặc error](#khi-subject-đã-complete-hoặc-error)
+- [Chia sẻ nguồn có sẵn bằng operator](#chia-sẻ-nguồn-có-sẵn-bằng-operator)
+  - [share cho subscriber cùng tham gia](#share-cho-subscriber-cùng-tham-gia)
+  - [shareReplay cho subscriber cần dữ liệu trước đó](#sharereplay-cho-subscriber-cần-dữ-liệu-trước-đó)
+- [Quyết định vòng đời của kết nối và cache](#quyết-định-vòng-đời-của-kết-nối-và-cache)
+- [Những bẫy thường gặp](#những-bẫy-thường-gặp)
+- [Lộ trình trong nhóm](#lộ-trình-trong-nhóm)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
 
-## Phạm vi dự kiến
+## Chia sẻ execution khác với phát lại dữ liệu
 
-Nhóm này giải thích các biến thể Subject và cách multicast mà không tạo side effect ngoài ý muốn.
+Một Observable không mặc nhiên là một công việc chạy đúng một lần. Với cold source, mỗi subscription có thể khởi động một execution riêng. Cùng giữ một biến `source$` chưa đủ để biến nó thành nguồn dùng chung.
 
-## Các bài trong nhóm
+Ví dụ đồng bộ dưới đây mô phỏng việc tạo dữ liệu mỗi lần subscribe, không cần server:
 
-- **[Subject](/docs/subjects-multicasting/subject)** — Dùng Subject như một Observable đồng thời là Observer.
-- **[BehaviorSubject](/docs/subjects-multicasting/behavior-subject)** — Lưu và phát giá trị hiện tại cho subscriber mới.
-- **[ReplaySubject](/docs/subjects-multicasting/replay-subject)** — Phát lại một số emission trước đó theo buffer.
-- **[AsyncSubject](/docs/subjects-multicasting/async-subject)** — Chỉ phát giá trị cuối cùng khi source hoàn tất.
-- **[Operator share](/docs/subjects-multicasting/share)** — Chia sẻ một subscription và quản lý refCount.
-- **[Operator shareReplay](/docs/subjects-multicasting/share-replay)** — Chia sẻ kết quả có replay và kiểm soát cache lifecycle.
+```ts
+import { defer, of } from 'rxjs';
+
+let executions = 0;
+const source$ = defer(() => {
+  executions += 1;
+  console.log('start:', executions);
+  return of('profile');
+});
+
+source$.subscribe((value) => console.log('A:', value));
+source$.subscribe((value) => console.log('B:', value));
+
+// start: 1
+// A: profile
+// start: 2
+// B: profile
+```
+
+`defer` gọi factory cho từng subscription, nên hai nơi đọc gây ra hai execution. Với HTTP Observable tạo request khi subscribe, đó có thể là hai request; với nguồn khác, đó có thể là hai timer hoặc hai lần tính toán.
+
+Hãy tách yêu cầu thành ba câu hỏi trước khi chọn API:
+
+| Câu hỏi | Quyết định cần đưa ra |
+| --- | --- |
+| Nhiều subscriber có cần cùng dùng một execution không? | Unicast hay multicast |
+| Subscriber mới có cần emission cũ không? | Không replay, replay giá trị hiện tại, hay replay một buffer |
+| Khi không còn ai đọc hoặc source kết thúc, điều gì xảy ra? | Disconnect, reset, giữ cache, hoặc chờ kết nối lại |
+
+Multicast giống một loa phát cho những người đang nghe. Replay là phần lưu bản ghi để người đến sau nghe lại. Phép so sánh dừng ở đó: RxJS không tạo thread hay queue riêng cho mỗi người nghe, và replay không tự làm dữ liệu mới hơn.
+
+Mình mặc định giữ pipeline bình thường nếu mỗi subscriber cần một execution độc lập. Chỉ thêm sharing khi có yêu cầu dùng chung rõ ràng; nếu không, bạn sẽ phải quản lý thêm state và vòng đời cache mà không có lợi ích tương ứng.
+
+## Subject là điểm phát chung
+
+### Một nơi ghi nhiều nơi đọc
+
+`Subject<T>` vừa là Observable để subscriber đọc, vừa là Observer có `next`, `error`, `complete` để nhận notification. Khi bạn gọi `next(value)`, các subscriber đang đăng ký nhận cùng emission đó. Subscribe vào Subject chỉ đăng ký người nhận; nó không tự khởi động một HTTP request hay timer.
+
+```ts
+import { Subject } from 'rxjs';
+
+const events = new Subject<string>();
+const events$ = events.asObservable();
+
+const a = events$.subscribe((value) => console.log('A:', value));
+events.next('saved');
+
+const b = events$.subscribe((value) => console.log('B:', value));
+events.next('deleted');
+
+a.unsubscribe();
+events.next('restored');
+
+events.complete();
+
+// A: saved
+// A: deleted
+// B: deleted
+// B: restored
+```
+
+B không nhận `'saved'` vì đến sau emission ấy. A unsubscribe chỉ rời khỏi danh sách người nhận; B vẫn tiếp tục nhận. `complete()` kết thúc Subject cho tất cả subscriber còn lại, và subscription của B cũng được đóng.
+
+`asObservable()` tách API đọc khỏi API ghi: nơi sử dụng `events$` không được cung cấp các method `next`, `error`, `complete` của Subject. Đây là cách đóng gói quyền phát event, không phải một ranh giới bảo mật; nó cũng không thêm replay, clone dữ liệu hay thay đổi scheduling.
+
+Nếu dữ liệu đã có dưới dạng Observable, mình ưu tiên operator sharing thay vì tự viết `source$.subscribe(subject)`. Cách nối thủ công chạy được, nhưng bạn phải sở hữu subscription upstream và tự quyết định khi nào ngắt nó. Ngược lại, Subject phù hợp ở ranh giới imperative: một command của ứng dụng cần phát event vào pipeline.
+
+### Subscriber đến muộn nhìn thấy gì
+
+Đọc các hàng theo cùng cột thời gian. Trong diagram này, A đăng ký ở frame 0, B đăng ký ở frame 4, còn producer gọi `next` tại frame 2 và 6. Đây là virtual timeline minh họa, không phải thời gian thực của đoạn code đồng bộ phía trên.
+
+<MarbleDiagram
+  title="Subject"
+  rows={[
+    { label: 'producer', marble: '--a---b--|', kind: 'source' },
+    { label: 'sub A', marble: '^--------!', kind: 'subscription' },
+    { label: 'sub B', marble: '----^----!', kind: 'subscription' },
+    { label: 'A nhận', marble: '--a---b--|', kind: 'output' },
+    { label: 'B nhận', marble: '------b--|', kind: 'output' },
+  ]}
+  values={{ a: 'event đầu', b: 'event tiếp theo' }}
+  caption="B chỉ nhận b; Subject không giữ a để phát lại. Dấu ! ở frame 9 biểu diễn subscription đóng khi Subject complete."
+/>
+
+Ở frame 2, chỉ A đang nghe nên chỉ A nhận `a`. B đăng ký ở frame 4 nhưng không có notification nào được replay tại frame ấy. Frame 6, cả hai cùng nhận `b`; frame 9, cả hai nhận `complete` và subscription đóng.
+
+Nếu B cần biết trạng thái hiện tại ngay khi mở widget, một event stream thuần không đáp ứng yêu cầu. Bạn cần một biến thể giữ giá trị hoặc một operator có replay.
+
+## Chọn biến thể Subject theo ý nghĩa dữ liệu
+
+### Event state lịch sử và kết quả cuối
+
+Đừng chọn Subject chỉ dựa trên việc muốn “nhớ một giá trị”. Trước hết, giá trị ấy biểu diễn một sự kiện đã xảy ra, một trạng thái đang có, hay kết quả chỉ hợp lệ khi công việc hoàn tất?
+
+| Loại | Cần giá trị khởi tạo | Subscriber mới khi Subject còn hoạt động | Nên nghĩ tới khi |
+| --- | --- | --- | --- |
+| `Subject<T>` | Không | Chỉ nhận emission tương lai | Event như click, refresh, saved |
+| `BehaviorSubject<T>` | Có | Nhận ngay giá trị hiện tại, rồi emission tương lai | State có giá trị ban đầu hợp lệ |
+| `ReplaySubject<T>(n)` | Không | Nhận tối đa `n` giá trị trong buffer, rồi emission tương lai | Cần lịch sử ngắn hoặc giá trị mới nhất nhưng chưa có seed |
+| `AsyncSubject<T>` | Không | Chưa nhận `next` cho đến khi complete | Chỉ công bố giá trị cuối của một công việc hữu hạn |
+
+Ví dụ sau làm rõ khác biệt giữa event và state:
+
+```ts
+import { BehaviorSubject, Subject } from 'rxjs';
+
+const refresh = new Subject<void>();
+refresh.next();
+refresh.subscribe(() => console.log('refresh requested'));
+// Không có output: event trước đó đã qua.
+
+const selectedTab = new BehaviorSubject('overview');
+selectedTab.next('activity');
+selectedTab.subscribe((tab) => console.log('current tab:', tab));
+// current tab: activity
+
+refresh.complete();
+selectedTab.complete();
+```
+
+Tab đang chọn tồn tại ngay cả khi không ai nghe, nên `BehaviorSubject` hợp lý. Một lệnh refresh thì khác: phát lại event cũ cho widget mới có thể gây thêm request ngoài ý muốn.
+
+Mình chọn `BehaviorSubject` khi thực sự có state và seed có nghĩa. Nếu chưa có dữ liệu, hãy mô hình hóa trạng thái như `loading` hoặc `null` có chủ đích, hoặc dùng `ReplaySubject(1)` để chưa phát gì trước emission đầu. Đừng tạo một object giả chỉ để thỏa constructor.
+
+`ReplaySubject(1)` không yêu cầu seed nhưng vẫn replay dữ liệu sau khi đã kết thúc, khác với `BehaviorSubject`. Còn `AsyncSubject` không phải “Subject phát bất đồng bộ”: nếu source không complete thì nó không phát giá trị nào. Khi complete mà chưa từng nhận `next`, nó chỉ complete.
+
+### Khi Subject đã complete hoặc error
+
+Subject đã kết thúc không thể được mở lại bằng `next`. Muốn bắt đầu một vòng đời mới, bạn cần instance mới hoặc một operator quản lý reset cho bạn.
+
+| Loại | Subscriber đăng ký sau complete | Subscriber đăng ký sau error |
+| --- | --- | --- |
+| `Subject` | Chỉ nhận complete | Chỉ nhận error |
+| `BehaviorSubject` | Chỉ nhận complete, không nhận giá trị hiện tại | Chỉ nhận error, không replay giá trị |
+| `ReplaySubject` | Nhận buffer còn hợp lệ, rồi complete | Nhận buffer còn hợp lệ, rồi error |
+| `AsyncSubject` | Nhận giá trị cuối nếu có, rồi complete | Chỉ nhận error, không nhận giá trị cuối |
+
+Các notification khi subscribe vào Subject đã dừng có thể được phát đồng bộ ngay trong lời gọi `subscribe`. Vì vậy, đừng dùng callback ấy với giả định rằng mọi biến hay UI đã được khởi tạo xong sau khi `subscribe` trả về.
+
+<Callout type="warn" title="Replay cũng là giữ dữ liệu trong bộ nhớ">
+  `new ReplaySubject()` mặc định không giới hạn số giá trị hay tuổi của buffer. Với stream sống lâu, hãy đặt `bufferSize` và cân nhắc `windowTime`. Buffer giữ reference của object, không tạo snapshot bất biến; mutate object sau khi phát có thể khiến subscriber khác thấy dữ liệu bị đổi.
+</Callout>
+
+## Chia sẻ nguồn có sẵn bằng operator
+
+Nếu bạn đã có `source$`, thường không cần tạo Subject rồi tự forward notification. `share` và `shareReplay` đặt một Subject nội bộ giữa source và các subscriber, đồng thời quản lý kết nối upstream theo cấu hình.
+
+```text
+source execution ──► Subject nội bộ ──┬──► subscriber A
+                                    └──► subscriber B
+```
+
+### share cho subscriber cùng tham gia
+
+`share()` mặc định dùng `Subject`, không replay. Subscriber đầu tiên tạo kết nối đến source; những subscriber tham gia khi kết nối còn hoạt động dùng chung execution đó.
+
+Ví dụ này dùng timer bất đồng bộ để A và B đều đăng ký trước emission đầu:
+
+```ts
+import { defer, share, take, timer } from 'rxjs';
+
+let executions = 0;
+const shared$ = defer(() => {
+  console.log('start:', ++executions);
+  return timer(0, 100).pipe(take(2));
+}).pipe(share());
+
+shared$.subscribe({
+  next: (value) => console.log('A:', value),
+  complete: () => console.log('A complete'),
+});
+shared$.subscribe({
+  next: (value) => console.log('B:', value),
+  complete: () => console.log('B complete'),
+});
+
+// start: 1
+// A: 0
+// B: 0
+// A: 1
+// B: 1
+// A complete
+// B complete
+```
+
+Chỉ có một lần `start`, vì B đến khi execution của A vẫn đang chạy. `take(2)` làm source complete sau hai emission, nên ví dụ không để timer chạy mãi. Timer dùng để minh họa thứ tự, không bảo đảm callback chạy đúng từng millisecond.
+
+Nhưng nếu thay nguồn bằng `of(...)` đồng bộ thì sao? Subscription A có thể hoàn tất trước khi câu lệnh subscribe của B được chạy. Vì `share()` mặc định reset khi complete, B lúc đó mở execution mới. **share không có nghĩa là “chạy đúng một lần mãi mãi”.**
+
+### shareReplay cho subscriber cần dữ liệu trước đó
+
+`shareReplay` dùng `ReplaySubject` nội bộ. Nó vừa chia sẻ execution vừa cho subscriber mới nhận buffer, chứ không cung cấp một API `next` để bạn cập nhật state thủ công.
+
+Ví dụ hữu hạn sau dùng nguồn đồng bộ có chủ đích: B đăng ký sau khi A đã nhận dữ liệu và source complete, nhưng vẫn nhận kết quả đã cache.
+
+```ts
+import { defer, of, shareReplay } from 'rxjs';
+
+let executions = 0;
+const profile$ = defer(() => {
+  console.log('load:', ++executions);
+  return of({ name: 'Lan' });
+}).pipe(
+  shareReplay({ bufferSize: 1, refCount: true }),
+);
+
+profile$.subscribe({
+  next: (profile) => console.log('A:', profile.name),
+  complete: () => console.log('A complete'),
+});
+profile$.subscribe({
+  next: (profile) => console.log('B:', profile.name),
+  complete: () => console.log('B complete'),
+});
+
+// load: 1
+// A: Lan
+// A complete
+// B: Lan
+// B complete
+```
+
+Không có `load: 2` vì `shareReplay` trong RxJS 7.8.2 giữ buffer sau khi source complete thành công. `refCount: true` không thay đổi chính sách ấy. Ví dụ này mô phỏng kết quả một lần tải, không có HTTP request thật.
+
+Mình dùng cấu hình object rõ ràng như trên thay vì `shareReplay(1)`: bạn nhìn thấy cả kích thước buffer lẫn quyết định về kết nối. Dạng `shareReplay(1)` mặc định có `refCount: false`; một nguồn vô hạn có thể tiếp tục chạy dù không còn subscriber.
+
+## Quyết định vòng đời của kết nối và cache
+
+RefCount là số subscriber hiện đang đăng ký vào **cùng shared Observable**. Nó không đếm số component từng dùng dữ liệu, và không phải TTL của cache.
+
+Với cấu hình mặc định hoặc cấu hình đã nêu trong bảng, RxJS 7.8.2 xử lý như sau:
+
+| Tình huống | `share()` | `shareReplay({ bufferSize: 1, refCount: true })` |
+| --- | --- | --- |
+| Subscriber đầu tiên đến | Kết nối source | Kết nối source, hoặc replay cache nếu source đã complete |
+| Subscriber mới đến khi nguồn đang chạy | Chỉ nhận emission tiếp theo | Nhận buffer hiện có, rồi emission tiếp theo |
+| Subscriber cuối rời đi trước khi source kết thúc | Disconnect và reset Subject nội bộ | Disconnect và reset ReplaySubject cùng buffer |
+| Source complete | Phát complete và reset; subscriber sau chạy nguồn mới | Giữ buffer và trạng thái complete; subscriber sau nhận replay rồi complete |
+| Source error | Phát error và reset | Phát error và reset |
+
+Reset sau error **không tự retry cho subscriber đã nhận lỗi**. Subscription đó đã kết thúc; subscriber mới có thể mở execution mới. Nếu cần retry trong cùng luồng sử dụng, bạn phải thiết kế chính sách retry riêng.
+
+Bạn có thể đọc vòng đời theo ba bước: subscriber đầu mở kết nối; subscriber cuối rời đi quyết định có ngắt nguồn đang chạy hay không; terminal notification quyết định giữ hay xóa trạng thái cho lần subscribe sau. Tách ba bước này sẽ tránh nhầm “không còn ai đọc” với “source đã complete”.
+
+`share` cho phép cấu hình `connector`, `resetOnError`, `resetOnComplete` và `resetOnRefCountZero`. Mặc định ba chính sách reset đều bật. Nếu cần replay nhưng cũng cần reset sau complete hoặc reset có độ trễ, hãy đọc bài [share](/docs/subjects-multicasting/share) để dùng `share` với `ReplaySubject` làm connector, thay vì giả định `shareReplay` có mọi tùy chọn cache.
+
+<Callout type="warn" title="Replay không phải chính sách làm mới dữ liệu">
+  Cache của một request đã complete có thể tồn tại trong shared Observable dù `refCount: true`. Khi đổi tài khoản, thay query hoặc cần refresh, bạn phải có cơ chế invalidation rõ ràng. `windowTime` chỉ giới hạn tuổi của giá trị replay; nó không tự tạo request mới khi buffer hết hạn.
+</Callout>
+
+## Những bẫy thường gặp
+
+| Bẫy | Điều thực sự xảy ra | Cách tránh |
+| --- | --- | --- |
+| Tạo `source$.pipe(shareReplay(...))` bên trong hàm được gọi cho từng widget | Mỗi lần gọi tạo một shared Observable với state riêng | Giữ cùng instance ở phạm vi có chủ đích; với nhiều query, cache theo key nếu cần |
+| Đặt `tap` có side effect sau `share` | Side effect ấy vẫn chạy riêng cho từng subscriber | Đặt trước sharing nếu nó thuộc execution dùng chung; giữ sau nếu thuộc từng consumer |
+| Dùng Subject cho state cần hiển thị ngay | Subscriber mới không biết giá trị hiện tại | Chọn `BehaviorSubject`, `ReplaySubject(1)` hoặc nguồn có replay theo contract |
+| Replay event như “gửi đơn hàng” | Subscriber mới có thể xử lý lại command cũ | Tách event/command khỏi state và dữ liệu được cache |
+| Gọi `subject.complete()` để dừng nguồn đã nối thủ công | Không tự unsubscribe subscription upstream độc lập | Giữ và cleanup subscription upstream, hoặc dùng operator sharing |
+| Nghĩ multicast tạo bản sao cho từng nơi đọc | Subscriber nhận cùng object reference | Tránh mutation; cập nhật bằng object mới khi cần state bất biến |
+
+Sharing chỉ bao phủ phần pipeline ở **trước vị trí sharing**. Vì thế vị trí `share` hoặc `shareReplay` là một phần của thiết kế: đặt sau công việc cần dùng chung, rồi để xử lý riêng của widget ở phía sau.
+
+Subject cũng không phải hàng đợi công việc hay cơ chế backpressure. `next` thông thường gọi các observer đồng bộ; callback nặng có thể làm chậm lời gọi producer. Việc nhiều nơi nhận cùng event không có nghĩa mỗi nơi chạy trên một thread riêng.
+
+Cuối cùng, ai tạo nguồn thì người đó phải biết khi nào nguồn được dọn. Component cleanup subscription của nó; owner của một Subject hoặc kết nối thủ công quản lý vòng đời rộng hơn. Đừng để một component gọi `complete()` trên Subject dùng chung của cả ứng dụng chỉ vì component ấy unmount.
+
+## Lộ trình trong nhóm
+
+Đọc Subject trước để hiểu điểm phát chung, rồi chọn biến thể theo loại dữ liệu. Khi đã rõ subscriber đến muộn cần gì, chuyển sang sharing để tránh tự quản lý kết nối nguồn.
+
+<Cards>
+  <Card title="Subject" href="/docs/subjects-multicasting/subject" description="Ranh giới imperative, quyền phát event và vòng đời subscriber." />
+  <Card title="BehaviorSubject" href="/docs/subjects-multicasting/behavior-subject" description="State có seed và giá trị hiện tại cho subscriber mới." />
+  <Card title="ReplaySubject" href="/docs/subjects-multicasting/replay-subject" description="Buffer lịch sử, giới hạn bộ nhớ và subscriber đến muộn." />
+  <Card title="AsyncSubject" href="/docs/subjects-multicasting/async-subject" description="Giá trị cuối chỉ được công bố khi hoàn tất." />
+  <Card title="Operator share" href="/docs/subjects-multicasting/share" description="Chia sẻ execution và cấu hình reset kết nối." />
+  <Card title="Operator shareReplay" href="/docs/subjects-multicasting/share-replay" description="Chia sẻ có replay và quản lý vòng đời cache." />
+</Cards>
+
+## Bài tập tự kiểm tra
+
+1. Với ví dụ Subject, chuyển subscription B lên trước `events.next('saved')`. B nhận thêm giá trị nào? **B nhận cả `saved`**, vì lúc ấy đã đăng ký.
+2. Thay `timer(0, 100).pipe(take(2))` trong ví dụ `share` bằng `of(0, 1)` và thêm import `of`. Có bao nhiêu dòng `start`? **Hai**, vì A đã complete và sharing reset trước khi B subscribe.
+3. Với ví dụ `profile$`, B đăng ký sau complete. Có `load: 2` không? **Không**: cùng instance `profile$` giữ kết quả complete trong replay buffer, kể cả với `refCount: true`.
+4. Một stream cảm biến không bao giờ complete dùng `shareReplay(1)`. Khi mọi subscriber rời đi, nguồn có tự ngừng không? **Không theo cấu hình ấy**; hãy cân nhắc `refCount: true` nếu nguồn chỉ nên chạy khi có người đọc.
+
+Trước khi mở bài tiếp theo, chọn một stream trong ứng dụng của bạn và ghi lại ba quyết định: execution có dùng chung không, subscriber mới nhận gì, và nguồn/cache được dọn lúc nào. Sau đó đối chiếu với bài Subject hoặc operator phù hợp trong lộ trình phía trên.
+
+## Nguồn tham khảo
+
+- [RxJS Subject guide](https://rxjs.dev/guide/subject) — Subject và các biến thể; phần ví dụ multicasting cũ trong guide không phải API được khuyến nghị ở trang này.
+- [Subject guide tại tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/docs_app/content/guide/subject.md) — nội dung guide theo phiên bản dùng trong ví dụ.
+- [Implementation share trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/share.ts) — connector, refCount và các chính sách reset.
+- [Implementation shareReplay trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/shareReplay.ts) — `resetOnError: true`, `resetOnComplete: false` và `resetOnRefCountZero` theo cấu hình `refCount`.

@@ -29,6 +29,10 @@ Một ô tìm kiếm phát event sau mỗi phím bấm, `pointermove` có thể 
   - [Checklist trước khi chọn](#checklist-trước-khi-chọn)
 - [Bước tiếp theo](#bước-tiếp-theo)
 
+<Callout type="info" title="Cách chạy các ví dụ TypeScript">
+  Các ví dụ thực hành chạy độc lập trong trình duyệt với RxJS 7 (`npm install rxjs@7`), qua bundler hỗ trợ TypeScript và DOM types. Chạy code sau khi HTML tương ứng đã được tạo, không chạy trong phần SSR của Next.js; nếu dùng React, đặt setup trong effect và unsubscribe trong cleanup. Các snippet dùng `declare` chỉ minh họa pipeline: đó là khai báo kiểu cho nguồn/hàm do ứng dụng cung cấp, **không tạo giá trị lúc runtime**. Pipeline chỉ xử lý event khi có subscription.
+</Callout>
+
 ## Mô hình chọn operator
 
 Đừng bắt đầu bằng câu hỏi “operator nào nhanh hơn?”. Câu hỏi đúng là: **trong một burst event, giá trị nào có ý nghĩa với nghiệp vụ?**
@@ -81,7 +85,10 @@ D mở cửa sổ 700..1000, giữ mới nhất ─────► E@1000
 Mỗi giá trị mới thay giá trị đang chờ và bắt đầu lại khoảng lặng. Nếu nguồn tiếp tục phát nhanh hơn `dueTime`, downstream chưa nhận gì cả.
 
 ```ts
-import { debounceTime } from 'rxjs';
+import { debounceTime, type Observable } from 'rxjs';
+
+// Minh họa: ứng dụng cung cấp stream số cần ổn định.
+declare const source$: Observable<number>;
 
 const stableValue$ = source$.pipe(
   debounceTime(300),
@@ -92,7 +99,16 @@ const stableValue$ = source$.pipe(
 
 ### Ví dụ live search
 
-Live search thường không cần gọi API sau từng phím. Pipeline dưới đây chuyển DOM event thành chuỗi trước, chờ người dùng ngừng gõ, bỏ từ khóa trùng rồi hủy request cũ nếu một từ khóa mới xuất hiện:
+Live search thường không cần gọi API sau từng phím. Pipeline dưới đây chuyển DOM event thành chuỗi trước, chờ người dùng ngừng gõ, bỏ từ khóa trùng rồi hủy request cũ khi từ khóa mới **đi qua debounce**:
+
+Tạo HTML tối thiểu:
+
+```html
+<input id="product-search" type="search" placeholder="Nhập ít nhất 2 ký tự" />
+<ul id="product-results"></ul>
+```
+
+Ví dụ dùng dữ liệu giả và `timer(400)` mô phỏng độ trễ, không cần backend. `searchProducts` trả về Observable có thể hủy timer khi unsubscribe; `renderProducts` cập nhật danh sách bằng `textContent`:
 
 ```ts
 import {
@@ -102,9 +118,38 @@ import {
   map,
   of,
   switchMap,
+  timer,
+  type Observable,
 } from 'rxjs';
 
-const input = document.querySelector<HTMLInputElement>('#product-search')!;
+type Product = { id: number; name: string };
+
+const products: Product[] = [
+  { id: 1, name: 'Laptop' },
+  { id: 2, name: 'Mouse' },
+  { id: 3, name: 'Keyboard' },
+];
+
+const input = document.querySelector<HTMLInputElement>('#product-search');
+const list = document.querySelector<HTMLUListElement>('#product-results');
+if (!input || !list) throw new Error('Thiếu #product-search hoặc #product-results');
+const resultsList = list;
+
+function searchProducts(query: string): Observable<Product[]> {
+  return timer(400).pipe(
+    map(() => products.filter((product) =>
+      product.name.toLowerCase().includes(query.toLowerCase()),
+    )),
+  );
+}
+
+function renderProducts(items: Product[]): void {
+  resultsList.replaceChildren(...items.map((product) => {
+    const item = document.createElement('li');
+    item.textContent = product.name;
+    return item;
+  }));
+}
 
 const results$ = fromEvent<InputEvent>(input, 'input').pipe(
   map((event) => (event.target as HTMLInputElement).value.trim()),
@@ -115,10 +160,13 @@ const results$ = fromEvent<InputEvent>(input, 'input').pipe(
   ),
 );
 
-results$.subscribe(renderProducts);
+const subscription = results$.subscribe(renderProducts);
+window.addEventListener('pagehide', () => subscription.unsubscribe(), { once: true });
 ```
 
-Ở đây `debounceTime` giảm số request, còn `switchMap` giải quyết một vấn đề khác: response của request cũ không được phép ghi đè kết quả mới. Chỉ debounce mà bỏ `switchMap` vẫn có thể gặp stale response khi mạng chậm.
+Ở đây `debounceTime` giảm số request, còn `switchMap` giải quyết một vấn đề khác: response của request cũ không được phép ghi đè kết quả mới. Chỉ debounce mà bỏ `switchMap` vẫn có thể gặp stale response khi mạng chậm. Request cũ vẫn có thể phát kết quả trong khoảng 300 ms từ lúc người dùng gõ tiếp tới khi từ khóa mới qua debounce; ví dụ này không hủy ngay ở mỗi phím bấm.
+
+Khi thay mock bằng API thật, hãy trả về Observable/Promise theo contract của `switchMap` và xử lý lỗi request bên trong nó (ví dụ `catchError(() => of<Product[]>([]))`) để stream input không chết sau một lỗi mạng. Unsubscribe chỉ thực sự hủy HTTP nếu nguồn hỗ trợ cancellation; bỏ kết quả cũ không đồng nghĩa server ngừng xử lý.
 
 Đặt `map` trước `debounceTime` giúp phần còn lại của pipeline làm việc với domain value là chuỗi, thay vì giữ nguyên cả `InputEvent`. `distinctUntilChanged` nằm sau debounce để hai trạng thái cuối giống nhau không gọi lại API.
 
@@ -126,9 +174,14 @@ results$.subscribe(renderProducts);
 
 Đừng dùng debounce nếu downstream phải nhận tiến độ trong lúc nguồn vẫn liên tục phát. Ví dụ, người dùng kéo một slider suốt ba giây thì `debounceTime(300)` có thể chỉ phát khi họ thả tay; UI phụ thuộc downstream sẽ trông như bị đứng.
 
-Một lỗi khác là đặt debounce sau công việc đắt đỏ:
+Một lỗi khác là đặt debounce sau công việc đắt đỏ. Hai snippet dưới đây là **hai phương án minh họa thay thế nhau**, giả định ứng dụng cung cấp `source$` là stream số và `expensiveTransform` là hàm biến đổi đồng bộ:
 
 ```ts
+import { debounceTime, map, type Observable } from 'rxjs';
+
+declare const source$: Observable<number>;
+declare function expensiveTransform(value: number): number;
+
 // Không giảm chi phí của expensiveTransform vì hàm đã chạy trước debounce.
 source$.pipe(
   map(expensiveTransform),
@@ -139,6 +192,11 @@ source$.pipe(
 Nếu phép biến đổi không cần thiết cho việc quyết định debounce, hãy đặt nó phía sau:
 
 ```ts
+import { debounceTime, map, type Observable } from 'rxjs';
+
+declare const source$: Observable<number>;
+declare function expensiveTransform(value: number): number;
+
 source$.pipe(
   debounceTime(300),
   map(expensiveTransform),
@@ -154,7 +212,10 @@ source$.pipe(
 `throttleTime(duration)` mặc định phát giá trị đầu tiên ngay lập tức, sau đó bỏ các giá trị tới trong cửa sổ `duration`. Khi cửa sổ đóng, event tiếp theo lại được quyền đi qua.
 
 ```ts
-import { throttleTime } from 'rxjs';
+import { throttleTime, type Observable } from 'rxjs';
+
+// Minh họa: ứng dụng cung cấp stream số cần giới hạn tần suất.
+declare const source$: Observable<number>;
 
 const firstValuePerWindow$ = source$.pipe(
   throttleTime(1000),
@@ -168,7 +229,10 @@ const firstValuePerWindow$ = source$.pipe(
 `throttleTime` cho phép chọn giá trị ở đầu cửa sổ (`leading`) và cuối cửa sổ (`trailing`). Cấu hình mặc định là `{ leading: true, trailing: false }`.
 
 ```ts
-import { asyncScheduler, throttleTime } from 'rxjs';
+import { asyncScheduler, fromEvent, throttleTime } from 'rxjs';
+
+// Minh họa trong trình duyệt; subscribe position$ để bắt đầu lắng nghe.
+const pointerMoves$ = fromEvent<PointerEvent>(document, 'pointermove');
 
 const position$ = pointerMoves$.pipe(
   throttleTime(100, asyncScheduler, {
@@ -189,26 +253,78 @@ Khi `trailing: true`, giá trị cuối được giữ lại để phát ở ran
 
 ### Ví dụ chặn click dồn
 
-Nếu mục tiêu chỉ là bỏ accidental double-click trong một khoảng ngắn, throttle diễn đạt ý đó trực tiếp:
+Nếu mục tiêu chỉ là bỏ accidental double-click trong một khoảng ngắn, throttle diễn đạt ý đó trực tiếp. Dùng HTML này cho **một trong hai** ví dụ lưu bên dưới, không chạy cả hai subscription cùng lúc:
+
+```html
+<textarea id="draft" placeholder="Nội dung bản nháp"></textarea>
+<button id="save" type="button">Lưu bản nháp</button>
+<p id="save-status" role="status"></p>
+```
+
+Ví dụ đầu lưu đồng bộ vào `localStorage`, nên `saveDraft` trả về `void`; không có request nền cần chờ:
 
 ```ts
 import { fromEvent, throttleTime } from 'rxjs';
 
-const saveButton = document.querySelector<HTMLButtonElement>('#save')!;
+const saveButton = document.querySelector<HTMLButtonElement>('#save');
+const draft = document.querySelector<HTMLTextAreaElement>('#draft');
+const status = document.querySelector<HTMLParagraphElement>('#save-status');
+if (!saveButton || !draft || !status) throw new Error('Thiếu phần tử của form lưu');
+const draftInput = draft;
+const statusElement = status;
 
-fromEvent(saveButton, 'click').pipe(
+function saveDraft(): void {
+  try {
+    localStorage.setItem('draft', draftInput.value);
+    statusElement.textContent = 'Đã lưu bản nháp';
+  } catch {
+    statusElement.textContent = 'Không thể lưu bản nháp';
+  }
+}
+
+const subscription = fromEvent(saveButton, 'click').pipe(
   throttleTime(1000),
 ).subscribe(() => saveDraft());
+window.addEventListener('pagehide', () => subscription.unsubscribe(), { once: true });
 ```
 
 Nhưng nếu nút phải bị khóa **cho tới khi request hoàn tất**, một cửa sổ một giây là sai abstraction: request có thể mất 100 ms hoặc 5 giây. Khi đó dùng `exhaustMap` để bỏ click mới trong lúc request hiện tại còn chạy:
 
-```ts
-import { exhaustMap, fromEvent } from 'rxjs';
+Ví dụ độc lập sau mô phỏng request mất 1,5 giây rồi lưu vào `localStorage`. Ở đây `saveDraft` trả về **Observable**, không dùng lại hàm trả `void` phía trên. Nội dung được chụp tại click được chấp nhận; click trong lúc lưu bị bỏ, không được xếp hàng.
 
-fromEvent(saveButton, 'click').pipe(
-  exhaustMap(() => saveDraft()),
+```ts
+import { catchError, exhaustMap, fromEvent, map, of, timer, type Observable } from 'rxjs';
+
+const saveButton = document.querySelector<HTMLButtonElement>('#save');
+const draft = document.querySelector<HTMLTextAreaElement>('#draft');
+const status = document.querySelector<HTMLParagraphElement>('#save-status');
+if (!saveButton || !draft || !status) throw new Error('Thiếu phần tử của form lưu');
+const draftInput = draft;
+const statusElement = status;
+
+type SaveResult = { ok: boolean };
+
+function saveDraft(): Observable<SaveResult> {
+  const content = draftInput.value;
+  statusElement.textContent = 'Đang lưu…';
+  return timer(1500).pipe(
+    map((): SaveResult => {
+      localStorage.setItem('draft', content);
+      return { ok: true };
+    }),
+  );
+}
+
+function showSaveResult(result: SaveResult): void {
+  statusElement.textContent = result.ok ? 'Đã lưu bản nháp' : 'Không thể lưu bản nháp';
+}
+
+const subscription = fromEvent(saveButton, 'click').pipe(
+  exhaustMap(() => saveDraft().pipe(
+    catchError(() => of<SaveResult>({ ok: false })),
+  )),
 ).subscribe(showSaveResult);
+window.addEventListener('pagehide', () => subscription.unsubscribe(), { once: true });
 ```
 
 Mình chọn `throttleTime` cho giới hạn dựa trên đồng hồ; mình chọn `exhaustMap` cho giới hạn dựa trên lifecycle của tác vụ.
@@ -218,7 +334,10 @@ Mình chọn `throttleTime` cho giới hạn dựa trên đồng hồ; mình ch�
 `auditTime(duration)` bắt đầu một cửa sổ khi thấy event đầu tiên. Trong lúc cửa sổ mở, nó liên tục thay giá trị đang giữ; tới cuối cửa sổ, nó phát giá trị mới nhất. Sau đó operator chờ event tiếp theo để mở cửa sổ mới.
 
 ```ts
-import { auditTime } from 'rxjs';
+import { auditTime, type Observable } from 'rxjs';
+
+// Minh họa: ứng dụng cung cấp stream số cần lấy giá trị mới nhất.
+declare const source$: Observable<number>;
 
 const latestValuePerActiveWindow$ = source$.pipe(
   auditTime(100),
@@ -229,7 +348,15 @@ Cách nghĩ thực dụng là: throttle mặc định trả lời “event nào 
 
 ### Ví dụ render theo animation frame
 
-DOM không cần render lại sau mọi `pointermove`. Ta có thể gom các event xảy ra giữa hai frame và dùng tọa độ mới nhất ở frame kế tiếp:
+DOM không cần render lại sau mọi `pointermove`. Ta có thể gom các event xảy ra giữa hai frame và dùng tọa độ mới nhất ở frame kế tiếp. Thêm phần tử cursor sau vào HTML; `position: fixed` giữ nó cùng hệ tọa độ viewport với `clientX`/`clientY`, còn `pointer-events: none` tránh cản thao tác chuột:
+
+```html
+<div
+  id="cursor"
+  aria-hidden="true"
+  style="position: fixed; top: 0; left: 0; width: 12px; height: 12px; border-radius: 50%; background: crimson; pointer-events: none;"
+></div>
+```
 
 ```ts
 import {
@@ -239,14 +366,18 @@ import {
   map,
 } from 'rxjs';
 
+const cursor = document.querySelector<HTMLDivElement>('#cursor');
+if (!cursor) throw new Error('Thiếu #cursor');
+
 const pointerPosition$ = fromEvent<PointerEvent>(document, 'pointermove').pipe(
   auditTime(0, animationFrameScheduler),
   map(({ clientX, clientY }) => ({ x: clientX, y: clientY })),
 );
 
-pointerPosition$.subscribe(({ x, y }) => {
+const subscription = pointerPosition$.subscribe(({ x, y }) => {
   cursor.style.transform = `translate3d(${x}px, ${y}px, 0)`;
 });
+window.addEventListener('pagehide', () => subscription.unsubscribe(), { once: true });
 ```
 
 `animationFrameScheduler` căn việc phát với animation frame thay vì một timer tùy ý. `auditTime(0, animationFrameScheduler)` vì thế thường là mặc định tốt cho luồng cập nhật hình ảnh: trong mỗi frame đang chờ, chỉ vị trí mới nhất được render.
@@ -268,10 +399,12 @@ Nếu cần các mốc đồng hồ cố định cho dashboard, `sampleTime` th�
 
 Các operator hậu tố `Time` dùng một khoảng cố định. Khi mỗi giá trị cần thời lượng khác nhau, dùng bản selector: `debounce`, `throttle` hoặc `audit`. Selector trả về một Observable điều khiển thời điểm kết thúc khoảng chờ.
 
-Ví dụ, từ khóa ngắn được chờ lâu hơn vì thường người dùng chưa gõ xong:
+Ví dụ minh họa dưới đây giả định ứng dụng đã cung cấp `query$` là Observable chuỗi từ khóa (đã trim, như bước `map` ở live search). Từ khóa ngắn được chờ lâu hơn vì thường người dùng chưa gõ xong:
 
 ```ts
-import { debounce, timer } from 'rxjs';
+import { debounce, timer, type Observable } from 'rxjs';
+
+declare const query$: Observable<string>;
 
 const adaptiveQuery$ = query$.pipe(
   debounce((query) => timer(query.length < 3 ? 500 : 200)),

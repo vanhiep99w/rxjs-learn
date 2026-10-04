@@ -3,22 +3,236 @@ title: Tích hợp thực tế
 description: Kết nối RxJS với browser, framework frontend và Node.js.
 ---
 
-Đây là trang khung cho nhóm **Tích hợp thực tế** trong lộ trình học RxJS.
+Một pipeline chạy đúng với `of()` chưa chắc chạy đúng khi nối vào giao diện hoặc mạng. Người dùng có thể rời màn hình khi request còn pending, một component có thể subscribe hai lần, còn socket có thể sống lâu hơn consumer. Khi tích hợp RxJS, phần cần thiết kế không chỉ là operator: bạn phải biết ai mở tài nguyên, ai dùng kết quả và ai đóng nó.
+
+<Callout type="info" title="Bạn sẽ dùng trang này thế nào?">
+  Đây là bản đồ của nhóm tích hợp, kèm một mẫu quản lý lifecycle nhỏ. Bạn nên biết `Observable`, `subscribe`, `unsubscribe` và `pipe` trước khi đọc. Ví dụ dùng RxJS 7 và TypeScript; các bài riêng sẽ đi sâu vào từng nguồn I/O và framework.
+</Callout>
 
 ## Mục lục
 
-- [Phạm vi dự kiến](#phạm-vi-dự-kiến)
-- [Các bài trong nhóm](#các-bài-trong-nhóm)
+- [Khi nào nên đưa RxJS vào ứng dụng](#khi-nào-nên-đưa-rxjs-vào-ứng-dụng)
+- [Ba ranh giới cần thiết kế](#ba-ranh-giới-cần-thiết-kế)
+  - [Nguồn dữ liệu và adapter](#nguồn-dữ-liệu-và-adapter)
+  - [Pipeline và quy tắc nghiệp vụ](#pipeline-và-quy-tắc-nghiệp-vụ)
+  - [Consumer và chủ sở hữu subscription](#consumer-và-chủ-sở-hữu-subscription)
+- [Chọn bài theo tình huống](#chọn-bài-theo-tình-huống)
+- [Ví dụ nhỏ có setup và cleanup](#ví-dụ-nhỏ-có-setup-và-cleanup)
+- [Những quyết định khác nhau giữa các môi trường](#những-quyết-định-khác-nhau-giữa-các-môi-trường)
+  - [Browser và HTTP](#browser-và-http)
+  - [Angular và React](#angular-và-react)
+  - [WebSocket và Node.js](#websocket-và-nodejs)
+- [Các lỗi dễ mang từ demo sang production](#các-lỗi-dễ-mang-từ-demo-sang-production)
+- [Checklist kiểm thử tích hợp](#checklist-kiểm-thử-tích-hợp)
+- [Bắt đầu từ đâu](#bắt-đầu-từ-đâu)
+- [Tài liệu tham khảo](#tài-liệu-tham-khảo)
 
-## Phạm vi dự kiến
+## Khi nào nên đưa RxJS vào ứng dụng
 
-Nhóm này áp dụng RxJS vào các nguồn I/O và môi trường ứng dụng thường gặp.
+Mình chọn RxJS khi vấn đề nằm ở **phối hợp nhiều giá trị theo thời gian**: chờ người dùng ngừng gõ rồi tìm kiếm, thay request cũ bằng request mới, kết hợp form với dữ liệu server, hoặc dừng một phiên kéo khi thả pointer. Operator giúp bạn diễn đạt các quy tắc đó trong một pipeline thay vì rải timer, callback và cờ trạng thái ở nhiều nơi.
 
-## Các bài trong nhóm
+Nếu bạn chỉ cần một click đổi state hoặc một lần gọi API rồi hiển thị kết quả, event handler và `async`/`await` thường đủ. RxJS không tự làm request nhanh hơn, không thay HTTP client và cũng không thay cơ chế render của framework. Thêm Observable chỉ đáng khi nó làm quy tắc phối hợp rõ hơn.
 
-- **[DOM events](/docs/tich-hop/dom-events)** — Biến sự kiện giao diện thành stream có thể kết hợp.
-- **[HTTP và Ajax](/docs/tich-hop/http-ajax)** — Gọi API, hủy request và xử lý response bằng Observable.
-- **[WebSocket](/docs/tich-hop/websocket)** — Mô hình hóa kết nối hai chiều và reconnect.
-- **[RxJS với Angular](/docs/tich-hop/angular)** — Tích hợp stream vào HttpClient, forms và component lifecycle.
-- **[RxJS với React](/docs/tich-hop/react)** — Kết nối Observable với hook và vòng đời component.
-- **[RxJS với Node.js](/docs/tich-hop/nodejs)** — Bọc event, stream và tác vụ bất đồng bộ phía server.
+Trước khi viết code, hãy trả lời ba câu hỏi:
+
+1. Nguồn phát một kết quả rồi kết thúc, hay phát liên tục cho đến khi bạn ngắt?
+2. Khi có tác vụ mới, tác vụ cũ cần bị thay thế, xếp hàng hay chạy song song?
+3. Subscription thuộc component, service, phiên kết nối hay một request phía server?
+
+Câu thứ hai dẫn bạn đến nhóm [Higher-order Observables](/docs/higher-order-observables). Câu thứ ba quyết định lifecycle, và thường là nơi lỗi tích hợp xuất hiện.
+
+## Ba ranh giới cần thiết kế
+
+Tách nguồn, pipeline và consumer giúp bạn thay môi trường mà không phải viết lại toàn bộ quy tắc xử lý:
+
+```text
+DOM / HTTP / socket / EventEmitter
+                │
+                ▼
+      Adapter tạo Observable
+                │
+                ▼
+ Pipeline chuẩn hóa và phối hợp
+                │
+                ▼
+  Consumer: UI / log / response
+                ▲
+                │
+ Chủ sở hữu: subscribe + cleanup
+```
+
+Sơ đồ này mô tả ranh giới trách nhiệm, không phải timeline. Cleanup của subscription chỉ giải phóng tài nguyên bên ngoài nếu adapter đã nối teardown tới API tương ứng.
+
+### Nguồn dữ liệu và adapter
+
+Adapter chuyển API bên ngoài thành Observable. Với DOM hoặc Node.js `EventEmitter`, bạn có thể dùng `fromEvent`; với browser HTTP, có `ajax` hoặc `fromFetch`. Nếu tự bọc một SDK bằng `new Observable`, callback setup cần trả về teardown như gỡ listener hoặc hủy tác vụ mà SDK cho phép hủy.
+
+Đừng chỉ nhìn tên biến có hậu tố `$` rồi kết luận nguồn là lazy hoặc có cancellation. `from(fetch(url))` nhận một Promise từ request **đã bắt đầu**; unsubscribe ngừng chuyển kết quả tới subscriber nhưng không tự abort Fetch. `defer(() => fetch(url))` trì hoãn lúc bắt đầu, nhưng riêng `defer` vẫn không nối teardown tới `AbortController`.
+
+Đọc thêm [Cold và hot](/docs/observable-subscription/cold-va-hot) và [Tự tạo Observable](/docs/observable-subscription/custom-observable) nếu bạn chưa chắc lúc nào side effect bắt đầu.
+
+### Pipeline và quy tắc nghiệp vụ
+
+Pipeline nên làm việc với dữ liệu nhỏ, có ý nghĩa: chuỗi tìm kiếm, ID, tọa độ hoặc DTO đã kiểm tra. Chẳng hạn, đọc `input.value` ngay khi event tới rồi mới debounce; nếu giữ DOM event để đọc sau, bạn có thể đọc trạng thái DOM khác với lúc event phát sinh.
+
+Lựa chọn flattening phải khớp nghiệp vụ. `switchMap` hợp với tìm kiếm lấy kết quả mới nhất, còn `concatMap` hợp với các thao tác cần xử lý tuần tự. Với thao tác ghi, đừng chọn `switchMap` chỉ vì nó quen thuộc: ngắt subscription không chứng minh server chưa ghi dữ liệu.
+
+Mặc định mình giữ logic phối hợp trong `pipe`, không lồng `subscribe` để gọi tác vụ tiếp theo. Như vậy một subscription ở consumer có thể quản lý cả chuỗi tác vụ con do operator tạo ra, và pipeline dễ kiểm thử bằng nguồn giả hơn.
+
+### Consumer và chủ sở hữu subscription
+
+Consumer nhận kết quả rồi cập nhật UI, ghi log hoặc trả response. Chủ sở hữu quyết định lúc subscribe và lúc cleanup; trong nhiều trường hợp hai vai trò này nằm cùng một component, nhưng chúng không bắt buộc phải trùng nhau.
+
+Một subscription được tạo ở component thường kết thúc khi component bị hủy. Một kết nối shared ở service có thể sống lâu hơn, nhưng service phải có chính sách rõ ràng: mở lúc nào, đóng lúc nào và điều gì xảy ra khi consumer cuối rời đi.
+
+<Callout type="warn" title="Complete khác với unsubscribe">
+  `complete` là notification kết thúc bình thường từ stream; `unsubscribe()` là consumer ngắt subscription. Gọi `unsubscribe()` không gọi callback `complete` của observer. Nếu cần cleanup khi complete, error hoặc unsubscribe, dùng teardown hoặc `finalize`, không đặt mọi cleanup trong callback `complete`.
+</Callout>
+
+## Chọn bài theo tình huống
+
+Bạn không cần đọc cả nhóm trước khi áp dụng. Chọn nguồn I/O đang gây khó cho ứng dụng của bạn, rồi ghép thêm bài framework nếu cần.
+
+| Tình huống | Bài phù hợp | Câu hỏi cần chốt |
+| --- | --- | --- |
+| Input, click, delegation, kéo thả | [DOM events](/docs/tich-hop/dom-events) | Listener được gỡ khi nào, dữ liệu event được đọc lúc nào? |
+| Tìm kiếm, gọi API, upload | [HTTP và Ajax](/docs/tich-hop/http-ajax) | Request có abort thật không, lỗi có làm chết stream tương tác không? |
+| Nhận dữ liệu realtime, kết nối hai chiều | [WebSocket](/docs/tich-hop/websocket) | Ai sở hữu kết nối, reconnect và subscription phía server? |
+| HttpClient, forms và template Angular | [RxJS với Angular](/docs/tich-hop/angular) | Dùng consumer trong template hay subscription imperative, lifecycle kết thúc ở đâu? |
+| Đồng bộ Observable với state React | [RxJS với React](/docs/tich-hop/react) | Effect setup và cleanup có đối xứng, dependency có làm subscribe lại không? |
+| EventEmitter, callback và I/O phía server | [RxJS với Node.js](/docs/tich-hop/nodejs) | Listener, tác vụ và stream thuộc request hay process? |
+
+Angular và React là nơi tiêu thụ stream, không phải hai loại Observable khác nhau. Ví dụ, một tính năng Angular dùng HTTP vẫn cần hiểu lifecycle của request; một màn hình React dùng WebSocket vẫn cần thiết kế policy reconnect riêng.
+
+## Ví dụ nhỏ có setup và cleanup
+
+Trước khi nối API, bạn có thể kiểm tra ranh giới lifecycle bằng một preview từ khóa. Ví dụ này chạy trong browser qua bundler sau khi HTML đã tồn tại; không cần backend.
+
+```html
+<label for="query">Từ khóa</label>
+<input id="query" type="search" />
+<output id="preview" aria-live="polite"></output>
+```
+
+```ts
+import {
+  debounceTime,
+  distinctUntilChanged,
+  fromEvent,
+  map,
+  startWith,
+} from 'rxjs';
+
+function mountQueryPreview(
+  input: HTMLInputElement,
+  output: HTMLOutputElement,
+): () => void {
+  const query$ = fromEvent<Event>(input, 'input').pipe(
+    map(() => input.value.trim()),
+    startWith(input.value.trim()),
+    debounceTime(300),
+    distinctUntilChanged(),
+  );
+
+  const subscription = query$.subscribe((query) => {
+    output.textContent = query ? `Từ khóa: ${query}` : 'Chưa có từ khóa';
+  });
+
+  return () => subscription.unsubscribe();
+}
+
+const input = document.querySelector<HTMLInputElement>('#query');
+const output = document.querySelector<HTMLOutputElement>('#preview');
+if (!input || !output) throw new Error('Thiếu HTML của query preview');
+
+const dispose = mountQueryPreview(input, output);
+// Chủ sở hữu gọi dispose() khi kết thúc vòng đời widget.
+// Để thử cleanup ngay trong demo: gọi dispose() sau khi nhập.
+```
+
+`fromEvent` đăng ký listener khi subscribe, `map` lấy snapshot chuỗi ngay trong handler, còn `debounceTime` đợi khoảng lặng 300 ms. Giá trị ban đầu từ `startWith` cũng đi qua khoảng chờ này. Khi input rỗng, preview được xóa về thông báo mặc định; không filter chuỗi rỗng khiến UI giữ từ khóa cũ.
+
+Gọi `dispose()` gỡ listener và hủy timer debounce còn pending. Đây là điểm quan trọng của mẫu: hàm setup trả về cleanup ngay cạnh nơi mở subscription. Ở ứng dụng thật, chủ sở hữu phải gọi hàm đó; biến `dispose` tự nó không khiến cleanup xảy ra.
+
+Ví dụ cố ý chỉ minh họa lifecycle. Nó chưa xử lý composition của bộ gõ và không quan sát thay đổi `input.value` bằng JavaScript, vì gán giá trị không tự phát `input` event. Bài [DOM events](/docs/tich-hop/dom-events) xử lý các chi tiết này. Khi thêm request vào pipeline, xem [HTTP và Ajax](/docs/tich-hop/http-ajax) để chọn adapter có abort và phạm vi `catchError` đúng.
+
+Trong React, giữ state/render do React quản lý thay vì dùng đoạn gán `textContent` này trực tiếp. Phần có thể dùng lại là mô hình setup trả cleanup, không phải cách cập nhật DOM.
+
+## Những quyết định khác nhau giữa các môi trường
+
+Cùng một pipeline không có nghĩa là cùng một chính sách tài nguyên. Trước khi chuyển ví dụ giữa browser, framework và server, kiểm tra những khác biệt dưới đây.
+
+### Browser và HTTP
+
+Listener DOM không tự complete khi element bị gỡ khỏi trang. Nếu widget còn timer hoặc đang nghe `window`, việc xóa node không thay thế unsubscribe. Với SSR, tạo nguồn phụ thuộc `window` hoặc `document` ở phía client sau khi DOM sẵn sàng, không truy cập chúng ở module dùng chung server/client.
+
+HTTP thường là tác vụ hữu hạn, nhưng cancellation phụ thuộc adapter. `ajax` có teardown hủy XHR pending; `fromFetch` nối subscription với `AbortController`. Khi cần abort cả phần tải body đang pending, dùng `selector` của `fromFetch` để giữ việc đọc body trong lifecycle đó. Fetch cũng không tự coi HTTP 404/500 là Promise rejection; bạn cần kiểm tra `response.ok`.
+
+Abort phía client không rollback thao tác đã tới server. Vì vậy retry một thao tác ghi cần hợp đồng idempotency, không chỉ một operator `retry`.
+
+### Angular và React
+
+Trong Angular, mặc định ưu tiên `AsyncPipe` khi template là consumer: nó quản lý subscription theo lifecycle của view. Khi cần subscribe imperative để thực hiện side effect, nối cleanup với lifecycle của chủ sở hữu; ở Angular hỗ trợ API tương ứng, có thể dùng `takeUntilDestroyed` với `DestroyRef` phù hợp. Không để component và template cùng subscribe vô tình tạo hai request cold.
+
+Trong React, subscribe với stream bên ngoài trong effect và trả về cleanup. Cleanup chạy khi unmount và trước setup mới khi dependency thay đổi; với Strict Mode ở development, React còn có chu kỳ setup–cleanup bổ sung để kiểm tra tính đối xứng. Nếu thấy hai lần kết nối trong development, kiểm tra cleanup trước, đừng bỏ Strict Mode để che lỗi.
+
+Đối với external store được nhiều component đọc, cần thiết kế subscription và snapshot phù hợp với React; không mặc định mọi Observable đều nên biến thành một effect riêng cho mỗi consumer. Các bài framework sẽ đi sâu vào lựa chọn này.
+
+### WebSocket và Node.js
+
+WebSocket thường sống qua nhiều message, nên phải phân biệt lifecycle của một consumer với lifecycle của cả kết nối. Reconnect còn có thể cần xác thực lại hoặc đăng ký lại channel; kết nối mở lại không có nghĩa dữ liệu trong thời gian mất mạng tự được replay.
+
+Ở Node.js, `fromEvent(emitter, 'data')` gỡ listener đã đăng ký khi unsubscribe, nhưng không tự đóng emitter hoặc destroy stream. Event tên `error` cũng không tự trở thành error channel của Observable đang nghe `data`; adapter phải xử lý lỗi nguồn theo hợp đồng của API đó.
+
+Observable không tự cung cấp backpressure cho Node streams. Nếu consumer chậm hơn producer, `buffer` chỉ gom dữ liệu trong bộ nhớ, không khiến producer tự dừng. Với truyền file hoặc I/O cần kiểm soát tốc độ, giữ cơ chế backpressure của Node streams hoặc thiết kế adapter có pause/resume và giới hạn rõ ràng.
+
+## Các lỗi dễ mang từ demo sang production
+
+| Hiểu nhầm | Điều cần làm thay thế |
+| --- | --- |
+| Có biến `data$` là request đã được chia sẻ | Kiểm tra cold/hot và số subscription; sharing phải dùng cùng một instance Observable |
+| Thêm `shareReplay` là có cache hoàn chỉnh | Chốt scope, invalidation, replay và thời điểm ngắt upstream; `refCount` không phải TTL |
+| `catchError` ở cuối luôn giữ input hoạt động | Nếu muốn một request lỗi nhưng input tiếp tục, thường đặt recovery trong inner request |
+| `takeUntil` ở đâu cũng ngắt mọi tác vụ con | Đặt sau higher-order operator nếu muốn notifier đóng cả inner; notifier phải phát giá trị, không chỉ complete |
+| Component hết dùng là mọi tài nguyên tự đóng | Nối lifecycle tới unsubscribe và kiểm tra teardown thật của adapter |
+| Cache singleton dùng được cho mọi SSR request | Không chia sẻ dữ liệu riêng tư giữa user; chọn scope và cơ chế reset theo request hoặc phiên |
+
+Mình không thêm sharing và retry ngay từ demo đầu tiên. Trước hết, một consumer phải có lifecycle đúng và policy lỗi rõ ràng. Sau đó mới quyết định consumer nào cần chia sẻ kết quả và khi nào được phép subscribe lại nguồn.
+
+## Checklist kiểm thử tích hợp
+
+Marble test giúp kiểm tra operator và thời điểm subscription, nhưng không chứng minh browser đã abort request hay SDK đã gỡ listener. Cần thêm test ở boundary với API thật hoặc test double quan sát được teardown.
+
+- [ ] Mount rồi cleanup rồi mount lại: không có listener hoặc kết nối thừa.
+- [ ] Cleanup khi timer hoặc request đang pending: không còn cập nhật consumer cũ.
+- [ ] Hai input liên tiếp: kết quả cũ không ghi đè kết quả mới theo policy đã chọn.
+- [ ] Một request lỗi rồi input mới tới: stream tương tác vẫn hoạt động nếu đó là yêu cầu.
+- [ ] Hai consumer: số listener/request/kết nối đúng với thiết kế sharing.
+- [ ] Consumer cuối rời đi: upstream được giữ hoặc ngắt đúng policy, không chỉ đúng tình cờ.
+- [ ] Đổi user, logout hoặc đổi SSR request: dữ liệu cũ không được replay sang phạm vi mới.
+- [ ] Mất kết nối và reconnect: trạng thái UI, giới hạn retry và đăng ký lại channel đúng hợp đồng.
+
+Với preview phía trên, thử gõ rồi gọi `dispose()` trước khi hết 300 ms: output không được cập nhật bởi giá trị đang chờ. Sau cleanup, gõ tiếp cũng không cập nhật output. Nếu setup lại bằng `mountQueryPreview`, bạn phải giữ và gọi cleanup của instance mới.
+
+## Bắt đầu từ đâu
+
+Nếu bạn mới chuyển từ ví dụ operator sang ứng dụng thật, bắt đầu bằng DOM events để nhìn thấy rõ setup và teardown, rồi nối HTTP. Nếu bạn đã có lỗi cụ thể trong Angular, React hoặc Node.js, đi thẳng vào bài môi trường đó và quay lại kiểm tra ba ranh giới ở trên.
+
+<Cards>
+  <Card title="DOM events" href="/docs/tich-hop/dom-events" description="Bắt đầu với input, listener và cleanup nhìn thấy được." />
+  <Card title="HTTP và Ajax" href="/docs/tich-hop/http-ajax" description="Nối request, cancellation và recovery vào stream tương tác." />
+  <Card title="WebSocket" href="/docs/tich-hop/websocket" description="Thiết kế lifecycle kết nối hai chiều và reconnect." />
+  <Card title="RxJS với Angular" href="/docs/tich-hop/angular" description="Đưa stream vào HttpClient, forms và component lifecycle." />
+  <Card title="RxJS với React" href="/docs/tich-hop/react" description="Đồng bộ Observable với hook, state và lifecycle component." />
+  <Card title="RxJS với Node.js" href="/docs/tich-hop/nodejs" description="Kết nối EventEmitter và tác vụ I/O phía server." />
+  <Card title="Testing" href="/docs/testing" description="Kiểm thử pipeline và bổ sung test cho boundary tích hợp." />
+  <Card title="Patterns & Production" href="/docs/patterns-production" description="Đi tiếp với cache, orchestration và vận hành sau khi lifecycle đã rõ." />
+</Cards>
+
+## Tài liệu tham khảo
+
+- [RxJS fromEvent — implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/fromEvent.ts): đăng ký và gỡ handler theo subscription.
+- [RxJS fromFetch — implementation 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/dom/fetch.ts): AbortController và lifecycle đọc body với `selector`.
+- [Angular component lifecycle](https://angular.dev/guide/components/lifecycle), [AsyncPipe](https://angular.dev/api/common/AsyncPipe) và [takeUntilDestroyed](https://angular.dev/api/core/rxjs-interop/takeUntilDestroyed): liên kết consumer với lifecycle Angular.
+- [React useEffect](https://react.dev/reference/react/useEffect): setup, cleanup, dependency và chu kỳ kiểm tra trong Strict Mode.
+- [Node.js streams](https://nodejs.org/api/stream.html): lifecycle I/O và cơ chế backpressure cần giữ khi tích hợp.

@@ -3,8 +3,409 @@ title: Virtual time
 description: Mô phỏng thời gian để kiểm thử nhanh và xác định.
 ---
 
-Trang này sẽ trình bày **Virtual time** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn muốn test một ô tìm kiếm đợi người dùng ngừng gõ 300 ms, hoặc một stream polling mỗi giây. Nếu test thật sự chờ từng khoảng đó, suite sẽ chậm; nếu assertion dựa vào timer thật, event loop bận còn có thể khiến kết quả lúc đúng lúc sai.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+**Virtual time thay khoảng chờ bằng một clock do test điều khiển.** Pipeline vẫn đi qua các mốc thời gian và quy tắc cancellation như trước, nhưng test chạy công việc đã lên lịch mà không phải ngồi đợi đồng hồ ngoài đời. Mình sẽ dùng `TestScheduler.run()` làm lựa chọn mặc định cho unit test RxJS; trước đó, ta nhìn vào `VirtualTimeScheduler` để hiểu cơ chế bên dưới.
+
+<Callout type="info" title="Phạm vi và điều kiện chạy ví dụ">
+  Bài này đối chiếu **RxJS 7.8.2**. Các block TypeScript là ví dụ độc lập, chạy trong một project Node.js đã có RxJS và hỗ trợ TypeScript; assertion dùng `node:assert/strict`, không phụ thuộc Jest hay Vitest. `TestScheduler` được import từ `rxjs/testing`, các API còn lại từ `rxjs`. Bài tập trung vào clock và cách thực thi test, không thay thế hướng dẫn đầy đủ về marble syntax.
 </Callout>
+
+## Mục lục
+
+- [Virtual time thay đổi điều gì](#virtual-time-thay-đổi-điều-gì)
+  - [Clock chỉ tiến khi có công việc được chạy](#clock-chỉ-tiến-khi-có-công-việc-được-chạy)
+  - [Không phải tua nhanh toàn bộ runtime](#không-phải-tua-nhanh-toàn-bộ-runtime)
+- [Quan sát VirtualTimeScheduler trực tiếp](#quan-sát-virtualtimescheduler-trực-tiếp)
+  - [Lập lịch và flush hàng đợi](#lập-lịch-và-flush-hàng-đợi)
+  - [Giới hạn bằng maxFrames](#giới-hạn-bằng-maxframes)
+- [Chọn TestScheduler cho unit test](#chọn-testscheduler-cho-unit-test)
+- [Kiểm thử debounce bằng run](#kiểm-thử-debounce-bằng-run)
+  - [Đọc timeline trước khi viết assertion](#đọc-timeline-trước-khi-viết-assertion)
+  - [Completion có thể đẩy giá trị sớm](#completion-có-thể-đẩy-giá-trị-sớm)
+- [Viết khoảng thời gian dài mà không chờ thật](#viết-khoảng-thời-gian-dài-mà-không-chờ-thật)
+- [Dừng stream vô hạn bằng subscription window](#dừng-stream-vô-hạn-bằng-subscription-window)
+- [Assertion side effect sau flush](#assertion-side-effect-sau-flush)
+- [Ranh giới của virtual time](#ranh-giới-của-virtual-time)
+  - [Promise và I/O vẫn ở runtime thật](#promise-và-io-vẫn-ở-runtime-thật)
+  - [Clock và nguồn dữ liệu phải nhất quán](#clock-và-nguồn-dữ-liệu-phải-nhất-quán)
+- [Những bẫy thường gặp](#những-bẫy-thường-gặp)
+- [Checklist và bài tập](#checklist-và-bài-tập)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Virtual time thay đổi điều gì
+
+Một scheduler có cả cách lấy thời gian hiện tại lẫn cách chạy Action đến hạn. Với `asyncScheduler`, clock và timer bám runtime thật. Với virtual scheduler, `now()` đọc một số gọi là **frame**, và các Action chờ trong một hàng đợi sắp theo thời điểm đến hạn.
+
+Bạn có thể hình dung một bảng lịch hẹn: thay vì chờ ngoài phòng đến 10 giờ, người chạy test chuyển clock thẳng đến lịch hẹn gần nhất rồi xử lý nó. Phép so sánh này chỉ nói về thứ tự và thời gian; callback vẫn chạy JavaScript bình thường, không được chuyển sang thread khác.
+
+```text
+schedule(work, delay)
+          │
+          ▼
+    hàng đợi Action
+    sắp theo thời điểm đến hạn
+          │
+       flush()
+          │
+          ▼
+    frame = mốc kế tiếp
+          │
+          ▼
+    chạy callback đồng bộ
+          │
+          └──► xử lý Action tiếp theo, kể cả Action vừa được thêm
+```
+
+### Clock chỉ tiến khi có công việc được chạy
+
+Giả sử clock đang ở frame `0`, hàng đợi có Action ở frame `100` và `500`. Khi flush, scheduler chuyển đến `100`, chạy Action, rồi chuyển đến `500`. Nó không chạy một callback cho từng frame ở giữa.
+
+Điều này giải thích vì sao test cho timer vài phút không cần đợi vài phút. Tuy nhiên, **virtual time không làm công việc CPU trở nên miễn phí**: nếu callback tính toán nặng, hoặc bạn tạo hàng triệu tick, test vẫn phải thực thi toàn bộ lượng công việc đó.
+
+### Không phải tua nhanh toàn bộ runtime
+
+Clock ảo chỉ có hiệu lực với công việc đi qua cơ chế mà scheduler kiểm soát. Truyền một virtual scheduler vào `timer` không thay thế một `setTimeout` viết tay bên cạnh nó, không làm `fetch` trả về ngay và không tự xử lý native Promise.
+
+Đây cũng không phải một bản mô phỏng đầy đủ của browser event loop. Test xác nhận quy tắc thời gian của pipeline theo scheduler, chứ không chứng minh UI repaint đúng nhịp hay production timer không bị trễ.
+
+## Quan sát VirtualTimeScheduler trực tiếp
+
+### Lập lịch và flush hàng đợi
+
+Ví dụ này không tạo Observable; nó chỉ cho bạn thấy clock và thứ tự Action. Trong RxJS 7.8.2, những Action cùng thời điểm đến hạn được xử lý theo thứ tự enqueue.
+
+```ts
+import { deepStrictEqual, strictEqual } from 'node:assert/strict';
+import { VirtualTimeScheduler } from 'rxjs';
+
+const scheduler = new VirtualTimeScheduler();
+const events: Array<[number, string]> = [];
+
+scheduler.schedule(() => {
+  events.push([scheduler.now(), 'A']);
+
+  // Delay tương đối: frame hiện tại 10 + 5 = frame 15.
+  scheduler.schedule(() => {
+    events.push([scheduler.now(), 'C']);
+  }, 5);
+}, 10);
+
+scheduler.schedule(() => {
+  events.push([scheduler.now(), 'B']);
+}, 10);
+
+// schedule() mới enqueue; chưa có callback nào chạy.
+strictEqual(scheduler.now(), 0);
+deepStrictEqual(events, []);
+
+scheduler.flush();
+
+deepStrictEqual(events, [
+  [10, 'A'],
+  [10, 'B'],
+  [15, 'C'],
+]);
+strictEqual(scheduler.now(), 15);
+```
+
+`flush()` chạy đồng bộ cho đến khi hết Action đủ điều kiện. `A` thêm `C` trong lúc flush, nên `C` cũng được xử lý trong lần flush đó. Delay luôn tính từ clock tại thời điểm schedule, không phải một timestamp tuyệt đối tính từ frame `0`.
+
+Bạn vẫn có thể hủy Action chưa chạy bằng `Subscription` mà `schedule()` trả về. Virtual scheduler thay cách chờ, không bỏ contract `unsubscribe()` của scheduler.
+
+### Giới hạn bằng maxFrames
+
+Với Observable, bạn phải truyền scheduler vào source hoặc operator muốn điều khiển. Ví dụ dưới dùng `interval` và hai lần flush để quan sát giới hạn:
+
+```ts
+import { deepStrictEqual, strictEqual } from 'node:assert/strict';
+import { interval, take, VirtualTimeScheduler } from 'rxjs';
+
+// undefined giữ Action mặc định; 2.500 là mốc frame tối đa.
+const scheduler = new VirtualTimeScheduler(undefined, 2_500);
+const ticks: Array<[number, number]> = [];
+let completed = false;
+
+const subscription = interval(1_000, scheduler)
+  .pipe(take(3))
+  .subscribe({
+    next: (value) => ticks.push([scheduler.now(), value]),
+    complete: () => { completed = true; },
+  });
+
+scheduler.flush();
+
+deepStrictEqual(ticks, [[1_000, 0], [2_000, 1]]);
+strictEqual(scheduler.now(), 2_000);
+strictEqual(completed, false);
+strictEqual(subscription.closed, false);
+
+scheduler.maxFrames = 3_000;
+scheduler.flush();
+
+deepStrictEqual(ticks, [[1_000, 0], [2_000, 1], [3_000, 2]]);
+strictEqual(completed, true);
+strictEqual(subscription.closed, true);
+```
+
+`maxFrames` là **mốc tuyệt đối**, không phải số frame được cộng thêm ở mỗi lần flush. Action có thời điểm đến hạn bằng giới hạn vẫn được chạy. Sau lần flush đầu, clock ở `2_000`, không phải `2_500`, vì không có Action nào được xử lý tại `2_500`.
+
+Quan trọng hơn, giới hạn này chỉ dừng việc xử lý hàng đợi; nó không complete hay unsubscribe stream. Tick ở `3_000` còn chờ, và lần flush sau mới chạy nó. Nếu không cần chạy tiếp, bạn phải tự unsubscribe. Ví dụ dùng `take(3)` để subscription kết thúc ở tick thứ ba.
+
+<Callout type="warn" title="Flush không mặc định có điểm dừng">
+  `VirtualTimeScheduler` mặc định có `maxFrames = Infinity`. Một `interval` không có `take`, cancellation hoặc giới hạn hữu hạn có thể khiến `flush()` chạy mãi. Giới hạn frame cũng không cứu được một Action tự reschedule vô hạn với delay `0`, vì clock không bao giờ vượt giới hạn.
+</Callout>
+
+## Chọn TestScheduler cho unit test
+
+`TestScheduler` kế thừa `VirtualTimeScheduler`, rồi thêm công cụ tạo source giả và đối chiếu notification cùng thời điểm. Bạn không cần tự thu từng cặp `[frame, value]` cho mọi test.
+
+| Công cụ | Dùng khi nào | Bạn tự chịu trách nhiệm gì |
+| --- | --- | --- |
+| `VirtualTimeScheduler` | Muốn quan sát clock, Action hoặc thử một API nhận `SchedulerLike` tường minh | Truyền scheduler, thu kết quả, flush và dừng công việc |
+| `TestScheduler.run()` | Unit test pipeline RxJS dựa trên thời gian và lifecycle | Định nghĩa source, timeline mong đợi và điểm dừng |
+| Fake timers của test framework | Code trực tiếp gọi timer runtime | Advance timer và quản lý async theo framework |
+| Async/integration test | Promise, HTTP, DOM hoặc adapter thật | Await kết quả và kiểm tra teardown ở ranh giới thật |
+
+Mình chọn `run()` cho unit test vì nó đặt một bộ quy ước nhất quán:
+
+- Một frame trong marble string bằng **một millisecond ảo**.
+- Các API RxJS dùng timer qua provider được điều khiển bằng test scheduler, như `interval`, `delay` và `debounceTime`; không cần truyền scheduler vào từng operator.
+- Callback được thực thi đồng bộ, và `run()` tự flush sau khi callback return.
+- `maxFrames` trong run mode là `Infinity`, nên stream không tự kết thúc vẫn cần giới hạn.
+
+Đừng trộn run mode với ví dụ `TestScheduler` legacy gọi `createColdObservable()` rồi `flush()` thủ công. Ngoài `run()`, mặc định RxJS 7.8.2 dùng `frameTimeFactor = 10`, giới hạn `750` và không tự thay timer của operator như run mode. Những con số đó thuộc cách dùng `TestScheduler` cũ, không phải quy tắc chung của mọi virtual scheduler.
+
+<Callout type="info" title="Không phải monkey-patch toàn bộ timer toàn cục">
+  `run()` điều khiển các provider mà RxJS sử dụng. Nó không thay trực tiếp `globalThis.setTimeout`, `Date.now()` hay native Promise của code ứng dụng. Scheduler mặc định vẫn có thể được dùng trong pipeline, nhưng công việc timer của RxJS sẽ đi qua provider được virtualize trong phạm vi `run()`.
+</Callout>
+
+## Kiểm thử debounce bằng run
+
+### Đọc timeline trước khi viết assertion
+
+Giả sử source phát `a` ở frame `1`, `b` ở frame `3` và `c` ở frame `8`. Với `debounceTime(3)`, `a` bị thay bởi `b` trước khi đủ ba frame im lặng; `b` được phát ở frame `6`, rồi `c` ở frame `11`.
+
+Đọc theo cột dọc để so thời điểm source và output. Mỗi khoảng trên trục là một millisecond ảo, không phải thời gian test phải chờ.
+
+<MarbleDiagram
+  title="debounceTime(3)"
+  frameLabel="1 khoảng = 1 ms ảo"
+  rows={[
+    { label: 'source', marble: '-a-b----c----|', kind: 'source' },
+    { label: 'output', marble: '------b----c-|', kind: 'output' },
+  ]}
+  values={{ a: 'input đầu', b: 'input thay thế a', c: 'input sau khoảng nghỉ' }}
+  caption="a không đi xuống output; b và c mỗi giá trị chờ đủ 3 ms im lặng. Source và output cùng complete ở frame 13."
+/>
+
+Ở frame `3`, `b` cập nhật giá trị đang chờ. Đến frame `6` không có input mới, nên `b` đi xuống downstream. Source complete ở frame `13`, khi `c` đã được phát từ frame `11`, nên completion không phải chờ thêm.
+
+Test tương ứng là nguồn kiểm chứng cho sơ đồ:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { debounceTime } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, time, expectObservable, expectSubscriptions }) => {
+  const values = { a: 'r', b: 'rx', c: 'rxjs' };
+  const source$ = cold('-a-b----c----|', values);
+  const due = time('---|'); // 3 frame = 3 ms ảo.
+  const result$ = source$.pipe(debounceTime(due));
+
+  expectObservable(result$).toBe('------b----c-|', values);
+  expectSubscriptions(source$.subscriptions).toBe('^------------!');
+});
+```
+
+`cold()` tạo một source có timeline tính từ mỗi lần subscribe. `expectObservable()` mặc định subscribe ở frame `0` và ghi cả `next`, `error`, `complete` cùng frame để so với chuỗi expected. Callback `deepStrictEqual` phải thực sự assert; chỉ `console.log` actual và expected thì một test sai vẫn có thể kết thúc mà không báo lỗi.
+
+`expectSubscriptions()` kiểm tra cửa sổ subscription riêng: `^` ở frame `0`, `!` ở frame `13`. Dấu `!` ở đây biểu thị subscription đã đóng do completion, không có nghĩa source phát error hay phát một notification “unsubscribe”.
+
+### Completion có thể đẩy giá trị sớm
+
+Đừng suy ra rằng mọi output của `debounceTime(5)` đều phải muộn hơn input đúng năm frame. Nếu source complete khi còn giá trị chờ, operator phát giá trị đó ngay rồi complete:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { debounceTime } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable }) => {
+  // a ở frame 2, source complete ở frame 4.
+  const source$ = cold('--a-|');
+
+  expectObservable(source$.pipe(debounceTime(5)))
+    .toBe('----(a|)');
+});
+```
+
+`(a|)` trong test biểu thị `next(a)` và `complete` cùng frame `4`, không phải frame `7`. Quy tắc này dành cho source completion: chủ động unsubscribe không đẩy giá trị debounce còn chờ xuống consumer; source error cũng không flush giá trị đang chờ như completion.
+
+## Viết khoảng thời gian dài mà không chờ thật
+
+Không cần viết một nghìn dấu `-` để test một giây. Run mode hỗ trợ time-progression token như `100ms`, `1s`, `2m`:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { take, timer } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ expectObservable }) => {
+  const ticks$ = timer(1_000, 1_000).pipe(take(3));
+
+  expectObservable(ticks$).toBe(
+    '1s a 999ms b 999ms (c|)',
+    { a: 0, b: 1, c: 2 },
+  );
+});
+```
+
+Các emission nằm ở `1_000`, `2_000`, `3_000`; `take(3)` complete cùng emission cuối. Test xử lý ba tick chứ không ngủ ba giây.
+
+Vì sao là `999ms` thay vì `1s` giữa các value? Ký tự value trong marble string cũng làm con trỏ tiến một frame sau khi đặt emission. Sau `a` tại `1_000`, con trỏ ở `1_001`; cộng `999` mới đặt `b` đúng tại `2_000`. Dùng `a 1s b` sẽ đặt `b` ở `2_001`.
+
+<Callout type="warn" title="Chuỗi test và sơ đồ hiển thị không hoàn toàn cùng parser">
+  `MarbleDiagram` của site không hiểu time-progression token như `1s`. Khi cần sơ đồ, dùng các hàng frame ngắn và ghi đơn vị rõ ràng. Renderer có hỗ trợ nhóm `(ab)`, nhưng tiến một cột sau nhóm; parser của `TestScheduler` tiến theo độ dài chuỗi nhóm, gồm cả ngoặc. Đừng chép nguyên chuỗi có nhóm ở giữa từ test sang sơ đồ rồi giả định các frame phía sau vẫn khớp.
+</Callout>
+
+## Dừng stream vô hạn bằng subscription window
+
+`interval` không tự complete. Bạn có thể dùng `take` nếu đó là contract muốn test; nếu muốn quan sát một đoạn của stream vô hạn mà không đổi pipeline, hãy giới hạn subscription trong `expectObservable()`:
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { interval } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ expectObservable }) => {
+  const ticks$ = interval(1_000);
+  const subscriptionWindow = '^ 2499ms !';
+
+  expectObservable(ticks$, subscriptionWindow).toBe(
+    '1s a 999ms b',
+    { a: 0, b: 1 },
+  );
+});
+```
+
+`^` đặt subscribe ở frame `0` rồi tiến một frame; `2499ms` đặt unsubscribe tại `2_500`. Consumer nhận hai tick ở `1_000` và `2_000`, rồi đóng trước tick thứ ba.
+
+Expected không có `|`, vì **unsubscribe không phải completion notification**. Nếu thêm `|` vào expected, bạn đang yêu cầu producer gọi `complete()`; đó là một contract khác. Nếu dùng source giả qua `cold()` hoặc `hot()`, thêm `expectSubscriptions(source$.subscriptions)` để kiểm tra upstream thực sự được hủy đúng mốc, không chỉ output tình cờ ngừng phát.
+
+## Assertion side effect sau flush
+
+Các helper như `expectObservable()` đăng ký công việc để scheduler thực thi sau; chúng không làm source phát ngay trong dòng gọi. Vì vậy, một assertion đồng bộ đặt quá sớm có thể thấy state chưa đổi:
+
+```ts
+import { deepStrictEqual, strictEqual } from 'node:assert/strict';
+import { tap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, flush }) => {
+  let count = 0;
+  const result$ = cold('--a--b|').pipe(
+    tap(() => { count += 1; }),
+  );
+
+  expectObservable(result$).toBe('--a--b|');
+  strictEqual(count, 0);
+
+  flush();
+
+  strictEqual(count, 2);
+});
+```
+
+Ở đây `flush()` chạy source và các assertion timeline đã đăng ký trước khi kiểm tra `count`. Khi callback return, `run()` còn tự flush lần nữa; trong ví dụ này không còn công việc nên không có thêm emission.
+
+Đừng gọi `subscribe()` thêm chỉ để làm side effect chạy rồi lại dùng `expectObservable()` trên cùng cold pipeline. Bạn sẽ tạo hai execution riêng và có thể đếm gấp đôi. Đăng ký test một lần rồi flush giúp state và timeline thuộc cùng một execution.
+
+## Ranh giới của virtual time
+
+### Promise và I/O vẫn ở runtime thật
+
+Bọc Promise bằng `from()` không đưa Promise vào clock ảo. Tương tự, `fetch`, database client, DOM event hay WebSocket thật không tự phát notification theo marble chỉ vì được subscribe bên trong `run()`.
+
+Cách tách test hữu ích là giữ phần xử lý stream nhận một Observable đầu vào. Trong unit test, truyền `cold()` hoặc `hot()` thay cho adapter thật để kiểm tra debounce, retry, timeout và cancellation bằng virtual time. Sau đó viết async/integration test riêng cho adapter: Promise resolve/reject thế nào, abort có thật sự dừng request không, listener có được gỡ không.
+
+<Callout type="warn" title="Không dùng callback async cho run">
+  `run(async (...) => ...)` không khiến scheduler đợi phần sau `await`. `run()` nhận Promise như một giá trị trả về, flush và khôi phục provider ngay khi callback trả Promise. Phần tiếp tục sau `await` không còn cùng phạm vi virtual time. Giữ callback đồng bộ; dùng async test riêng cho công việc cần `await`.
+</Callout>
+
+### Clock và nguồn dữ liệu phải nhất quán
+
+`timestamp()` và `timeInterval()` dùng clock qua provider của RxJS nên có thể đi cùng virtual time trong run mode. Nhưng một phép gọi trực tiếp `Date.now()` trong code ứng dụng vẫn đọc thời gian thật; `new Date()` cũng không tự chuyển sang epoch ảo.
+
+Nếu logic nghiệp vụ vừa lên lịch vừa tự so deadline, hãy cho phép inject cùng một clock, chẳng hạn đọc `scheduler.now()`, thay vì trộn frame với timestamp thật. Một `timer(new Date(...))` còn cần mốc `Date` và clock của scheduler cùng hệ quy chiếu; ngày thật cộng vài giây không có nghĩa là vài giây sau frame `0`.
+
+Cũng đừng đặt `observeOn(scheduler)` ở cuối rồi cho rằng toàn bộ producer đã thành virtual. Ranh giới đó chỉ lập lịch notification downstream; timer viết tay, Promise hoặc side effect upstream vẫn cần một strategy test riêng.
+
+## Những bẫy thường gặp
+
+| Triệu chứng | Nguyên nhân dễ gặp | Cách sửa |
+| --- | --- | --- |
+| Test không kết thúc | `interval`, `repeat` hoặc reschedule vô hạn trong phạm vi flush | Đặt `take`, subscription window hoặc giới hạn phù hợp với test |
+| Array kết quả rỗng | Chưa flush, hoặc source nằm ngoài clock ảo | Dùng `run()`; kiểm tra Promise/timer viết tay ở ranh giới |
+| Expected lệch một frame | Quên value và `^` cũng tiến con trỏ marble | Tính mốc cụ thể rồi viết token, không đo bằng khoảng trắng |
+| Debounce phát sớm hơn dự đoán | Source complete khi còn giá trị đang chờ | Test completion riêng, đừng chỉ test khoảng im lặng |
+| Unsubscribe mà test đòi `complete` | Nhầm lifecycle subscription với notification | Dùng `!` trong subscription window, bỏ `|` khỏi output expected |
+| Assertion state thấy dữ liệu cũ | Assertion chạy trước công việc đã được schedule | Gọi helper `flush()` trước assertion side effect |
+| `maxFrames = 2500` nhưng `now()` là `2000` | Clock dừng ở Action cuối được xử lý | Không coi `flush()` là API advance clock đến một mốc tùy ý |
+| Test đầu đúng, test sau có frame lạ | Tái sử dụng cùng scheduler giữ clock/state cũ | Tạo `TestScheduler` mới cho mỗi test |
+| Virtual test đúng nhưng UI vẫn giật | Scheduler không mô phỏng CPU, repaint hay timer throttling | Kiểm tra trên runtime thật; đo hiệu năng riêng |
+
+Nếu đang dùng fake timers của Jest/Vitest, mình tránh bật chúng đồng thời cho một unit test chỉ cần `TestScheduler.run()`. Hai cơ chế điều khiển thời gian làm test khó đọc hơn mà không giúp pipeline thuần RxJS được kiểm tra tốt hơn. Khi có adapter dùng timer trực tiếp, tách test theo ranh giới thay vì tùy tiện ghép hai clock.
+
+## Checklist và bài tập
+
+Trước khi lưu một test thời gian, kiểm tra:
+
+- [ ] Scheduler mới được tạo cho test; callback assertion thực sự ném lỗi khi actual khác expected.
+- [ ] Source giả có giá trị, completion hoặc error đúng với tình huống nghiệp vụ.
+- [ ] Mốc frame của từng emission được tính trước khi viết expected.
+- [ ] Mọi stream vô hạn có điểm dừng; expected phân biệt complete, error và unsubscribe.
+- [ ] Có kiểm tra subscription khi cancellation là một phần của contract.
+- [ ] Không dựa vào native Promise, `Date.now()` hay timer viết tay được virtualize ngầm.
+- [ ] Có test runtime thật cho adapter hoặc hành vi event loop không thuộc phạm vi scheduler.
+
+Để tự kiểm tra, sửa ví dụ debounce thành source `'-a-b-|'` và giữ `due = 3`. Trước khi chạy, hãy dự đoán cả output lẫn subscription window. Bạn sẽ cần giải thích vì sao giá trị cuối xuất hiện cùng completion ở frame `5`, thay vì đợi đến frame `6`.
+
+Sau đó đổi completion thành chủ động unsubscribe ở frame `5`. Nếu expected vẫn chứa giá trị đang chờ hoặc `|`, hãy quay lại phân biệt completion của producer với cancellation của consumer.
+
+## Nguồn tham khảo
+
+- [RxJS: Testing code with marble diagrams](https://rxjs.dev/guide/testing/marble-testing) — hướng dẫn `run()`, syntax, subscription và giới hạn với Promise.
+- [VirtualTimeScheduler trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/scheduler/VirtualTimeScheduler.ts) — frame, thứ tự Action và giới hạn `maxFrames`.
+- [TestScheduler trong RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/testing/TestScheduler.ts) — parser marble, provider delegation và vòng đời `run()`.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Mô hình Scheduler" href="/docs/thoi-gian-schedulers/scheduler-model" description="Nối clock, Action và execution context trong cùng một mental model." />
+  <Card title="Debounce, throttle và audit" href="/docs/thoi-gian-schedulers/debounce-throttle-audit" description="Chọn quy tắc giảm tần suất event trước khi kiểm thử timeline." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Tiếp tục với các helper và cách tổ chức test pipeline." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Đọc và viết timeline notification, error và subscription." />
+</Cards>

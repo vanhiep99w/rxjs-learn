@@ -3,8 +3,546 @@ title: RxJS với Angular
 description: Tích hợp stream vào HttpClient, forms và component lifecycle.
 ---
 
-Trang này sẽ trình bày **RxJS với Angular** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn đang làm ô tìm kiếm trong Angular: mỗi lần gõ có thể gọi API, request cũ có thể về sau request mới, và người dùng có thể rời trang khi request vẫn chạy. Nếu xử lý từng việc bằng `subscribe()` lồng nhau, component rất nhanh có thêm cờ loading, danh sách subscription và những kết quả không còn đúng với input.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Mình thường giữ luồng xử lý trong RxJS, rồi để Angular đọc kết quả bằng `AsyncPipe` hoặc `toSignal`. Bài này đi từ `HttpClient` đến một màn tìm kiếm có trạng thái rõ ràng, sau đó giải thích ai chịu trách nhiệm dọn subscription và khi nào nên chuyển giữa Observable với Signal.
+
+<Callout type="info" title="Phạm vi và điều kiện đọc">
+  Ví dụ dành cho ứng dụng **Angular 20+**, standalone component và **RxJS 7.8.x**; dùng template control flow `@if`, `@switch`, `@for`. Bạn cần biết `pipe`, `switchMap` và subscription. Code đặt trong ứng dụng Angular của bạn, không phải chạy trực tiếp trong site tài liệu Next.js này. API `/api/products` là backend giả định, trả về mảng sản phẩm.
 </Callout>
+
+## Mục lục
+
+- [Chọn nơi sở hữu subscription](#chọn-nơi-sở-hữu-subscription)
+- [HttpClient là nguồn cold](#httpclient-là-nguồn-cold)
+  - [Đăng ký provider và viết service](#đăng-ký-provider-và-viết-service)
+  - [Hủy request không phải hoàn tác server](#hủy-request-không-phải-hoàn-tác-server)
+- [Tìm kiếm bằng Reactive Forms](#tìm-kiếm-bằng-reactive-forms)
+  - [Component có idle loading success và error](#component-có-idle-loading-success-và-error)
+  - [Đọc pipeline theo thứ tự](#đọc-pipeline-theo-thứ-tự)
+  - [Timeline của request bị thay thế](#timeline-của-request-bị-thay-thế)
+  - [Giữ form sống sau lỗi](#giữ-form-sống-sau-lỗi)
+- [Lifecycle với takeUntilDestroyed](#lifecycle-với-takeuntildestroyed)
+  - [Truyền DestroyRef ngoài injection context](#truyền-destroyref-ngoài-injection-context)
+  - [Đặt teardown sau higher-order operator](#đặt-teardown-sau-higher-order-operator)
+- [Kết nối RxJS với Signals](#kết-nối-rxjs-với-signals)
+  - [toSignal cho dữ liệu dùng trong component](#tosignal-cho-dữ-liệu-dùng-trong-component)
+  - [toObservable cho input dạng Signal](#toobservable-cho-input-dạng-signal)
+- [Chia sẻ dữ liệu mà không gọi API trùng](#chia-sẻ-dữ-liệu-mà-không-gọi-api-trùng)
+- [Những bẫy thường gặp](#những-bẫy-thường-gặp)
+- [Kiểm thử request và cancellation](#kiểm-thử-request-và-cancellation)
+- [Checklist trước khi đưa vào ứng dụng](#checklist-trước-khi-đưa-vào-ứng-dụng)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Chọn nơi sở hữu subscription
+
+Một service trả về Observable chưa nhất thiết làm công việc gì. Subscription mới là thứ kết nối consumer với producer, nên câu hỏi đầu tiên không phải “subscribe ở đâu cho tiện?” mà là “khi consumer biến mất, ai ngắt kết nối?”.
+
+```text
+FormControl.valueChanges → pipeline RxJS → view model → AsyncPipe → template
+                                               hoặc → toSignal → template / computed
+Side effect không thuộc template → subscribe + takeUntilDestroyed
+```
+
+| Nhu cầu | Mặc định mình chọn | Ai dọn subscription? |
+| --- | --- | --- |
+| Hiển thị Observable trong template | `AsyncPipe`, đọc một lần rồi dùng alias | Pipe ngắt khi view bị hủy hoặc reference nguồn đổi |
+| Dùng dữ liệu async trong `computed` hoặc logic dựa trên Signal | `toSignal` tạo một lần | Context tạo Signal bị destroy, trừ khi chọn `manualCleanup` |
+| Side effect bắt buộc như ghi log hoặc gọi một API imperative | `subscribe` cùng `takeUntilDestroyed` | `DestroyRef` được operator sử dụng |
+| Chia sẻ dữ liệu giữa nhiều consumer | Shared Observable ổn định trong service | Theo chính sách sharing và lifecycle của consumer |
+
+`AsyncPipe` đánh dấu component cần được kiểm tra khi có value mới, nên phù hợp với `OnPush`. Nó không tự biến source cold thành shared source. Hai pipe riêng biệt vẫn có thể tạo hai subscription.
+
+Không cần RxJS cho mọi biến local. Một boolean đóng/mở panel hoặc giá trị tính thuần từ vài Signal thường nên ở lại dưới dạng Signal; RxJS hữu ích khi bạn cần phối hợp event, thời gian, request hoặc cancellation.
+
+## HttpClient là nguồn cold
+
+### Đăng ký provider và viết service
+
+Trong ứng dụng standalone, đăng ký `provideHttpClient()` tại cấu hình ứng dụng. Đây là code hướng dẫn cho app Angular, không phải yêu cầu cài thêm dependency cho site tài liệu.
+
+```ts title="app.config.ts"
+import { ApplicationConfig } from '@angular/core';
+import { provideHttpClient } from '@angular/common/http';
+
+export const appConfig: ApplicationConfig = {
+  providers: [provideHttpClient()],
+};
+```
+
+Service giữ việc gọi HTTP; component sẽ quyết định gọi khi nào, dùng operator nào và hiển thị trạng thái gì.
+
+```ts title="product-api.service.ts"
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { Observable } from 'rxjs';
+
+export interface Product {
+  id: number;
+  name: string;
+}
+
+@Injectable({ providedIn: 'root' })
+export class ProductApi {
+  private readonly http = inject(HttpClient);
+
+  search(query: string): Observable<Product[]> {
+    return this.http.get<Product[]>('/api/products', {
+      params: { q: query },
+    });
+  }
+}
+```
+
+Gọi `api.search('sách')` chỉ tạo Observable. Mỗi subscription vào Observable đó thường gửi một request độc lập; riêng việc giữ nó trong biến không làm request dùng chung. Với chế độ đọc body mặc định, request thường phát một response rồi complete; interceptor có thể thay đổi hành vi này.
+
+<Callout type="warn" title="Generic không kiểm tra response ở runtime">
+  `get<Product[]>()` nói với TypeScript rằng bạn kỳ vọng mảng `Product`. Nó không xác nhận JSON nhận được đúng schema. Nếu backend trả dữ liệu không đáng tin cậy, hãy validate ở ranh giới API trước khi đưa value vào UI.
+</Callout>
+
+### Hủy request không phải hoàn tác server
+
+Unsubscribe khỏi request `HttpClient` đang chạy sẽ yêu cầu backend HTTP của Angular hủy request phía client. Vì `switchMap` unsubscribe inner cũ khi có input mới, nó là lựa chọn tốt cho thao tác đọc “chỉ quan tâm kết quả mới nhất”.
+
+Nhưng server có thể đã nhận và xử lý request. Hủy ở browser không hoàn tác việc tạo đơn hàng hay ghi dữ liệu. Với thao tác ghi, chọn chính sách theo nghiệp vụ:
+
+| Ý định | Operator thường phù hợp | Điều cần chốt |
+| --- | --- | --- |
+| Tìm kiếm hoặc đọc dữ liệu theo lựa chọn mới nhất | `switchMap` | Kết quả cũ không còn cần thiết |
+| Lưu từng thay đổi theo đúng thứ tự | `concatMap` | Hàng đợi có thể tăng khi người dùng thao tác nhanh |
+| Bỏ qua click lặp trong khi submit đang chạy | `exhaustMap` | UI cần cho biết submit đang bận |
+| Cho phép nhiều tác vụ độc lập chạy song song | `mergeMap` với giới hạn concurrency khi cần | Thứ tự response không được đảm bảo |
+
+Không tự động retry thao tác ghi chỉ vì request bị lỗi mạng. Nếu không biết server đã ghi hay chưa, cần idempotency key hoặc một cơ chế đối soát phù hợp, không chỉ thêm operator.
+
+## Tìm kiếm bằng Reactive Forms
+
+### Component có idle loading success và error
+
+Ví dụ dưới đây dùng một `FormControl` không nullable, đợi người dùng ngừng gõ 300 ms, bỏ qua query trùng sau khi trim và chỉ nhận response của query mới nhất. Các con số là lựa chọn minh họa; hãy điều chỉnh ngưỡng ký tự và debounce theo trải nghiệm sản phẩm.
+
+View model tách `error` khỏi danh sách rỗng: “không tìm thấy sản phẩm” không phải cùng trạng thái với “API bị lỗi”. Template chỉ đọc `vm$` qua **một** `AsyncPipe`, rồi dùng alias `vm` cho mọi nhánh.
+
+```ts title="product-search.component.ts"
+import { AsyncPipe } from '@angular/common';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  inject,
+} from '@angular/core';
+import { FormControl, ReactiveFormsModule } from '@angular/forms';
+import {
+  Observable,
+  catchError,
+  debounceTime,
+  distinctUntilChanged,
+  map,
+  of,
+  startWith,
+  switchMap,
+} from 'rxjs';
+import { Product, ProductApi } from './product-api.service';
+
+export type SearchState =
+  | { status: 'idle' }
+  | { status: 'loading'; query: string }
+  | { status: 'success'; query: string; products: Product[] }
+  | { status: 'error'; query: string; message: string };
+
+@Component({
+  selector: 'app-product-search',
+  standalone: true,
+  imports: [AsyncPipe, ReactiveFormsModule],
+  changeDetection: ChangeDetectionStrategy.OnPush,
+  template: `
+    <label for="product-query">Tìm sản phẩm</label>
+    <input id="product-query" type="search" [formControl]="query" />
+
+    @if (vm$ | async; as vm) {
+      <section aria-live="polite">
+        @switch (vm.status) {
+          @case ('idle') {
+            <p>Nhập ít nhất 2 ký tự để tìm kiếm.</p>
+          }
+          @case ('loading') {
+            <p>Đang tìm {{ vm.query }}…</p>
+          }
+          @case ('error') {
+            <p role="alert">{{ vm.message }}</p>
+          }
+          @case ('success') {
+            <ul>
+              @for (product of vm.products; track product.id) {
+                <li>{{ product.name }}</li>
+              } @empty {
+                <li>Không có sản phẩm phù hợp.</li>
+              }
+            </ul>
+          }
+        }
+      </section>
+    }
+  `,
+})
+export class ProductSearchComponent {
+  private readonly api = inject(ProductApi);
+  readonly query = new FormControl('', { nonNullable: true });
+
+  readonly vm$: Observable<SearchState> = this.query.valueChanges.pipe(
+    map((value) => value.trim()),
+    debounceTime(300),
+    distinctUntilChanged(),
+    startWith(this.query.value.trim()),
+    switchMap((query): Observable<SearchState> => {
+      if (query.length < 2) {
+        return of<SearchState>({ status: 'idle' });
+      }
+
+      return this.api.search(query).pipe(
+        map((products): SearchState => ({
+          status: 'success',
+          query,
+          products,
+        })),
+        catchError(() =>
+          of<SearchState>({
+            status: 'error',
+            query,
+            message: 'Không tải được sản phẩm. Hãy đổi từ khóa để thử lại.',
+          }),
+        ),
+        startWith<SearchState>({ status: 'loading', query }),
+      );
+    }),
+  );
+}
+```
+
+Để dùng màn này, render `<app-product-search />` từ một component đã import `ProductSearchComponent`, hoặc cấu hình nó làm component của route. Backend cần hỗ trợ `GET /api/products?q=...`; nếu app chạy khác origin, cấu hình proxy hoặc URL API theo môi trường của bạn.
+
+### Đọc pipeline theo thứ tự
+
+`valueChanges` phát khi control thay đổi, nhưng không tự phát giá trị hiện tại tại thời điểm subscribe. Vì vậy `startWith(this.query.value.trim())` tạo trạng thái ban đầu ngay; nó được đặt sau debounce để màn không phải đợi 300 ms mới hiện hướng dẫn.
+
+`map` chuẩn hóa query trước khi so sánh. `debounceTime` đợi một khoảng im lặng, còn `distinctUntilChanged` ngăn hai query đã chuẩn hóa giống nhau liên tiếp gọi lại API. Programmatic `setValue()` cũng phát event mặc định; với `{ emitEvent: false }`, pipeline không nhận thay đổi đó.
+
+`switchMap` thay thế request khi **query đã qua debounce** đến nơi. Query dưới hai ký tự vẫn đi vào `switchMap`, nên nó thay request đang chạy bằng `idle`; đừng `filter` bỏ query ngắn trước `switchMap` nếu bạn muốn thao tác xóa ô tìm kiếm hủy request cũ.
+
+<Callout type="warn" title="Debounce trì hoãn cả quyết định hủy">
+  Trong pipeline này, request cũ vẫn chạy trong khoảng chờ debounce và có thể trả kết quả trước khi query mới được chấp nhận. Xóa input cũng chỉ chuyển sang `idle` sau khoảng chờ đó. Nếu yêu cầu là hủy ngay mỗi lần input đổi, hãy để input thô đi vào một `switchMap` bên ngoài, rồi đặt bước chờ như `timer(300)` và request bên trong. Đó là chính sách khác, không phải hành vi mặc định của `debounceTime → switchMap`.
+</Callout>
+
+`distinctUntilChanged` cũng có nghĩa là sau lỗi, nhập lại đúng query vừa phát không tự retry. Ví dụ chủ động yêu cầu đổi từ khóa; sản phẩm có nút “Thử lại” nên có retry trigger riêng, thay vì dựa vào việc control phát lại cùng value.
+
+### Timeline của request bị thay thế
+
+Đọc theo cột dọc: hàng `query` dưới đây là query **sau debounce**, không phải từng lần nhấn phím. Frame là virtual time minh họa, không phải millisecond của ví dụ Angular.
+
+<MarbleDiagram
+  title="switchMap(query => api.search(query))"
+  rows={[
+    { label: 'query', marble: '-a---b------|', kind: 'source' },
+    { label: 'HTTP A', marble: '-^---!', kind: 'inner' },
+    { label: 'HTTP B', marble: '-----^--y|', kind: 'inner' },
+    { label: 'response', marble: '--------y---|', kind: 'output' },
+  ]}
+  values={{
+    a: 'query sách',
+    b: 'query sách rxjs',
+    y: 'response của query sách rxjs',
+  }}
+  caption="B đến ở frame 5 làm HTTP A unsubscribe; chỉ response B đi xuống output. Diagram lược bỏ các state loading và idle."
+/>
+
+A bắt đầu ở frame 1 nhưng chưa trả response khi B đến ở frame 5. B khiến A bị ngắt (`!`), rồi phát `y` ở frame 8 và complete ở frame 9. Output chưa complete ở frame 9 vì nguồn query vẫn còn sống; trong mô hình này nguồn complete ở frame 12.
+
+Form trong ứng dụng thực thường tiếp tục nhận input. Khi view bị hủy, `AsyncPipe` unsubscribe toàn bộ pipeline và request hiện hành, thay vì đợi form hoặc HTTP tự complete.
+
+### Giữ form sống sau lỗi
+
+Vị trí của `catchError` quyết định bạn cứu một request hay thay thế cả luồng input. Trong component trên, nó nằm **bên trong** `switchMap`: request lỗi biến thành state `error`, inner complete, nhưng subscription vào form vẫn còn để nhận query tiếp theo.
+
+Cách dưới đây không có cùng hành vi:
+
+```ts
+// Phản ví dụ: api là ProductApi, query$ là Observable<string>.
+const results$ = query$.pipe(
+  switchMap((query) => api.search(query)),
+  catchError(() => of([])),
+);
+```
+
+Nếu một request error, `catchError` ngoài cùng ngắt pipeline lỗi rồi chuyển sang `of([])`. Observable thay thế phát mảng rỗng và complete; query gõ sau đó không còn được xử lý qua subscription này.
+
+Không dùng một biến `loading` chung với `finalize(() => loading = false)` cho nhiều request nếu chưa xét cancellation. `finalize` chạy cả lúc request cũ bị unsubscribe, nên nó có thể tắt trạng thái loading không đúng ý bạn. View model gắn trạng thái với từng query tránh việc điều khiển UI bằng cờ rời rạc; dùng `finalize` cho cleanup tài nguyên hoặc đo thời gian thì vẫn hợp lý.
+
+## Lifecycle với takeUntilDestroyed
+
+### Truyền DestroyRef ngoài injection context
+
+Với dữ liệu chỉ cần render, cứ để `AsyncPipe` sở hữu subscription. Bạn cần subscribe thủ công khi đích đến không phải template, chẳng hạn gọi API imperative của một widget. Khi đó dùng `takeUntilDestroyed` để ràng buộc subscription với component.
+
+Ví dụ sau minh họa side effect bằng ghi log, không cần dùng nó để cập nhật view:
+
+```ts title="lifecycle-log.component.ts"
+import { Component, DestroyRef, OnInit, inject } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { interval } from 'rxjs';
+
+@Component({
+  selector: 'app-lifecycle-log',
+  standalone: true,
+  template: '<p>Xem log trong console, rồi rời khỏi trang.</p>',
+})
+export class LifecycleLogComponent implements OnInit {
+  private readonly destroyRef = inject(DestroyRef);
+
+  ngOnInit(): void {
+    interval(1000)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe((tick) => console.debug('component tick', tick));
+  }
+}
+```
+
+`ngOnInit` không phải injection context. Vì vậy mình lấy `DestroyRef` ở field initializer qua `inject()` rồi truyền rõ vào operator. Trong constructor hoặc field initializer, bạn có thể gọi `takeUntilDestroyed()` không đối số; ở event handler hoặc lifecycle hook, đừng dựa vào context ngầm.
+
+Scope cũng quan trọng: `DestroyRef` của service `providedIn: 'root'` gắn với injector ứng dụng, không với từng màn hình. Dùng `takeUntilDestroyed` trong root service không tự dọn listener khi một component sử dụng nó rời trang.
+
+### Đặt teardown sau higher-order operator
+
+Đặt operator giới hạn lifecycle sau phần pipeline tạo inner subscription để ngắt toàn bộ chuỗi:
+
+```ts
+// Trong component: refresh$ là trigger, api là ProductApi,
+// destroyRef là DestroyRef đã inject; subscription chỉ minh họa side effect.
+refresh$.pipe(
+  switchMap(() => api.search('rxjs')),
+  takeUntilDestroyed(destroyRef),
+).subscribe({
+  next: (products) => console.debug('refresh result', products),
+  error: (error: unknown) => console.error('refresh failed', error),
+});
+```
+
+Nếu đặt `takeUntilDestroyed` trước `switchMap`, destroy làm outer complete. Nhưng `switchMap` có thể chờ inner hiện hành complete, nên request đó chưa chắc bị hủy ngay. Đây là khác biệt giữa **outer complete** và **unsubscribe toàn bộ chain**.
+
+HTTP hữu hạn thường tự complete sau response, nhưng điều đó không có nghĩa mọi subscription có HTTP đều hữu hạn. Một form, timer hoặc refresh trigger bên ngoài request có thể sống lâu, và request đang chạy vẫn nên bị ngắt khi không còn consumer.
+
+## Kết nối RxJS với Signals
+
+### toSignal cho dữ liệu dùng trong component
+
+Nếu bạn muốn dùng kết quả tìm kiếm trong `computed`, chuyển `vm$` thành một Signal. Đây là biến thể của component tìm kiếm: import các API sau, đặt field **sau khai báo `vm$`**, rồi thay template đọc `AsyncPipe` bằng đọc Signal.
+
+```ts
+import { computed } from '@angular/core';
+import { toSignal } from '@angular/core/rxjs-interop';
+
+// Bên trong ProductSearchComponent, sau vm$:
+readonly vm = toSignal(this.vm$, {
+  initialValue: { status: 'idle' } as SearchState,
+});
+
+readonly resultCount = computed(() => {
+  const state = this.vm();
+  return state.status === 'success' ? state.products.length : 0;
+});
+```
+
+Template tương ứng có thể mở bằng `@if (vm(); as state)` rồi render theo `state.status`. Không đồng thời giữ `vm$ | async` nếu không có nhu cầu thật sự: `toSignal` đã tạo một subscription, thêm pipe có thể tạo subscription thứ hai và gọi API hai lần.
+
+Khác với `AsyncPipe` đợi view sử dụng, `toSignal` **subscribe ngay khi được gọi**. Tạo nó một lần trong injection context và tái sử dụng Signal, không gọi trong getter, template hoặc mỗi lần xử lý input. Nếu tạo ở ngoài context, cần truyền `injector` thích hợp qua options.
+
+| Option hoặc tình huống | Hành vi cần nhớ |
+| --- | --- |
+| `initialValue` | Giá trị đọc được trước emission đầu tiên |
+| Không có `initialValue` | Signal có thể trả `undefined` trước emission đầu tiên |
+| `requireSync: true` | Yêu cầu nguồn phát đồng bộ khi subscribe; không phù hợp với HTTP thuần hoặc nguồn đã qua debounce |
+| Source error | Đọc Signal sẽ throw lỗi; nên đổi lỗi thành state trước khi chuyển |
+| Source complete | Signal tiếp tục giữ value cuối cùng |
+| Cleanup mặc định | Ngắt subscription khi context tạo Signal bị destroy |
+
+`BehaviorSubject` thường đáp ứng `requireSync`, nhưng thêm operator làm emission thành async có thể phá đảm bảo đó. Đừng chọn option này chỉ để loại `undefined` khỏi type mà chưa kiểm tra source.
+
+### toObservable cho input dạng Signal
+
+Chiều ngược lại hữu ích khi input đang là Signal nhưng bạn cần debounce hoặc cancellation. Ví dụ này chỉ tạo stream query; nối nó vào pipeline `switchMap` và state tương tự phần form ở trên.
+
+```ts title="signal-query.component.ts"
+import { Component, signal } from '@angular/core';
+import { toObservable } from '@angular/core/rxjs-interop';
+import { debounceTime, distinctUntilChanged, map } from 'rxjs';
+
+@Component({
+  selector: 'app-signal-query',
+  standalone: true,
+  template: `
+    <input
+      #input
+      aria-label="Từ khóa tìm kiếm"
+      [value]="query()"
+      (input)="query.set(input.value)"
+    />
+  `,
+})
+export class SignalQueryComponent {
+  readonly query = signal('');
+  readonly query$ = toObservable(this.query).pipe(
+    map((value) => value.trim()),
+    debounceTime(300),
+    distinctUntilChanged(),
+  );
+}
+```
+
+Signal mô tả giá trị hiện tại, không phải một nhật ký event. `toObservable` theo dõi Signal bằng effect; giá trị đầu tiên nếu đã có có thể phát đồng bộ, nhưng các lần cập nhật tiếp theo phát bất đồng bộ sau khi Signal ổn định. Nếu bạn gọi `query.set('a')`, rồi `query.set('ab')`, rồi `query.set('abc')` liên tiếp trước khi ổn định, consumer có thể chỉ thấy `'abc'`.
+
+Nếu phải giữ mọi event, ví dụ từng click hoặc từng thao tác ghi cần xếp hàng, dùng Observable event hoặc Subject ngay từ đầu. Chuyển qua Signal rồi quay lại Observable không khôi phục các trạng thái trung gian đã mất.
+
+## Chia sẻ dữ liệu mà không gọi API trùng
+
+Màn tìm kiếm trên chỉ có một consumer nên chưa cần sharing. Nếu nhiều component cùng đọc danh mục sản phẩm, một Observable ổn định trong service có thể chia sẻ request và replay response cho consumer đến sau:
+
+```ts title="catalog.service.ts"
+import { Injectable, inject } from '@angular/core';
+import { HttpClient } from '@angular/common/http';
+import { shareReplay } from 'rxjs';
+import { Product } from './product-api.service';
+
+@Injectable({ providedIn: 'root' })
+export class CatalogService {
+  private readonly http = inject(HttpClient);
+
+  readonly products$ = this.http.get<Product[]>('/api/products').pipe(
+    shareReplay({ bufferSize: 1, refCount: true }),
+  );
+}
+```
+
+Các consumer phải dùng **cùng instance `products$`** mới dùng chung execution. Nếu một hàm mỗi lần được gọi lại tạo `http.get(...).pipe(shareReplay(...))`, bạn có nhiều shared Observable riêng, không phải một cache chung.
+
+Với RxJS 7.8.x, `refCount: true` ngắt source còn chạy khi consumer cuối rời đi. Nhưng source đã complete vẫn có thể giữ response trong buffer. Trong root service, dữ liệu đó có thể tồn tại lâu bằng service; `refCount` không phải TTL, không tự refetch và không biết server vừa thay đổi dữ liệu.
+
+<Callout type="warn" title="Quy định invalidation trước khi gọi là cache">
+  Ví dụ danh mục này giữ kết quả thành công sau complete và chưa có refresh. Nếu dữ liệu thay đổi khi ghi, logout hoặc đổi tenant, cần chính sách refresh/invalidation rõ ràng. Đặt `catchError(() => of([]))` trước sharing cũng có thể khiến mảng fallback được giữ như một kết quả thành công, che mất lỗi và không tự gọi lại API.
+</Callout>
+
+Đừng thêm `shareReplay` để chữa mọi request trùng. Trước hết kiểm tra template có nhiều pipe không, Observable có bị tạo lại mỗi lần change detection không, và có vừa `subscribe()` thủ công vừa để view subscribe không.
+
+## Những bẫy thường gặp
+
+| Triệu chứng | Nguyên nhân thường gặp | Cách sửa |
+| --- | --- | --- |
+| Một lần render gửi nhiều request | Nhiều subscription vào source cold | Đọc một lần bằng alias; share khi có nhiều consumer thực sự |
+| Request gửi lại liên tục | Gọi hàm tạo Observable trong template | Tạo field Observable ổn định, đổi dữ liệu bằng trigger |
+| Response cũ ghi đè response mới | `subscribe` lồng nhau hoặc `mergeMap` cho tìm kiếm | Dùng `switchMap` cho chính sách latest-only |
+| Form không tìm nữa sau lỗi đầu | `catchError` thay thế và complete toàn bộ stream | Bắt lỗi trong inner request |
+| Query cũ không bị hủy khi xóa ô | `filter` bỏ query ngắn trước `switchMap` | Cho query ngắn vào `switchMap`, trả state `idle` |
+| Callback vẫn chạy sau khi rời trang | Subscription thủ công không có teardown | `takeUntilDestroyed` với scope component |
+| View OnPush không cập nhật như kỳ vọng | Gán field thường trong callback mà không báo Angular | Ưu tiên `AsyncPipe` hoặc Signal; nếu imperative, quản lý change detection rõ ràng |
+| Lỗi thiếu injection context | Gọi API `inject` ngầm trong hook/event handler | Truyền `DestroyRef` hoặc `Injector` đã lấy trong context hợp lệ |
+| Catalog không đổi sau khi lưu sản phẩm | Shared response đã complete vẫn được replay | Thêm refresh/invalidation, không dựa vào `refCount` |
+
+Một subscription outer không tự sở hữu subscription mà bạn tạo thủ công trong callback của nó. Vì thế `takeUntilDestroyed` đặt trên form rồi gọi `api.search(...).subscribe()` bên trong vẫn để bạn phải dọn inner riêng. Flatten bằng operator để lifecycle nằm trong một chain.
+
+## Kiểm thử request và cancellation
+
+Đừng chỉ kiểm tra danh sách render đúng khi API trả nhanh. Hãy kiểm tra cả số request và subscription bị hủy, vì race condition thường xuất hiện khi độ trễ hai request khác nhau.
+
+Ví dụ spec dưới đây kiểm thử `ProductApi` bằng backend giả của Angular, không gọi server thật. Dùng test runner đã được cấu hình trong ứng dụng Angular của bạn; `describe`, `it`, `expect` là globals của runner đó. Đặt `provideHttpClientTesting()` **sau** `provideHttpClient()` để thay backend.
+
+```ts title="product-api.service.spec.ts"
+import { TestBed } from '@angular/core/testing';
+import { provideHttpClient } from '@angular/common/http';
+import {
+  HttpTestingController,
+  provideHttpClientTesting,
+} from '@angular/common/http/testing';
+import { ProductApi } from './product-api.service';
+
+describe('ProductApi', () => {
+  let api: ProductApi;
+  let http: HttpTestingController;
+
+  beforeEach(() => {
+    TestBed.configureTestingModule({
+      providers: [provideHttpClient(), provideHttpClientTesting()],
+    });
+    api = TestBed.inject(ProductApi);
+    http = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => http.verify());
+
+  it('không gửi request trước subscribe, trả response sau flush', () => {
+    const result$ = api.search('rxjs');
+    http.expectNone('/api/products?q=rxjs');
+
+    const seen: unknown[] = [];
+    result$.subscribe((products) => seen.push(products));
+
+    const request = http.expectOne('/api/products?q=rxjs');
+    expect(request.request.method).toBe('GET');
+    request.flush([{ id: 1, name: 'Sách RxJS' }]);
+
+    expect(seen).toEqual([[{ id: 1, name: 'Sách RxJS' }]]);
+  });
+
+  it('đánh dấu request bị hủy khi consumer unsubscribe', () => {
+    const subscription = api.search('rxjs').subscribe();
+    const request = http.expectOne('/api/products?q=rxjs');
+
+    subscription.unsubscribe();
+
+    expect(request.cancelled).toBe(true);
+  });
+});
+```
+
+Hai test này xác nhận cold behavior và cancellation của request, **chưa** chứng minh toàn bộ pipeline tìm kiếm đúng. Thêm các ca sau ở mức component/pipeline, điều khiển debounce bằng virtual time hoặc fake timer mà runner của bạn hỗ trợ:
+
+| Ca kiểm thử | Kết quả cần xác nhận |
+| --- | --- |
+| Gõ nhanh nhiều query trong khoảng debounce | Chỉ query cuối gửi request sau khoảng chờ |
+| Query B được chấp nhận khi A chưa trả | Request A bị hủy, response B trở thành state `success` |
+| Request error rồi gõ query khác | Có state `error`, sau đó query mới vẫn gửi request |
+| Xóa input khi request chạy | Sau debounce chuyển `idle`, request hiện hành bị hủy |
+| Query khác nhau chỉ ở khoảng trắng đầu/cuối | Không tạo request trùng sau normalization |
+| Hủy fixture/component khi HTTP đang pending | Request bị cancel, không có emission muộn vào view |
+
+Với unit test thuần RxJS, dùng `TestScheduler` kiểm tra cả output lẫn subscription windows. Với component dùng `toObservable`, còn cần để Angular xử lý effect/stabilization; chỉ advance clock của RxJS không thay thế vòng đời Angular. Backend testing mô phỏng cancellation phía client, không chứng minh server đã ngừng xử lý request thực.
+
+## Checklist trước khi đưa vào ứng dụng
+
+- [ ] Mỗi subscription có owner rõ: view, Signal hoặc side effect có teardown.
+- [ ] `HttpClient` đã có provider; standalone component import `AsyncPipe` và module form cần dùng.
+- [ ] Observable dùng trong template có reference ổn định, không được tạo lại từ getter/hàm render.
+- [ ] Operator flattening phù hợp với nghiệp vụ đọc/ghi, không chọn `switchMap` cho mọi thao tác.
+- [ ] State loading, rỗng và error phân biệt được; lỗi request không làm chết luồng input.
+- [ ] Lifecycle operator nằm sau phần tạo inner subscription; `DestroyRef` đúng scope.
+- [ ] `toSignal` chỉ tạo một lần; không vô tình subscribe thêm bằng pipe cho cùng nguồn cold.
+- [ ] Shared response có chính sách refresh và reset khi logout hoặc đổi phạm vi dữ liệu.
+- [ ] Test có trường hợp request chậm, lỗi, input đổi và component bị hủy.
+
+Nếu áp dụng vào một màn hiện có, bắt đầu bằng việc chuyển `subscribe` lồng nhau thành một `vm$` và đọc qua một alias trong template. Kiểm tra cancellation cùng phục hồi sau lỗi trước khi thêm cache hoặc chuyển sang Signals.
+
+## Nguồn tham khảo
+
+- [Angular: Making HTTP requests](https://angular.dev/guide/http/making-requests) — source cold, response và cancellation.
+- [Angular: AsyncPipe](https://angular.dev/api/common/AsyncPipe) — subscription theo view và change detection.
+- [Angular: Reactive forms](https://angular.dev/guide/forms/reactive-forms) — `FormControl` và luồng thay đổi giá trị.
+- [Angular: Unsubscribing with takeUntilDestroyed](https://angular.dev/ecosystem/rxjs-interop/take-until-destroyed) — `DestroyRef` và injection context.
+- [Angular: Signals interop](https://angular.dev/ecosystem/rxjs-interop) — `toSignal`, `toObservable` và timing.
+- [Angular: Test requests](https://angular.dev/guide/http/testing) — backend kiểm thử và thứ tự provider.
+- [RxJS: shareReplay](https://rxjs.dev/api/operators/shareReplay) — sharing, replay và `refCount`.
+
+## Học tiếp
+
+<Cards>
+  <Card title="switchMap" href="/docs/higher-order-observables/switch-map" description="Đọc sâu chính sách thay thế inner subscription." />
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Phân biệt complete với unsubscribe và cleanup tài nguyên." />
+  <Card title="catchError" href="/docs/loi-hoan-tat/catch-error" description="Chọn ranh giới phục hồi lỗi để stream tiếp tục hoạt động." />
+  <Card title="shareReplay" href="/docs/subjects-multicasting/share-replay" description="Hiểu cache sau complete, refCount và invalidation." />
+</Cards>
