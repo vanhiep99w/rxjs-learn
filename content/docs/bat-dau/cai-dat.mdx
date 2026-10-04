@@ -3,8 +3,413 @@ title: Cài đặt RxJS
 description: Thiết lập RxJS với npm, TypeScript và môi trường thực hành.
 ---
 
-Trang này sẽ trình bày **Cài đặt RxJS** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Cài được package chưa có nghĩa là môi trường đã sẵn sàng để học RxJS. Bạn còn cần biết TypeScript có resolve đúng kiểu dữ liệu không, lệnh nào thật sự chạy file, và vì sao một chương trình dùng `interval` có thể không chịu thoát.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Trang này dựng một playground Node.js nhỏ, chạy một stream từ đầu đến cuối, rồi dùng chính output để đọc `subscribe`, `complete` và teardown. Nếu bạn đã có project TypeScript hoặc framework, hãy xem phần [Đưa RxJS vào project hiện có](#đưa-rxjs-vào-project-hiện-có) thay vì tạo project mới.
+
+<Callout type="info" title="Phạm vi phiên bản">
+  Các lệnh và API trong bài nhắm đến **RxJS 7.8.2**, bản ổn định thuộc nhánh RxJS 7 tại thời điểm kiểm chứng. Ví dụ chỉ dùng public import từ `rxjs` và không giả định API của RxJS 8.
 </Callout>
+
+## Mục lục
+
+- [Bạn sẽ dựng gì](#bạn-sẽ-dựng-gì)
+- [Mental model: cài đặt rồi chạy](#mental-model-cài-đặt-rồi-chạy)
+- [Chuẩn bị](#chuẩn-bị)
+- [Tạo playground TypeScript](#tạo-playground-typescript)
+  - [Khởi tạo project và cài package](#khởi-tạo-project-và-cài-package)
+  - [Cấu hình ESM và TypeScript](#cấu-hình-esm-và-typescript)
+  - [Viết stream đầu tiên](#viết-stream-đầu-tiên)
+  - [Type-check và chạy](#type-check-và-chạy)
+- [Đọc lifecycle từ output](#đọc-lifecycle-từ-output)
+- [Teardown khi hủy thủ công](#teardown-khi-hủy-thủ-công)
+- [Ví dụ thực tế: dừng worker bằng Ctrl+C](#ví-dụ-thực-tế-dừng-worker-bằng-ctrlc)
+- [Đưa RxJS vào project hiện có](#đưa-rxjs-vào-project-hiện-có)
+  - [Project TypeScript hoặc bundler](#project-typescript-hoặc-bundler)
+  - [Project Angular](#project-angular)
+  - [Chọn range phiên bản](#chọn-range-phiên-bản)
+- [Pitfalls thường gặp](#pitfalls-thường-gặp)
+- [Xử lý lỗi cài đặt](#xử-lý-lỗi-cài-đặt)
+- [Tiếp tục lộ trình](#tiếp-tục-lộ-trình)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Bạn sẽ dựng gì
+
+Sau các bước bên dưới, thư mục thực hành có dạng:
+
+```text
+rxjs-playground/
+├── node_modules/
+├── src/
+│   └── index.ts
+├── package-lock.json
+├── package.json
+└── tsconfig.json
+```
+
+Bạn sẽ có:
+
+- `rxjs` trong `dependencies`, vì code chạy thật sự cần runtime của thư viện;
+- `typescript`, `tsx` và `@types/node` trong `devDependencies`, vì chúng chỉ phục vụ việc viết, kiểm tra và chạy source TypeScript;
+- một lệnh type-check riêng và một lệnh chạy riêng;
+- một stream hữu hạn để chương trình tự complete, cùng một stream sống lâu để luyện teardown.
+
+Mình khuyên tạo playground riêng thay vì cài thêm package vào repo tài liệu hoặc project đang làm việc. Một môi trường nhỏ giúp bạn nhìn rõ lỗi thuộc về RxJS, TypeScript hay cấu hình project.
+
+## Mental model: cài đặt rồi chạy
+
+`npm install` chỉ đặt runtime JavaScript và declaration TypeScript của RxJS vào `node_modules`. Nó không tự tạo Observable, không chạy operator và cũng không tự `subscribe`.
+
+```text
+npm install
+    │
+    ▼
+node_modules/rxjs
+(runtime JavaScript + type declarations)
+    │
+    ├──► tsc đọc declarations để kiểm tra kiểu
+    │
+    └──► tsx nạp runtime để chạy src/index.ts
+                         │
+                         ▼
+                    subscribe()
+                         │
+           source ─► operators ─► Observer
+                         │
+                         ▼
+              complete / error / unsubscribe
+                         │
+                         ▼
+                      teardown
+```
+
+Hãy tách ba việc trong đầu:
+
+1. **Cài package** làm cho module `rxjs` có mặt trong dependency graph.
+2. **Type-check** xác nhận import và kiểu dữ liệu hợp lệ, nhưng không chạy stream.
+3. **Thực thi** chạy file; với phần lớn cold Observable, source chỉ bắt đầu khi có `subscribe()`.
+
+Cách tách này đặc biệt hữu ích khi debug: `tsx` chạy được chưa chắc code đã qua type-check, còn `tsc --noEmit` thành công chưa chứng minh pipeline có output đúng.
+
+## Chuẩn bị
+
+Bạn cần một bản Node.js còn được hỗ trợ và npm đi kèm. Playground trong bài dùng Node.js 20 trở lên để có môi trường hiện đại, nhưng đây là lựa chọn cho bài học, không phải tuyên bố về phiên bản Node.js tối thiểu của mọi ứng dụng RxJS.
+
+Kiểm tra công cụ trước khi tạo project:
+
+```bash
+node --version
+npm --version
+```
+
+Nếu terminal không nhận ra `node` hoặc `npm`, hãy cài Node.js trước rồi mở terminal mới. Đừng dùng `sudo npm install` để chữa lỗi quyền truy cập; cách đó dễ tạo file do `root` sở hữu trong project. Nên sửa cách cài Node.js hoặc dùng một version manager phù hợp với hệ điều hành.
+
+## Tạo playground TypeScript
+
+### Khởi tạo project và cài package
+
+Chạy các lệnh sau trong thư mục dành cho bài tập, **không phải trong repo tài liệu này**:
+
+```bash
+mkdir rxjs-playground
+cd rxjs-playground
+npm init -y
+npm install rxjs@7.8.2
+npm install --save-dev typescript tsx @types/node
+npm pkg set type=module
+mkdir src
+```
+
+Việc pin `rxjs@7.8.2` giúp output của bài không thay đổi vì một major release trong tương lai. `npm` cũng tạo `package-lock.json`; hãy commit lockfile trong ứng dụng để các máy cài cùng dependency tree.
+
+Xác nhận package thực sự được resolve từ project hiện tại:
+
+```bash
+npm ls rxjs
+```
+
+Kết quả mong đợi có dòng tương tự:
+
+```text
+rxjs-playground@1.0.0
+└── rxjs@7.8.2
+```
+
+Nếu `npm ls` báo `(empty)`, thường là bạn đã chạy `npm install` ở thư mục khác. Kiểm tra `pwd` hoặc vị trí hiện tại của terminal trước khi cài lại.
+
+### Cấu hình ESM và TypeScript
+
+Tạo `tsconfig.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "types": ["node"],
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*.ts"]
+}
+```
+
+`"type": "module"` trong `package.json` và cặp `NodeNext` trong `tsconfig.json` cùng mô tả cách Node.js resolve ESM. Giữ chúng nhất quán sẽ tránh tình trạng TypeScript hiểu file theo một module system còn runtime hiểu theo hệ khác.
+
+`noEmit` có nghĩa `tsc` chỉ kiểm tra kiểu. `tsx` sẽ transpile và chạy file trực tiếp trong lúc học, nên bạn chưa cần thư mục `dist` hay một build pipeline riêng.
+
+<Callout type="warn" title="tsx không thay thế type-check">
+  `tsx` ưu tiên chạy nhanh và không thực hiện đầy đủ vai trò kiểm tra kiểu của `tsc`. Hãy chạy cả `npx tsc --noEmit` và `npx tsx src/index.ts`; hai lệnh trả lời hai câu hỏi khác nhau.
+</Callout>
+
+### Viết stream đầu tiên
+
+Tạo `src/index.ts` với import đầy đủ từ public entry point `rxjs`:
+
+```ts
+import { finalize, interval, map, take } from 'rxjs';
+
+const statuses = ['đã nhận', 'đang xử lý', 'hoàn tất'] as const;
+
+const orderStatus$ = interval(200).pipe(
+  take(statuses.length),
+  map((index) => statuses[index]),
+  finalize(() => console.log('teardown: đã dọn timer')),
+);
+
+const subscription = orderStatus$.subscribe({
+  next: (status) => console.log('next:', status),
+  error: (error: unknown) => console.error('error:', error),
+  complete: () => console.log('complete'),
+});
+
+console.log('ngay sau subscribe:', subscription.closed);
+
+setTimeout(() => {
+  console.log('sau khi kết thúc:', subscription.closed);
+}, 750);
+```
+
+Tên biến có hậu tố `$` là convention để báo rằng biến chứa Observable; đây không phải cú pháp bắt buộc của RxJS. Ví dụ mô phỏng trạng thái một đơn hàng, nhưng timer chỉ để bạn quan sát lifecycle rõ ràng, không phải cách lưu trạng thái đơn hàng production.
+
+### Type-check và chạy
+
+Trước hết, kiểm tra kiểu mà không sinh file JavaScript:
+
+```bash
+npx tsc --noEmit
+```
+
+Nếu lệnh không in lỗi và trả exit code `0`, chạy chương trình:
+
+```bash
+npx tsx src/index.ts
+```
+
+Output xuất hiện theo thời gian như sau:
+
+```text
+ngay sau subscribe: false
+next: đã nhận
+next: đang xử lý
+next: hoàn tất
+complete
+teardown: đã dọn timer
+sau khi kết thúc: true
+```
+
+`interval(200)` không phát `0` ngay lập tức; emission đầu tiên đến sau một period. Thời điểm thực tế có thể lệch đôi chút do event loop, nhưng thứ tự các dòng trên không đổi trong ví dụ này.
+
+## Đọc lifecycle từ output
+
+Khi khai báo `orderStatus$`, bạn mới tạo một công thức. Timer bắt đầu khi `subscribe()` nối Observer vào pipeline.
+
+```text
+subscribe
+    │
+    ▼
+interval: 0 ─────► 1 ─────► 2 ─────► ...
+    │              │         │
+    └──────────────┴─────────┴──► take(3)
+                                  │
+                                  ├──► map: trạng thái
+                                  ├──► Observer.complete()
+                                  └──► unsubscribe upstream
+                                             │
+                                             ▼
+                                          finalize
+```
+
+Lifecycle cụ thể là:
+
+1. `subscribe()` trả về một `Subscription`; lúc này `closed` là `false`.
+2. `interval` phát các số tăng dần. `map` đổi chỉ số thành trạng thái để Observer nhận qua `next`.
+3. Sau ba giá trị, `take(3)` gửi `complete` xuống Observer và hủy subscription phía upstream.
+4. Teardown của `interval` dọn tác vụ định kỳ; callback trong `finalize` chạy khi chuỗi kết thúc.
+5. Lần kiểm tra sau cùng thấy `subscription.closed` là `true`.
+
+`complete` là notification từ pipeline đến Observer. Teardown là quá trình giải phóng tài nguyên của execution. Hai ý liên quan nhưng không đồng nghĩa: một subscription cũng có thể teardown do `error` hoặc do consumer tự gọi `unsubscribe()`.
+
+## Teardown khi hủy thủ công
+
+Bây giờ thay nội dung `src/index.ts` bằng một stream không tự complete:
+
+```ts
+import { finalize, interval } from 'rxjs';
+
+const heartbeat$ = interval(300).pipe(
+  finalize(() => console.log('finalize: đã dọn heartbeat')),
+);
+
+const subscription = heartbeat$.subscribe({
+  next: (tick) => console.log('tick:', tick),
+  complete: () => console.log('complete'),
+});
+
+setTimeout(() => {
+  console.log('hủy subscription');
+  subscription.unsubscribe();
+  console.log('closed:', subscription.closed);
+}, 750);
+```
+
+Output mong đợi:
+
+```text
+tick: 0
+tick: 1
+hủy subscription
+finalize: đã dọn heartbeat
+closed: true
+```
+
+Bạn sẽ không thấy dòng `complete`. Gọi `unsubscribe()` dừng execution và chạy teardown, nhưng không biến thao tác hủy của consumer thành notification `complete`. Vì thế, đừng đặt cleanup bắt buộc chỉ trong callback `complete`; `finalize` hoặc teardown của source mới bao phủ cả complete, error và hủy chủ động.
+
+Nếu bỏ `take(...)` ở ví dụ trước và cũng không gọi `unsubscribe()`, timer tiếp tục giữ Node.js process sống. Đây là lý do một bài thử RxJS đôi khi “chạy xong output” nhưng terminal vẫn không trả prompt.
+
+Đọc kỹ hơn về quyền sở hữu subscription tại [Subscription và teardown](/docs/observable-subscription/subscription-teardown).
+
+## Ví dụ thực tế: dừng worker bằng Ctrl+C
+
+Một worker thường có công việc định kỳ và cần dừng gọn khi người vận hành nhấn Ctrl+C. Bạn có thể biểu diễn cả heartbeat lẫn tín hiệu `SIGINT` thành Observable, rồi để `takeUntil` nối hai lifecycle lại:
+
+```ts
+import { finalize, fromEvent, interval, takeUntil, tap } from 'rxjs';
+
+const shutdown$ = fromEvent(process, 'SIGINT');
+
+const worker$ = interval(1_000).pipe(
+  tap((tick) => console.log(`heartbeat ${tick}`)),
+  takeUntil(shutdown$),
+  finalize(() => console.log('teardown: đã dọn timer và listener')),
+);
+
+worker$.subscribe({
+  complete: () => console.log('worker đã dừng'),
+  error: (error: unknown) => console.error('worker lỗi:', error),
+});
+```
+
+Chạy file rồi nhấn Ctrl+C sau vài giây. Một phiên minh họa có thể in:
+
+```text
+heartbeat 0
+heartbeat 1
+^Cworker đã dừng
+teardown: đã dọn timer và listener
+```
+
+`fromEvent` đăng ký listener cho `SIGINT` khi có subscription. Khi listener phát giá trị đầu tiên, `takeUntil` complete `worker$`; quá trình teardown gỡ cả timer của `interval` và listener của `shutdown$`, nên process có thể thoát. Ví dụ này cho thấy lợi ích thực tế của RxJS: thay vì tự giữ hai handler rồi nhớ dọn từng cái, bạn mô tả quan hệ “chạy cho đến khi có tín hiệu dừng” trong một pipeline.
+
+<Callout type="info" title="Giới hạn của ví dụ">
+  Đây là graceful shutdown tối thiểu. Worker production còn phải ngừng nhận việc mới, chờ tác vụ đang chạy, đặt timeout cưỡng bức và trả exit code phù hợp. Xem thêm bối cảnh server tại [RxJS với Node.js](/docs/tich-hop/nodejs).
+</Callout>
+
+## Đưa RxJS vào project hiện có
+
+### Project TypeScript hoặc bundler
+
+Nếu project đã có TypeScript, Vite, Next.js hoặc bundler khác, bạn thường chỉ cần:
+
+```bash
+npm install rxjs@7.8.2
+```
+
+Không cài lại `typescript`, `tsx` hay chép nguyên `tsconfig.json` của playground nếu project đã có toolchain. Cấu hình `NodeNext` ở trên dành cho việc chạy trực tiếp bằng Node.js; bundler của ứng dụng có thể cần `moduleResolution` khác.
+
+Với RxJS 7.8.x, hãy ưu tiên public import từ package root:
+
+```ts
+import { fromEvent, map } from 'rxjs';
+```
+
+Đừng import từ `rxjs/internal/...`. Đường dẫn internal là chi tiết triển khai, không phải API contract dành cho ứng dụng. Các entry point chuyên biệt như `rxjs/ajax`, `rxjs/testing` hoặc `rxjs/webSocket` chỉ nên dùng khi bạn thật sự cần module tương ứng.
+
+### Project Angular
+
+Angular project thường đã có `rxjs` trong dependency tree. Trước khi cài thêm, kiểm tra:
+
+```bash
+npm ls rxjs
+```
+
+Hãy giữ phiên bản trong range mà phiên bản Angular của project hỗ trợ. Đừng ép `rxjs@7.8.2` chỉ để giống playground nếu việc đó xung đột với peer dependency của framework; ở đây compatibility của ứng dụng quan trọng hơn việc khớp tuyệt đối phiên bản bài học. Phần tích hợp framework nằm tại [RxJS với Angular](/docs/tich-hop/angular).
+
+### Chọn range phiên bản
+
+Ba cách cài phục vụ ba mục tiêu khác nhau:
+
+| Lệnh | Ý nghĩa | Khi nên dùng |
+| --- | --- | --- |
+| `npm install rxjs@7.8.2` | Pin đúng một phiên bản | Tutorial, workshop hoặc lúc cần tái lập output chính xác. |
+| `npm install rxjs@^7.8.2` | Cho phép các bản tương thích theo semver trong cùng major | Ứng dụng muốn nhận patch/minor có kiểm soát qua lockfile và CI. |
+| `npm install rxjs@7` | Lấy bản mới nhất trong major 7 tại thời điểm cài | Thử nghiệm nhánh 7, khi không cần khóa minor ban đầu. |
+
+Mặc định cho bài này, mình chọn pin `7.8.2`. Với ứng dụng thật, mình thường để range phù hợp chính sách cập nhật của team và dựa vào lockfile cùng CI để kiểm soát thay đổi. Tránh dùng tag prerelease nếu mục tiêu chỉ là học API ổn định của RxJS 7.
+
+## Pitfalls thường gặp
+
+- **Chạy file nhưng không có output:** tạo Observable hoặc gọi `pipe(...)` chưa khởi động cold source. Kiểm tra xem code đã `subscribe()` chưa.
+- **Node.js process không thoát:** một `interval`, event listener hoặc resource khác vẫn còn subscription sống. Dùng operator kết thúc phù hợp như `take`, `takeUntil`, hoặc gọi `unsubscribe()` ở lifecycle owner.
+- **Chỉ chạy `tsx` rồi tưởng type-safe:** `tsx` có thể thực thi trong khi `tsc` vẫn tìm thấy lỗi kiểu. Giữ bước `npx tsc --noEmit` trong workflow.
+- **Import từ đường dẫn internal:** autocomplete có thể gợi ý đường dẫn sâu, nhưng chúng làm code phụ thuộc vào cấu trúc bên trong thư viện. Chỉ import từ public entry point.
+- **Cài RxJS cả global lẫn local:** code của project resolve dependency local. `npm install --global rxjs` không thay thế cho dependency trong `package.json`.
+- **Tạo nhiều subscription ngoài ý muốn:** với cold Observable, mỗi lần `subscribe()` có thể tạo timer, listener hoặc request riêng. Cài đúng package không tự động chia sẻ execution.
+- **Tin rằng unsubscribe sẽ gọi complete:** hủy chủ động chạy teardown nhưng callback `complete` của Observer không chạy.
+
+Các khái niệm phía sau những lỗi này được mở rộng tại [RxJS là gì?](/docs/nen-tang/rxjs-la-gi), [Subscribe và Observer](/docs/bat-dau/subscribe-observer) và [Playground và debug](/docs/bat-dau/playground-va-debug).
+
+## Xử lý lỗi cài đặt
+
+| Triệu chứng | Nguyên nhân thường gặp | Cách kiểm tra và sửa |
+| --- | --- | --- |
+| `Cannot find module 'rxjs'` | Package chưa được cài trong project hiện tại | Chạy `npm ls rxjs`, kiểm tra thư mục hiện tại, rồi chạy lại `npm install rxjs@7.8.2`. |
+| TypeScript không hiểu `process` | Thiếu Node.js declarations hoặc `types` không chứa `node` | Cài `@types/node` ở devDependencies và dùng `"types": ["node"]` cho playground Node.js. |
+| Lỗi lẫn lộn ESM và CommonJS | `package.json`, `module` và runtime không cùng module system | Với playground này, giữ `"type": "module"`, `module: "NodeNext"` và `moduleResolution: "NodeNext"`. |
+| `tsx` chạy nhưng `tsc` báo lỗi | Execution và type-check là hai bước độc lập | Sửa lỗi từ `npx tsc --noEmit`; đừng lấy việc chạy được làm bằng chứng kiểu dữ liệu đúng. |
+| Có nhiều phiên bản RxJS | Các dependency yêu cầu range khác nhau | Đọc toàn bộ cây từ `npm ls rxjs`; ưu tiên range framework hỗ trợ thay vì ép dedupe mù quáng. |
+| Terminal không trả prompt | Stream hoặc resource vẫn sống | Thêm `finalize` để quan sát teardown, rồi xác định nơi cần `take`, `takeUntil` hay `unsubscribe()`. |
+
+Nếu lỗi xuất hiện trong một project lớn nhưng không tái hiện ở playground, khác biệt thường nằm ở module resolution, framework plugin hoặc dependency tree của project đó. So sánh `package.json`, `tsconfig.json` và kết quả `npm ls rxjs` trước khi thay operator trong code.
+
+## Tiếp tục lộ trình
+
+Môi trường đã ổn khi cả type-check lẫn hai ví dụ lifecycle chạy đúng. Bước tiếp theo không phải học thuộc hàng chục operator; hãy nắm chắc ai tạo execution, ai nhận notification và ai chịu trách nhiệm teardown.
+
+<Cards>
+  <Card title="Subscribe và Observer" href="/docs/bat-dau/subscribe-observer" description="Đọc ba callback next, error, complete và cách subscribe khởi động execution." />
+  <Card title="Pipe và operator" href="/docs/bat-dau/pipe-va-operator" description="Ghép các phép biến đổi thành pipeline có thể đọc và tái sử dụng." />
+  <Card title="Playground và debug" href="/docs/bat-dau/playground-va-debug" description="Quan sát giá trị, thời gian và lỗi khi thử nghiệm stream." />
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Quản lý tài nguyên cho stream sống lâu và các đường kết thúc khác nhau." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — Installation Instructions](https://rxjs.dev/guide/installation) — lệnh cài package `rxjs` qua npm và cách package cung cấp module cho consumer.
+- [Gói `rxjs` 7.8.2 trên npm](https://www.npmjs.com/package/rxjs/v/7.8.2) — phiên bản phát hành và metadata của package.
+- [RxJS 7.8.2 — `package.json`](https://github.com/ReactiveX/rxjs/blob/7.8.2/package.json) — public exports, runtime entry points và TypeScript declarations.
+- [RxJS 7.8.2 — source của `interval`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/interval.ts) — emission đầu tiên sau một period và chuỗi số tăng dần.
+- [RxJS 7.8.2 — source của `take`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/take.ts) — phát tối đa số lượng giá trị đã chọn rồi complete.
+- [RxJS 7.8.2 — source của `finalize`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/finalize.ts) — callback chạy khi complete, error hoặc unsubscribe chủ động.

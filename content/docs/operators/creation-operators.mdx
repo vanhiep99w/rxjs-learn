@@ -3,8 +3,627 @@ title: Creation operators
 description: Khởi tạo stream cho các loại nguồn dữ liệu phổ biến.
 ---
 
-Trang này sẽ trình bày **Creation operators** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn có một array, một DOM event, một Promise hoặc một clock chạy mỗi giây. Chúng khác nhau về cách hoạt động, nhưng phần còn lại của ứng dụng sẽ dễ ghép hơn nếu tất cả cùng đi vào pipeline dưới dạng `Observable`. Nhóm **creation** làm đúng việc đó: tạo source Observable từ dữ liệu, sự kiện hoặc một factory.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Tên gọi trong RxJS 7">
+  Tài liệu cũ thường gọi nhóm này là **creation operators**. Trong public API của RxJS 7.8.x, phần lớn chúng là **creation functions** được import trực tiếp từ `rxjs`, không phải pipeable operator đặt bên trong `pipe()`. Trang này giữ tên “Creation operators” theo cấu trúc khóa học, nhưng sẽ dùng “creation function” khi nói về API.
 </Callout>
+
+## Mục lục
+
+- [Mental model của creation function](#mental-model-của-creation-function)
+  - [Creation function khác pipeable operator](#creation-function-khác-pipeable-operator)
+  - [Bốn câu hỏi cần trả lời trước khi chọn](#bốn-câu-hỏi-cần-trả-lời-trước-khi-chọn)
+- [Bảng chọn nhanh](#bảng-chọn-nhanh)
+- [Giá trị và collection](#giá-trị-và-collection)
+  - [Chọn of hay from](#chọn-of-hay-from)
+  - [Tạo dãy số với range và generate](#tạo-dãy-số-với-range-và-generate)
+- [Event và callback](#event-và-callback)
+  - [fromEvent cho event API tiêu chuẩn](#fromevent-cho-event-api-tiêu-chuẩn)
+  - [fromEventPattern cho API đăng ký tùy biến](#fromeventpattern-cho-api-đăng-ký-tùy-biến)
+  - [bindCallback và bindNodeCallback cho callback một lần](#bindcallback-và-bindnodecallback-cho-callback-một-lần)
+- [Nguồn dựa trên thời gian](#nguồn-dựa-trên-thời-gian)
+- [Khởi tạo lazy và chọn source khi subscribe](#khởi-tạo-lazy-và-chọn-source-khi-subscribe)
+  - [defer tạo nguồn mới cho từng subscription](#defer-tạo-nguồn-mới-cho-từng-subscription)
+  - [iif chọn một trong hai source](#iif-chọn-một-trong-hai-source)
+- [Các source điều khiển luồng](#các-source-điều-khiển-luồng)
+- [Gắn resource vào vòng đời với using](#gắn-resource-vào-vòng-đời-với-using)
+- [Ranh giới với nhóm combination](#ranh-giới-với-nhóm-combination)
+- [Ví dụ hoàn chỉnh: refresh dữ liệu theo yêu cầu](#ví-dụ-hoàn-chỉnh-refresh-dữ-liệu-theo-yêu-cầu)
+- [Những bẫy thường gặp](#những-bẫy-thường-gặp)
+- [Checklist chọn creation function](#checklist-chọn-creation-function)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Mental model của creation function
+
+Creation function là **điểm vào** của pipeline. Nó nhận dữ liệu có sẵn, mô tả một producer hoặc một factory, rồi trả về `Observable<T>`:
+
+```text
+value / collection / event / clock / resource
+                       │
+                       ▼
+                creation function
+             of · from · timer · defer
+                       │
+                       ▼
+                 Observable<T>
+                       │
+              pipe(map, filter, ...)
+                       │
+                       ▼
+                   subscribe
+```
+
+Việc cùng trả về `Observable` không khiến mọi source có hành vi giống nhau. `of()` có thể phát đồng bộ rồi complete ngay; `fromEvent()` chờ event tương lai và thường không tự complete; `from(promise)` phát bất đồng bộ nhưng unsubscribe không hủy Promise. Creation function chuẩn hóa **giao diện quan sát**, không xóa khác biệt về lifecycle của producer bên dưới.
+
+### Creation function khác pipeable operator
+
+Creation function đứng đầu pipeline và không cần source Observable đi trước:
+
+```ts
+import { filter, map, range } from 'rxjs';
+
+const evenSquares$ = range(1, 5).pipe(
+  filter((value) => value % 2 === 0),
+  map((value) => value ** 2),
+);
+
+// 4, 16 rồi complete
+evenSquares$.subscribe(console.log);
+```
+
+Ở đây `range()` tạo source; `filter()` và `map()` là pipeable operators. Một dấu hiệu thực dụng là creation function được gọi **trước** `.pipe(...)`, còn pipeable operator nằm **bên trong** `pipe(...)`.
+
+### Bốn câu hỏi cần trả lời trước khi chọn
+
+Đừng chọn chỉ vì tên function nghe hợp. Hãy xác định bốn thuộc tính của nguồn:
+
+1. **Đơn vị emission là gì?** Cả array hay từng phần tử trong array?
+2. **Nguồn được tạo lúc khai báo hay lúc subscribe?** Điều này quyết định dữ liệu có mới theo từng subscriber hay không.
+3. **Source tự complete chứ?** Event, interval và `NEVER` có thể sống mãi nếu không được hủy.
+4. **Unsubscribe dọn được gì?** Gỡ listener và hủy timer được; một Promise đã chạy thì thường không tự bị hủy.
+
+Bốn câu hỏi này quan trọng hơn việc học thuộc danh sách API, vì chúng cho bạn biết stream sẽ cư xử thế nào trong production.
+
+## Bảng chọn nhanh
+
+| Nguồn hoặc ý định | Chọn mặc định | Emission | Complete mặc định |
+| --- | --- | --- | --- |
+| Một hay nhiều giá trị đã có | `of(...values)` | Mỗi argument là một emission | Có |
+| Array, iterable, string, Promise, async iterable | `from(input)` | Theo giao thức của input | Có với input hữu hạn |
+| Dãy số liên tiếp | `range(start, count)` | `count` số nguyên | Có |
+| Dãy sinh từ state và điều kiện lặp | `generate(options)` | Một giá trị mỗi vòng lặp | Khi condition sai |
+| DOM event hoặc `EventEmitter` quen thuộc | `fromEvent(target, name)` | Mỗi lần event xảy ra | Thường không |
+| API có hàm add/remove handler riêng | `fromEventPattern(add, remove)` | Mỗi lần handler được gọi | Thường không |
+| Callback trả kết quả một lần | `bindCallback` | Kết quả callback | Có |
+| Node-style callback `callback(error, value)` | `bindNodeCallback` | Kết quả hoặc error | Có |
+| Tick đều, tick đầu sau một chu kỳ | `interval(period)` | `0, 1, 2, ...` | Không |
+| Một lần sau delay, hoặc tick có delay đầu riêng | `timer(due, period?)` | `0, 1, 2, ...` | Có nếu không có `period` |
+| Tạo source tại thời điểm subscribe | `defer(factory)` | Theo source được tạo | Theo source đó |
+| Chọn một trong hai source khi subscribe | `iif(condition, a$, b$)` | Theo nhánh được chọn | Theo nhánh đó |
+| Complete mà không phát giá trị | `EMPTY` | Không có | Có, ngay lập tức |
+| Không phát và không kết thúc | `NEVER` | Không có | Không |
+| Phát lỗi theo error channel | `throwError(() => error)` | Không có `next` | Kết thúc bằng `error` |
+| Resource phải được dispose cùng subscription | `using(resourceFactory, sourceFactory)` | Theo source factory | Theo source đó |
+
+Bảng này là điểm bắt đầu, không phải toàn bộ quyết định. Chẳng hạn `from(fetch(...))` đúng về kiểu dữ liệu nhưng chưa chắc đúng về tính lazy và cancellation.
+
+## Giá trị và collection
+
+### Chọn of hay from
+
+`of(...values)` phát **nguyên từng argument**. `from(input)` duyệt một input có giao thức `ObservableInput`, chẳng hạn array, iterable hoặc Promise.
+
+```ts
+import { from, of } from 'rxjs';
+
+of([10, 20, 30]).subscribe((value) => {
+  console.log('of:', value);
+});
+
+from([10, 20, 30]).subscribe((value) => {
+  console.log('from:', value);
+});
+```
+
+Kết quả:
+
+```text
+of: [10, 20, 30]
+from: 10
+from: 20
+from: 30
+```
+
+Nếu downstream cần xử lý cả danh sách như một snapshot, dùng `of(items)`. Nếu mỗi item phải đi qua `filter`, `map` hoặc một workflow riêng, dùng `from(items)`. `from(42)` không hợp lệ vì number không phải `ObservableInput`; trường hợp đó dùng `of(42)`.
+
+Với Promise, `from()` chuyển resolve thành `next` rồi `complete`, và chuyển reject thành `error`:
+
+```ts
+import { from } from 'rxjs';
+
+const user$ = from(
+  Promise.resolve({ id: 'u-01', name: 'An' }),
+);
+
+user$.subscribe({
+  next: (user) => console.log(user.name),
+  complete: () => console.log('complete'),
+});
+```
+
+<Callout type="warn" title="from không làm Promise trở thành lazy">
+  Trong `from(fetch('/api/users'))`, `fetch()` chạy trước khi `from()` nhận Promise. Unsubscribe sẽ ngăn subscriber nhận kết quả về sau, nhưng không tự hủy request. Dùng `defer()` nếu cần tạo Promise lúc subscribe; dùng `AbortController`, `fromFetch` hoặc một source có teardown nếu cần cancellation thật sự.
+</Callout>
+
+### Tạo dãy số với range và generate
+
+`range(start, count)` phù hợp với dãy số nguyên liên tiếp, hữu hạn:
+
+```ts
+import { map, range } from 'rxjs';
+
+range(1, 4)
+  .pipe(map((page) => `/api/products?page=${page}`))
+  .subscribe(console.log);
+```
+
+Kết quả:
+
+```text
+/api/products?page=1
+/api/products?page=2
+/api/products?page=3
+/api/products?page=4
+```
+
+Tham số thứ hai là **số lượng emission**, không phải giá trị cuối. Vì vậy `range(3, 2)` phát `3, 4`, chứ không phải chỉ phát `3`.
+
+Khi bước chuyển state phức tạp hơn phép cộng `1`, dùng `generate()`. Dạng options object dễ đọc hơn và tránh các overload positional đã bị deprecated trong RxJS 7:
+
+```ts
+import { generate } from 'rxjs';
+
+type RetryPlan = {
+  attempt: number;
+  delayMs: number;
+};
+
+const retryPlan$ = generate<RetryPlan>({
+  initialState: { attempt: 1, delayMs: 500 },
+  condition: (state) => state.attempt <= 4,
+  iterate: (state) => ({
+    attempt: state.attempt + 1,
+    delayMs: state.delayMs * 2,
+  }),
+});
+
+retryPlan$.subscribe(console.log);
+```
+
+Ví dụ phát bốn cấu hình delay: `500`, `1000`, `2000`, `4000` ms. Nó chỉ **tạo dữ liệu mô tả retry**, không tự chờ và không tự retry request. Muốn áp dụng thời gian hoặc retry thật, bạn vẫn cần các operator tương ứng.
+
+<Callout type="warn" title="generate mặc định chạy đồng bộ">
+  Nếu bỏ `condition`, sequence có thể vô hạn. Không tạo một vòng lặp đồng bộ vô hạn rồi mong `unsubscribe()` từ bên ngoài cứu ứng dụng; call stack đang bận nên code bên ngoài chưa có cơ hội chạy. Luôn đặt điều kiện dừng, giới hạn bằng thiết kế, hoặc chọn scheduler phù hợp khi sequence lớn.
+</Callout>
+
+## Event và callback
+
+Event có thể phát nhiều lần, còn callback kiểu “trả một kết quả” thường chỉ chạy một lần. Chọn wrapper theo contract thật của API thay vì gom cả hai vào một nhóm chung.
+
+### fromEvent cho event API tiêu chuẩn
+
+`fromEvent()` nhận các target có cặp API quen thuộc như DOM `addEventListener`/`removeEventListener`, Node `addListener`/`removeListener` hoặc jQuery-style `on`/`off`.
+
+```ts
+import { fromEvent, map } from 'rxjs';
+
+const input = document.querySelector<HTMLInputElement>('#search');
+
+if (!input) {
+  throw new Error('Không tìm thấy #search');
+}
+
+const query$ = fromEvent<InputEvent>(input, 'input').pipe(
+  map((event) =>
+    (event.currentTarget as HTMLInputElement).value.trim(),
+  ),
+);
+
+const subscription = query$.subscribe((query) => {
+  console.log('query:', query);
+});
+
+// Khi màn hình không còn dùng stream:
+subscription.unsubscribe();
+```
+
+Mỗi subscription tạo một handler riêng và unsubscribe sẽ gỡ handler đó. Source không tự complete chỉ vì người dùng ngừng tương tác, nên component hoặc màn hình phải sở hữu lifecycle của subscription.
+
+### fromEventPattern cho API đăng ký tùy biến
+
+Nếu thư viện dùng API riêng như `listen(handler)` và `unlisten(token)`, `fromEventPattern()` cho bạn mô tả cả đường đăng ký lẫn teardown:
+
+```ts
+import { fromEventPattern } from 'rxjs';
+
+type Message = { topic: string; payload: unknown };
+type Handler = (message: Message) => void;
+
+declare const bus: {
+  listen(handler: Handler): string;
+  unlisten(token: string): void;
+};
+
+const messages$ = fromEventPattern<Message>(
+  (handler) => bus.listen(handler),
+  (_handler, token) => bus.unlisten(token),
+);
+
+const subscription = messages$.subscribe(console.log);
+
+// Gọi bus.unlisten(token).
+subscription.unsubscribe();
+```
+
+Giá trị `token` do hàm add trả về được chuyển sang hàm remove. Đây là chi tiết dễ bỏ sót với event bus hoặc SDK bên thứ ba.
+
+<Callout type="error" title="Không có remove handler thì chưa có teardown hoàn chỉnh">
+  RxJS có thể ngừng chuyển event đến subscriber đã đóng, nhưng producer bên ngoài vẫn giữ handler nếu bạn không gỡ nó. Với source sống lâu, đó là đường dẫn trực tiếp đến listener trùng lặp và memory leak.
+</Callout>
+
+### bindCallback và bindNodeCallback cho callback một lần
+
+`bindCallback()` biến một function nhận callback cuối cùng thành function trả về Observable. `bindNodeCallback()` dành cho Node-style callback có dạng `(error, result)`; error khác `null` sẽ đi vào error channel.
+
+```ts
+import { bindNodeCallback } from 'rxjs';
+import { readFile } from 'node:fs';
+
+const readFile$ = bindNodeCallback(readFile);
+
+readFile$('config.json', 'utf8').subscribe({
+  next: (content) => console.log(content),
+  error: (error: unknown) => console.error('Không đọc được file:', error),
+  complete: () => console.log('complete'),
+});
+```
+
+Function gốc chỉ được gọi khi Observable kết quả có subscriber. Tuy nhiên, wrapper không tự phát minh cancellation cho API callback; muốn hủy, API gốc phải cung cấp cơ chế hủy và bạn phải nối cơ chế đó vào teardown.
+
+Với code mới, nếu API đã hỗ trợ Promise tốt và tác vụ chỉ trả một kết quả, `async`/`await` thường dễ đọc hơn. Dùng callback binding khi bạn đang tích hợp một API callback cũ vào pipeline RxJS lớn hơn.
+
+## Nguồn dựa trên thời gian
+
+`interval(period)` và `timer(due, period?)` đều phát số tăng dần, nhưng khác thời điểm emission đầu tiên:
+
+```text
+interval(1000):       ──1s── 0 ──1s── 1 ──1s── 2 ──►
+timer(0, 1000):       0 ──1s── 1 ──1s── 2 ─────────►
+timer(1000):          ──1s── 0 │ complete
+time ───────────────────────────────────────────────►
+```
+
+```ts
+import { interval, take, timer } from 'rxjs';
+
+interval(1_000)
+  .pipe(take(3))
+  .subscribe((tick) => console.log('interval:', tick));
+
+timer(0, 1_000)
+  .pipe(take(3))
+  .subscribe((tick) => console.log('timer:', tick));
+```
+
+Mình mặc định chọn:
+
+- `interval(period)` khi emission đầu tiên cũng phải chờ đủ một chu kỳ;
+- `timer(0, period)` khi polling cần chạy ngay lúc bắt đầu;
+- `timer(delay)` khi chỉ cần một tín hiệu sau khoảng chờ.
+
+Cả delay lẫn period đều là thời gian tối thiểu mong đợi, không phải deadline chính xác. Event loop bận có thể làm tick chạy muộn. `interval()` và dạng lặp của `timer()` không tự complete; hãy nối lifecycle bằng `take`, `takeUntil` hoặc unsubscribe từ owner của subscription.
+
+## Khởi tạo lazy và chọn source khi subscribe
+
+### defer tạo nguồn mới cho từng subscription
+
+`defer(factory)` gọi factory riêng cho **mỗi lần subscribe**. Nó hữu ích khi source phụ thuộc vào thời gian hiện tại, state hiện tại hoặc một Promise phải được tạo mới.
+
+```ts
+import { defer, from } from 'rxjs';
+
+type Profile = {
+  id: string;
+  displayName: string;
+};
+
+const profile$ = defer(() =>
+  from(
+    fetch('/api/profile').then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      return (await response.json()) as Profile;
+    }),
+  ),
+);
+
+// Mỗi subscription tạo một fetch mới.
+profile$.subscribe((profile) => console.log('A:', profile.displayName));
+profile$.subscribe((profile) => console.log('B:', profile.displayName));
+```
+
+Đây là điểm khác giữa “công thức tạo request” và “Promise đã chạy”. Nhưng `defer()` không phải cache, cũng không làm request có thể hủy. Nếu hai subscriber phải dùng chung một request, bạn cần chiến lược sharing riêng; nếu unsubscribe phải abort request, source phải nối teardown với `AbortController`.
+
+### iif chọn một trong hai source
+
+`iif(condition, trueSource, falseSource)` gọi `condition` lúc subscribe rồi chỉ subscribe vào một nhánh. Dùng nó khi hai nhánh đều đã là Observable và điều kiện phải được đọc lại theo từng subscription.
+
+```ts
+import { defer, from, iif } from 'rxjs';
+
+let isAdmin = false;
+
+const adminDashboard$ = defer(() =>
+  from(fetch('/api/admin/dashboard')),
+);
+
+const userDashboard$ = defer(() =>
+  from(fetch('/api/dashboard')),
+);
+
+const dashboard$ = iif(
+  () => isAdmin,
+  adminDashboard$,
+  userDashboard$,
+);
+
+// Chọn userDashboard$.
+dashboard$.subscribe();
+
+isAdmin = true;
+
+// Đọc lại isAdmin và chọn adminDashboard$.
+dashboard$.subscribe();
+```
+
+Các nhánh dùng `defer()` để request chưa chạy trước khi được chọn. Nếu bạn truyền trực tiếp `from(fetch(...))` cho cả hai nhánh, cả hai lời gọi `fetch()` đã bắt đầu ngay lúc khai báo dù `iif()` chỉ subscribe một nhánh.
+
+Nếu việc chọn source có hơn hai nhánh hoặc cần nhiều logic, một `defer(() => { ... })` với `switch` thường rõ hơn việc lồng nhiều `iif()`.
+
+## Các source điều khiển luồng
+
+Ba source nhỏ thường xuất hiện trong nhánh điều kiện, error handling và test:
+
+| Source | `next` | Kết thúc | Cách dùng điển hình |
+| --- | --- | --- | --- |
+| `EMPTY` | Không | `complete` ngay | Bỏ qua một nhánh nhưng kết thúc sạch |
+| `NEVER` | Không | Không bao giờ | Giữ một nhánh im lặng có chủ đích hoặc mô phỏng timeout trong test |
+| `throwError(() => error)` | Không | `error` ngay | Trả một Observable lỗi ở nơi API yêu cầu `ObservableInput` |
+
+```ts
+import { EMPTY, NEVER, iif, throwError } from 'rxjs';
+
+const canLoad = true;
+const optionalLoad$ = iif(() => canLoad, EMPTY, NEVER);
+
+function requireId(id: string | undefined) {
+  return id
+    ? EMPTY
+    : throwError(() => new Error('Thiếu id'));
+}
+```
+
+`EMPTY` và `NEVER` không phải `undefined` hay “không làm gì”. Chúng có lifecycle rất khác: `EMPTY` kết thúc ngay, còn `NEVER` giữ subscription mở mãi. Chỉ dùng `NEVER` khi hành vi không kết thúc là điều bạn thật sự muốn và đã biết ai sẽ unsubscribe.
+
+Với `throwError`, dùng error factory `() => new Error(...)` trong RxJS 7. Cách này tạo error tại thời điểm subscribe và giữ stack trace gần nơi lỗi thực sự xảy ra hơn.
+
+## Gắn resource vào vòng đời với using
+
+`using(resourceFactory, observableFactory)` tạo một resource riêng cho mỗi subscription và gọi `resource.unsubscribe()` khi source complete, error hoặc bị unsubscribe. Đây là lựa chọn phù hợp khi source cần một resource có vòng đời rõ ràng, chẳng hạn `AbortController`, socket handle hoặc object khóa tạm thời.
+
+Ví dụ sau abort request khi subscription bị hủy:
+
+```ts
+import { from, using } from 'rxjs';
+
+type RequestResource = {
+  controller: AbortController;
+  unsubscribe(): void;
+};
+
+function loadJson<T>(url: string) {
+  return using(
+    (): RequestResource => {
+      const controller = new AbortController();
+
+      return {
+        controller,
+        unsubscribe: () => controller.abort(),
+      };
+    },
+    (resource) => {
+      const { controller } = resource as RequestResource;
+
+      return from(
+        fetch(url, { signal: controller.signal }).then(
+          async (response) => {
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status}`);
+            }
+
+            return (await response.json()) as T;
+          },
+        ),
+      );
+    },
+  );
+}
+
+type Report = { id: string; status: string };
+
+const subscription = loadJson<Report>('/api/report/current').subscribe({
+  next: (report) => console.log(report.status),
+  error: (error: unknown) => console.error(error),
+});
+
+// Gọi controller.abort() qua resource.unsubscribe().
+subscription.unsubscribe();
+```
+
+Cả `resourceFactory` lẫn `observableFactory` chạy lúc subscribe, nên request là lazy và mỗi subscription có controller riêng. Khi source tự complete, resource vẫn được dispose; `abort()` sau khi request đã xong là vô hại.
+
+<Callout type="idea" title="Khi nào không cần using">
+  Nếu bạn tự viết `new Observable(...)`, có thể trả teardown function trực tiếp từ constructor. `using()` hữu ích khi muốn tách việc sở hữu resource khỏi source factory hoặc khi resource đã có contract `unsubscribe()`. Đừng thêm nó chỉ để bọc một source không có gì cần cleanup.
+</Callout>
+
+## Ranh giới với nhóm combination
+
+`concat`, `merge`, `combineLatest`, `zip`, `forkJoin` và `race` cũng có dạng creation function: chúng nhận nhiều `ObservableInput` rồi tạo một Observable mới. Tuy nhiên, câu hỏi chính của chúng không còn là “đưa loại dữ liệu nào vào RxJS?” mà là **“phối hợp nhiều stream theo quy tắc nào?”**.
+
+Vì vậy, trang này tập trung vào source ban đầu. Khi đã có từ hai stream trở lên, hãy chuyển sang [Combination operators](/docs/operators/combination-operators) để chọn theo thứ tự subscribe, thời điểm emission và điều kiện complete.
+
+Một quy tắc ngắn:
+
+- một nguồn bên ngoài cần được đưa vào RxJS → nghĩ đến creation function;
+- nhiều Observable cần phối hợp → nghĩ đến combination;
+- mỗi emission cần biến đổi hoặc lọc → dùng pipeable operator.
+
+## Ví dụ hoàn chỉnh: refresh dữ liệu theo yêu cầu
+
+Giả sử dashboard phải tải dữ liệu ngay khi mở, tải lại mỗi 30 giây và cũng cho phép người dùng bấm nút refresh. Ví dụ này ghép ba loại source: DOM event, clock và request lazy.
+
+```ts
+import {
+  defer,
+  from,
+  fromEvent,
+  map,
+  merge,
+  startWith,
+  switchMap,
+  timer,
+  type Observable,
+} from 'rxjs';
+
+type Metric = {
+  name: string;
+  value: number;
+};
+
+const refreshButton = document.querySelector<HTMLButtonElement>(
+  '#refresh',
+);
+
+if (!refreshButton) {
+  throw new Error('Không tìm thấy #refresh');
+}
+
+function requestMetrics(): Observable<Metric[]> {
+  return defer(() =>
+    from(
+      fetch('/api/metrics').then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
+        return (await response.json()) as Metric[];
+      }),
+    ),
+  );
+}
+
+const manualRefresh$ = fromEvent(refreshButton, 'click');
+const scheduledRefresh$ = timer(30_000, 30_000);
+
+const refresh$ = merge(manualRefresh$, scheduledRefresh$).pipe(
+  startWith('initial'),
+);
+
+const metrics$ = refresh$.pipe(
+  switchMap(() => requestMetrics()),
+  map((metrics) =>
+    metrics.slice().sort((a, b) => b.value - a.value),
+  ),
+);
+
+const subscription = metrics$.subscribe({
+  next: (metrics) => console.table(metrics),
+  error: (error: unknown) => console.error('Không tải được metrics:', error),
+});
+
+export function destroyDashboard(): void {
+  subscription.unsubscribe();
+}
+```
+
+Dòng chảy của pipeline:
+
+1. `fromEvent()` biến click thành stream refresh thủ công.
+2. `timer(30_000, 30_000)` phát tick đầu sau 30 giây rồi lặp lại.
+3. `merge()` gom hai trigger; `startWith()` thêm trigger ban đầu để tải ngay.
+4. Mỗi trigger khiến `switchMap()` subscribe vào `requestMetrics()`.
+5. `defer()` chỉ gọi `fetch()` lúc inner stream được subscribe.
+6. Khi owner gọi `destroyDashboard()`, listener và timer được teardown.
+
+Có một giới hạn quan trọng: `switchMap()` ngừng nhận kết quả từ inner Observable cũ, nhưng wrapper `from(Promise)` không tự abort `fetch`. Nếu request mạng phải bị hủy thật sự khi refresh mới đến, thay `requestMetrics()` bằng source nối với `AbortController`, chẳng hạn cách dùng `using()` ở phần trước hoặc `fromFetch`.
+
+## Những bẫy thường gặp
+
+1. **Gọi mọi thứ là operator rồi đặt chúng trong `pipe()`.** `of`, `from`, `timer`, `defer` là creation functions và tạo source trước `.pipe()`.
+2. **Nhầm `of(array)` với `from(array)`.** Một bên phát cả array một lần; bên kia phát từng phần tử.
+3. **Dùng `from(fetch(...))` rồi mong request lazy.** `fetch()` đã chạy. Bọc việc tạo Promise bằng `defer()`.
+4. **Mong unsubscribe hủy mọi async work.** Nó chỉ hủy thứ source biết cách teardown. Promise không có cancellation chuẩn.
+5. **Subscribe nhiều lần mà quên mỗi subscription có thể tạo producer mới.** Bạn có thể vô tình tạo nhiều request, timer hoặc listener.
+6. **Để `interval`, event stream hoặc `NEVER` không có owner.** Các source này không tự complete; lifecycle phải đến từ ứng dụng.
+7. **Bỏ remove handler trong `fromEventPattern()`.** Subscription đóng nhưng SDK bên ngoài vẫn giữ callback.
+8. **Tạo `generate()` vô hạn đồng bộ.** Main thread có thể bị chiếm trước khi code có cơ hội unsubscribe.
+9. **Dùng `iif()` nhưng tạo Promise eager ở cả hai nhánh.** Chỉ một nhánh được subscribe, nhưng cả hai tác vụ đã khởi động. Dùng `defer()` cho nhánh có side effect.
+10. **Dùng `EMPTY` và `NEVER` thay nhau.** `EMPTY` complete ngay; `NEVER` không complete. Khác biệt này có thể làm combination operator kết thúc hoặc treo hoàn toàn khác nhau.
+11. **Truyền scheduler trực tiếp vào các overload cũ.** Nhiều scheduler argument trên creation function đã deprecated trong RxJS 7. Khi thật sự cần scheduling, ưu tiên `scheduled(input, scheduler)` hoặc API scheduler còn được hỗ trợ rõ ràng.
+
+## Checklist chọn creation function
+
+Trước khi viết code, đi từ trên xuống:
+
+- [ ] Tôi muốn phát cả giá trị hay duyệt từng phần tử của collection?
+- [ ] Producer phải chạy lúc khai báo hay lúc có subscriber?
+- [ ] Mỗi subscriber cần execution riêng hay dùng chung một execution?
+- [ ] Source phát đồng bộ hay bất đồng bộ?
+- [ ] Source tự complete, error hay có thể sống vô hạn?
+- [ ] Unsubscribe có gỡ listener, dừng timer, abort request hoặc dispose resource không?
+- [ ] API bên ngoài là event nhiều lần hay callback một lần?
+- [ ] Tôi đang tạo source ban đầu, hay thực ra đang kết hợp nhiều Observable?
+
+Nếu chưa trả lời được câu lifecycle và teardown, đừng vội chọn function. Code có thể chạy đúng ở happy path nhưng vẫn tạo request trùng, listener thừa hoặc subscription không bao giờ đóng.
+
+## Bài tập tự kiểm tra
+
+Hãy chạy ba thử nghiệm nhỏ sau trong playground:
+
+1. Tạo cùng một array bằng `of([1, 2, 3])` và `from([1, 2, 3])`; thêm `map` để quan sát kiểu dữ liệu downstream nhận được.
+2. So sánh `from(createRequest())` với `defer(() => from(createRequest()))`; đặt `console.log` trong `createRequest()` và subscribe hai lần để xác định chính xác lúc producer chạy.
+3. Tạo `fromEventPattern()` cho một event bus giả; đếm số handler sau subscribe và sau unsubscribe để kiểm tra teardown.
+
+Sau mỗi bài, ghi lại bốn điểm: số emission, thời điểm producer bắt đầu, cách stream kết thúc và tài nguyên nào được dọn. Nếu trả lời được cả bốn mà không cần đoán, bạn đã nắm đúng mental model của nhóm creation.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Creation functions" href="/docs/observable-subscription/creation-functions" description="Đi sâu vào of, from, fromEvent, timer, defer và lifecycle của từng nguồn." />
+  <Card title="Pipe và operator" href="/docs/bat-dau/pipe-va-operator" description="Phân biệt source factory với pipeable operator và xây pipeline dễ đọc." />
+  <Card title="Combination operators" href="/docs/operators/combination-operators" description="Phối hợp nhiều stream theo thứ tự và thời điểm emission." />
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Quản lý ownership, cancellation và cleanup của source sống lâu." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — API list](https://rxjs.dev/api) — public API của các creation function và constant.
+- [RxJS 7.8.2 source — `from`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/from.ts), [`of`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/of.ts) và [`defer`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/defer.ts) — cách tạo source từ input và trì hoãn factory đến lúc subscribe.
+- [RxJS 7.8.2 source — `fromEvent`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/fromEvent.ts) và [`fromEventPattern`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/fromEventPattern.ts) — đăng ký và gỡ event handler.
+- [RxJS 7.8.2 source — `generate`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/generate.ts), [`iif`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/iif.ts) và [`using`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/using.ts) — state loop, chọn source lúc subscribe và resource lifecycle.
+- [RxJS — Scheduler argument deprecation](https://rxjs.dev/deprecations/scheduler-argument) — hướng chuyển khỏi các overload scheduler đã deprecated.

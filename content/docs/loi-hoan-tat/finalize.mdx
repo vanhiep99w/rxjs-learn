@@ -3,8 +3,473 @@ title: finalize
 description: Thực hiện cleanup bất kể stream thành công, lỗi hay bị hủy.
 ---
 
-Trang này sẽ trình bày **finalize** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn bật loading trước một request rồi tắt nó trong callback `complete`. Request thành công thì ổn, nhưng nếu request lỗi hoặc người dùng rời màn hình, loading có thể bị kẹt. `finalize` là chỗ đặt cleanup phải chạy khi subscription kết thúc, không phụ thuộc kết quả thành công hay thất bại.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Các ví dụ dùng API của RxJS 7.8.x, import trực tiếp từ `rxjs`. Bạn nên biết `pipe`, `subscribe` và sự khác nhau giữa `complete`, `error`, `unsubscribe`; xem [Subscription và teardown](/docs/observable-subscription/subscription-teardown) nếu cần ôn lại.
 </Callout>
+
+## Mục lục
+
+- [Mental model: cleanup theo vòng đời subscription](#mental-model-cleanup-theo-vòng-đời-subscription)
+- [API và những gì finalize không làm](#api-và-những-gì-finalize-không-làm)
+- [Ba đường kết thúc qua ví dụ](#ba-đường-kết-thúc-qua-ví-dụ)
+  - [Complete bình thường](#complete-bình-thường)
+  - [Error từ source](#error-từ-source)
+  - [Unsubscribe chủ động](#unsubscribe-chủ-động)
+- [Phân biệt finalize với các callback khác](#phân-biệt-finalize-với-các-callback-khác)
+- [Bật và tắt loading đúng vòng đời](#bật-và-tắt-loading-đúng-vòng-đời)
+- [Vị trí trong pipeline quyết định phạm vi cleanup](#vị-trí-trong-pipeline-quyết-định-phạm-vi-cleanup)
+  - [Retry và repeat tạo nhiều lượt subscribe](#retry-và-repeat-tạo-nhiều-lượt-subscribe)
+  - [CatchError và vòng đời của fallback](#catcherror-và-vòng-đời-của-fallback)
+  - [SwitchMap và cleanup của từng inner stream](#switchmap-và-cleanup-của-từng-inner-stream)
+  - [Share và nhiều consumer](#share-và-nhiều-consumer)
+- [Cleanup không đồng nghĩa với hủy tác vụ bên dưới](#cleanup-không-đồng-nghĩa-với-hủy-tác-vụ-bên-dưới)
+- [Callback nên ngắn và không ném lỗi](#callback-nên-ngắn-và-không-ném-lỗi)
+- [Kiểm thử cả complete error và unsubscribe](#kiểm-thử-cả-complete-error-và-unsubscribe)
+- [Checklist trước khi dùng finalize](#checklist-trước-khi-dùng-finalize)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Mental model: cleanup theo vòng đời subscription
+
+Hãy coi một subscription như một lượt mượn phòng họp. Dù buổi họp kết thúc bình thường, bị gián đoạn hay bị hủy, người mượn vẫn cần tắt đèn và trả phòng. `finalize` là phần “trả phòng”, không phải biên bản xác nhận cuộc họp thành công. Điểm dừng của ví von này: RxJS chỉ chạy callback bạn đăng ký, chứ không tự biết resource nào cần dọn.
+
+**`finalize` chạy khi subscription tại vị trí của nó đóng**, qua một trong ba đường:
+
+| Đường kết thúc | Observer phía sau nhận gì? | Callback `finalize` chạy? |
+| --- | --- | --- |
+| Source complete | Notification `complete` | Có |
+| Source error | Notification `error`, trừ khi có operator xử lý lỗi ở phía sau | Có |
+| Consumer hoặc operator unsubscribe | Không có terminal notification do chính thao tác unsubscribe tạo ra | Có |
+
+```text
+complete ─────┐
+error ────────┼──► subscription đóng ──► finalize(callback)
+unsubscribe ──┘
+```
+
+Một operator cũng có thể đóng upstream mà không chờ source tự kết thúc. Ví dụ, `take(1)` complete output sau giá trị đầu tiên và unsubscribe upstream; `finalize` ở upstream vẫn chạy dù producer vốn có thể phát tiếp.
+
+Callback chạy một lần cho mỗi lần đăng ký `finalize` trên một subscription. Nếu subscribe hai lần vào cùng pipeline, hoặc `retry` tạo nhiều lượt subscribe qua vị trí đó, callback có thể chạy nhiều lần tổng cộng. Vì vậy, “chạy một lần” không có nghĩa là một lần cho cả biến Observable hay cả ứng dụng.
+
+## API và những gì finalize không làm
+
+Chữ ký API:
+
+```ts
+function finalize<T>(callback: () => void): MonoTypeOperatorFunction<T>;
+```
+
+`MonoTypeOperatorFunction<T>` nghĩa là operator nhận `Observable<T>` và trả `Observable<T>`: kiểu dữ liệu không đổi. Callback không nhận giá trị cuối, lỗi hay lý do hủy; giá trị trả về từ callback không được dùng làm dữ liệu output.
+
+```ts
+import { finalize, of } from 'rxjs';
+
+const result$ = of('profile').pipe(
+  finalize(() => console.log('cleanup')),
+);
+
+// Mới tạo pipeline: chưa subscribe, chưa chạy cleanup.
+result$.subscribe(console.log);
+```
+
+`finalize` không biến đổi `next`, không nuốt lỗi, không retry và không tự làm source complete. Source không bao giờ kết thúc như `NEVER`, hoặc một event stream sống lâu, sẽ không chạy finalizer nếu chẳng có ai unsubscribe.
+
+Mình mặc định dùng `finalize` cho cleanup không phụ thuộc kết quả, như tắt loading, giảm bộ đếm operation đang chạy hoặc ghi log kết thúc. Đừng dùng nó để thông báo “lưu thành công”: cancellation cũng chạy callback này.
+
+## Ba đường kết thúc qua ví dụ
+
+Ba ví dụ sau là các đoạn độc lập. Mỗi đoạn chỉ có một `finalize` để bạn nhìn rõ sự khác nhau giữa terminal notification và cleanup.
+
+### Complete bình thường
+
+```ts
+import { finalize, of } from 'rxjs';
+
+of('A', 'B')
+  .pipe(finalize(() => console.log('cleanup')))
+  .subscribe({
+    next: (value) => console.log('next', value),
+    complete: () => console.log('complete'),
+  });
+
+console.log('sau subscribe');
+```
+
+Output:
+
+```text
+next A
+next B
+complete
+cleanup
+sau subscribe
+```
+
+`of` phát đồng bộ, nên cả `complete` và cleanup đã chạy trước khi `subscribe()` trả về. Không nên giả định `finalize` luôn chạy “một lúc nào đó sau này”. Với pipeline đơn giản này, Observer được thông báo complete trước khi finalizer chạy.
+
+### Error từ source
+
+```ts
+import { finalize, throwError } from 'rxjs';
+
+throwError(() => new Error('request thất bại'))
+  .pipe(finalize(() => console.log('cleanup')))
+  .subscribe({
+    error: (error: Error) => console.log('error', error.message),
+    complete: () => console.log('complete'),
+  });
+```
+
+Output:
+
+```text
+error request thất bại
+cleanup
+```
+
+Không có `complete`. `finalize` vẫn chạy, nhưng lỗi vẫn đến Observer vì operator này không xử lý error channel. Nếu cần fallback, hãy dùng `catchError`; nếu cần thử lại, dùng `retry`.
+
+### Unsubscribe chủ động
+
+Dùng `NEVER` giúp ví dụ không phụ thuộc timing của timer: source không phát gì và không tự complete.
+
+```ts
+import { finalize, NEVER } from 'rxjs';
+
+const subscription = NEVER
+  .pipe(finalize(() => console.log('cleanup')))
+  .subscribe({
+    complete: () => console.log('complete'),
+  });
+
+console.log('trước unsubscribe');
+subscription.unsubscribe();
+subscription.unsubscribe();
+console.log('closed', subscription.closed);
+```
+
+Output:
+
+```text
+trước unsubscribe
+cleanup
+closed true
+```
+
+Không có `complete`, và lần unsubscribe thứ hai không chạy lại finalizer. Đây là lý do cleanup chỉ đặt trong `subscribe({ complete })` không bao phủ được trường hợp người dùng rời màn hình.
+
+## Phân biệt finalize với các callback khác
+
+Các callback này nằm gần nhau trong code nhưng có contract khác nhau:
+
+| Cơ chế | Complete | Error | Unsubscribe không có terminal notification | Nhận dữ liệu hoặc lỗi? |
+| --- | --- | --- | --- | --- |
+| `subscribe({ complete })` | Có | Không | Không | Không |
+| `subscribe({ error })` | Không | Có | Không | Nhận lỗi |
+| `tap({ complete })` | Có, nếu notification đi qua vị trí đó | Không | Không | Không |
+| `tap({ error })` | Không | Có, nếu notification đi qua vị trí đó | Không | Nhận lỗi |
+| `finalize(callback)` | Có | Có | Có | Không |
+| Teardown do producer đăng ký | Khi subscription producer đóng | Khi subscription producer đóng | Khi subscription producer đóng | Do closure của producer quyết định |
+
+`tap` phù hợp để quan sát notification tại một vị trí trong pipeline. `finalize` phù hợp để quan sát vòng đời subscription tại vị trí đó. Cleanup của resource do producer tạo nên nằm trong teardown của producer, còn side effect thuộc consumer có thể nằm trong `finalize`.
+
+<Callout type="warn" title="Không suy ra kết quả từ việc finalizer đã chạy">
+  “Operation đã kết thúc” khác với “operation thành công”. Ghi nhận thành công từ dữ liệu hoặc contract complete của operation; ghi nhận thất bại từ error channel. Đừng đặt toast thành công, xác nhận thanh toán hay commit nghiệp vụ vào `finalize`.
+</Callout>
+
+## Bật và tắt loading đúng vòng đời
+
+Loading phải bắt đầu khi có subscription, không phải khi bạn mới khai báo biến Observable. `defer` giúp ghép setup với đúng lượt subscribe; `finalize` ghép cleanup với lượt đó.
+
+Ví dụ dưới đây mô phỏng một request hữu hạn bằng `timer`, không gọi HTTP thật. Giả sử chỉ có một operation dùng trạng thái loading này tại một thời điểm:
+
+```ts
+import { defer, finalize, map, timer } from 'rxjs';
+
+let loading = false;
+
+function setLoading(value: boolean): void {
+  loading = value;
+  console.log('loading', loading);
+}
+
+const profile$ = defer(() => {
+  setLoading(true);
+
+  return timer(1_000).pipe(
+    map(() => ({ id: 1, name: 'An' })),
+  );
+}).pipe(
+  finalize(() => setLoading(false)),
+);
+
+const subscription = profile$.subscribe({
+  next: (profile) => console.log('profile', profile),
+  error: (error: unknown) => console.error('không tải được profile', error),
+});
+
+// Giả lập rời màn hình trước khi operation hoàn tất.
+subscription.unsubscribe();
+```
+
+Output:
+
+```text
+loading true
+loading false
+```
+
+Không có profile vì subscription bị hủy ngay. Nếu bỏ dòng unsubscribe, sau khoảng một giây timer phát profile rồi complete và loading vẫn được tắt. Nếu source thay bằng một request Observable phát lỗi, cleanup vẫn chạy.
+
+Không cần lặp lại `setLoading(false)` trong cả `error` lẫn `complete`: càng nhiều nơi viết cleanup, bạn càng dễ bỏ sót đường cancellation. Nhưng nếu bạn có `retry`, hãy để finalizer quản lý loading ở ngoài phạm vi retry để loading không tắt giữa các lần thử.
+
+<Callout type="warn" title="Một boolean không mô tả nhiều operation đồng thời">
+  Nếu hai request cùng dùng một cờ loading, request đầu kết thúc có thể đặt `false` trong khi request thứ hai còn chạy. Với concurrency thực sự, dùng bộ đếm pending theo cùng phạm vi UI: tăng trong `defer`, giảm trong `finalize`, rồi tính loading từ `pending > 0`. Nếu mỗi request có indicator riêng, hãy giữ state riêng cho từng request.
+</Callout>
+
+## Vị trí trong pipeline quyết định phạm vi cleanup
+
+Câu hỏi quan trọng không chỉ là “có dùng `finalize` chưa?”, mà là “nó đang theo dõi subscription nào?”. Operator tạo subscription con, resubscribe hoặc chia sẻ execution sẽ làm câu trả lời thay đổi.
+
+### Retry và repeat tạo nhiều lượt subscribe
+
+Đặt `finalize` **trước `retry`** để cleanup mỗi attempt. Đặt nó **sau `retry`** để cleanup toàn operation, bao gồm các attempt và thời gian chờ giữa chúng.
+
+```ts
+import { defer, finalize, of, retry, throwError } from 'rxjs';
+
+const operation$ = defer(() => {
+  let attempt = 0;
+
+  const attempt$ = defer(() => {
+    const currentAttempt = ++attempt;
+    console.log('bắt đầu attempt', currentAttempt);
+
+    const result$ = currentAttempt < 3
+      ? throwError(() => new Error('lỗi tạm thời'))
+      : of('OK');
+
+    return result$.pipe(
+      finalize(() => console.log('cleanup attempt', currentAttempt)),
+    );
+  });
+
+  return attempt$.pipe(retry({ count: 2 }));
+}).pipe(
+  finalize(() => console.log('cleanup operation')),
+);
+
+operation$.subscribe({
+  next: (value) => console.log('next', value),
+  error: (error: unknown) => console.error(error),
+  complete: () => console.log('complete'),
+});
+```
+
+Output của ví dụ đồng bộ này:
+
+```text
+bắt đầu attempt 1
+cleanup attempt 1
+bắt đầu attempt 2
+cleanup attempt 2
+bắt đầu attempt 3
+next OK
+complete
+cleanup attempt 3
+cleanup operation
+```
+
+`count: 2` nghĩa là hai lần thử lại, tổng cộng tối đa ba attempt. `defer` ngoài cùng tạo lại bộ đếm cho mỗi subscriber, còn `currentAttempt` giữ số của riêng lượt thử để log cleanup không đọc nhầm state đã thay đổi.
+
+Nếu operation bị hủy lúc đang đợi retry, finalizer ở ngoài vẫn chạy dù không có attempt nào đang hoạt động. Với `repeat`, nguyên tắc tương tự: finalizer nằm trong phần được repeat chạy mỗi lượt source complete; finalizer ở ngoài chỉ chạy khi chuỗi lặp kết thúc hoặc bị hủy.
+
+Mình dùng hai cấp finalizer khi hai loại cleanup thật sự khác nhau: mỗi attempt giải phóng resource riêng, toàn operation quản lý loading chung. Không nên phụ thuộc vào thứ tự giữa mọi finalizer trong một pipeline phức tạp; thứ tự còn chịu ảnh hưởng của source đồng bộ, bất đồng bộ và cách operator subscribe/unsubscribe.
+
+### CatchError và vòng đời của fallback
+
+Khi `catchError` nhận lỗi, subscription của source lỗi kết thúc, nhưng output có thể tiếp tục sống bằng fallback:
+
+```text
+source lỗi ──► cleanup source ──► subscribe fallback ──► fallback kết thúc
+                                                          │
+                                                          ▼
+                                                    cleanup operation
+```
+
+Vì vậy, hai vị trí sau theo dõi hai phạm vi khác nhau. Đây là sơ đồ pipeline, không phải một ví dụ độc lập:
+
+```ts
+source$.pipe(
+  finalize(cleanupSource),
+  catchError(() => fallback$),
+  finalize(cleanupOperation),
+);
+```
+
+`cleanupSource` chạy khi nhánh source đóng. `cleanupOperation` chạy khi toàn output đóng, bao gồm cả thời gian chờ fallback. Nếu fallback là `NEVER`, finalizer sau `catchError` không chạy cho đến khi consumer hủy.
+
+Callback chọn fallback trong `catchError` có thể được gọi trước cleanup source; sơ đồ trên chỉ mô tả vòng đời subscription source và fallback. Đừng dùng `finalize` trước `catchError` để tắt loading nếu UI vẫn đang chờ fallback.
+
+### SwitchMap và cleanup của từng inner stream
+
+`switchMap` hủy inner cũ khi nhận giá trị outer mới. Finalizer đặt **bên trong** chạy khi từng inner complete, error hoặc bị thay thế; finalizer đặt **bên ngoài** theo dõi toàn subscription, không chạy chỉ vì một inner bị hủy.
+
+```ts
+import { defer, finalize, Subject, switchMap, timer } from 'rxjs';
+
+const query$ = new Subject<string>();
+
+const subscription = query$.pipe(
+  switchMap((query) => defer(() => {
+    console.log('bắt đầu', query);
+
+    // Mô phỏng một request; mỗi request có vòng đời riêng.
+    return timer(1_000).pipe(
+      finalize(() => console.log('cleanup request', query)),
+    );
+  })),
+  finalize(() => console.log('cleanup màn hình')),
+).subscribe({
+  next: () => console.log('nhận kết quả'),
+});
+
+query$.next('rx');
+query$.next('rxjs');
+subscription.unsubscribe();
+```
+
+Output:
+
+```text
+bắt đầu rx
+cleanup request rx
+bắt đầu rxjs
+cleanup màn hình
+cleanup request rxjs
+```
+
+Các thao tác diễn ra đồng bộ trước khi timer kịp phát. Request `rx` bị thay thế, request `rxjs` bị hủy khi màn hình đóng; không request nào tạo kết quả. Trong ví dụ RxJS 7.8.2 này, finalizer ngoài chạy trước finalizer của inner còn hoạt động khi explicit unsubscribe. “Cleanup toàn subscription” mô tả phạm vi, không đảm bảo callback luôn chạy cuối cùng; đừng dùng thứ tự giữa các finalizer để phối hợp nghiệp vụ.
+
+Một bẫy loading thường gặp là bật loading trong `tap` trên outer, rồi tắt trong finalizer của inner. Khi outer phát query mới, `tap` bật cờ trước, sau đó `switchMap` hủy inner cũ và finalizer cũ tắt cờ vừa bật. Hãy đặt setup trong `defer` của inner mới: `switchMap` đóng inner cũ trước khi subscribe inner mới, nên cleanup cũ xảy ra trước setup mới. Nếu chuyển sang `mergeMap` để chạy đồng thời, hãy quay lại bộ đếm pending thay vì boolean chung.
+
+### Share và nhiều consumer
+
+Với `source$.pipe(finalize(cleanupSource), share())`, finalizer thuộc execution upstream được chia sẻ. Với `source$.pipe(share(), finalize(cleanupConsumer))`, mỗi subscriber phía sau có finalizer riêng. Hai consumer unsubscribe không nhất thiết đồng nghĩa upstream đã đóng ngay từ lần hủy đầu tiên.
+
+Với cấu hình `share()` mặc định của RxJS 7.8.x, upstream còn chạy khi vẫn có consumer; khi consumer cuối rời đi, ref count về zero và upstream bị unsubscribe. Nó cũng đóng khi source complete/error. Nếu thay cấu hình reset của `share`, vòng đời upstream có thể khác.
+
+Nếu dùng `shareReplay({ bufferSize: 1, refCount: false })` với source sống lâu, việc tất cả consumer unsubscribe không tự đóng upstream đã được kết nối. Finalizer trước `shareReplay` có thể chưa chạy. Hãy chọn scope dựa trên resource thuộc producer chung hay thuộc một consumer, thay vì chỉ nhìn vị trí thuận tiện để thêm operator.
+
+## Cleanup không đồng nghĩa với hủy tác vụ bên dưới
+
+`finalize` chạy không chứng minh HTTP request, Promise hay socket đã dừng. Nó chỉ chứng minh subscription tại vị trí đó đã đóng và callback cleanup đã được gọi.
+
+```ts
+import { defer, finalize, from } from 'rxjs';
+
+const request$ = defer(() => from(fetch('/api/profile'))).pipe(
+  finalize(() => console.log('subscription đã đóng')),
+);
+
+const subscription = request$.subscribe({
+  next: (response) => console.log(response.status),
+  error: (error: unknown) => console.error(error),
+});
+
+subscription.unsubscribe();
+```
+
+Ví dụ này chạy trong trình duyệt. `defer` đảm bảo fetch chỉ bắt đầu lúc subscribe, nhưng Promise adapter `from` không tự nối unsubscribe với `AbortController`. Finalizer log đã chạy trong khi fetch vẫn có thể tiếp tục; RxJS chỉ ngừng gửi kết quả đến subscriber đã đóng.
+
+Nếu cần cancellation thật, dùng adapter nối teardown với API abort, chẳng hạn `fromFetch` từ `rxjs/fetch`, hoặc tự viết Observable có teardown gọi `controller.abort()`. Với `fromFetch`, nếu cần bao phủ cả bước đọc body, dùng tùy chọn `selector` để bước ấy nằm trong vòng đời request Observable. Xem [Subscription và teardown](/docs/observable-subscription/subscription-teardown#unsubscribe-không-luôn-hủy-công-việc-bên-dưới) cho ví dụ custom adapter.
+
+Mình ưu tiên để producer tự dọn resource mà nó tạo: timer được clear, listener được remove, request được abort nếu API hỗ trợ. `finalize` ở consumer quản lý side effect của consumer, không phải bản vá bắt buộc để từng caller sửa một producer thiếu teardown.
+
+## Callback nên ngắn và không ném lỗi
+
+Finalizer là một phần của quá trình teardown. Hãy giữ callback ngắn, đồng bộ và không ném lỗi; một cleanup thất bại không nên ngăn code gọi unsubscribe tiếp tục bình thường.
+
+<Callout type="warn" title="Đừng dựa vào catchError để bắt lỗi cleanup">
+  `catchError` xử lý error notification trong pipeline, không phải một lớp bắt lỗi chung cho teardown. Trong RxJS 7.8.x, lỗi từ finalizer có thể trở thành `UnsubscriptionError` khi explicit unsubscribe. Nếu một API dispose có thể ném lỗi, hãy xử lý ngay trong cleanup; đường báo lỗi cleanup cũng cần an toàn.
+</Callout>
+
+Không dùng `finalize(async () => ...)` với kỳ vọng RxJS sẽ chờ cleanup xong. RxJS không await Promise được trả về, cũng không subscribe một Observable trả về từ callback. Observer có thể đã nhận `complete` hoặc `error` trước khi công việc cleanup bất đồng bộ hoàn tất.
+
+Nếu tác vụ bất đồng bộ là một phần bắt buộc của nghiệp vụ — ví dụ phải xác nhận ghi dữ liệu trước khi báo thành công — hãy mô hình hóa nó thành một bước trong pipeline với flattening operator phù hợp. Khi subscription đã bị hủy, chính pipeline đó không thể tiếp tục đảm bảo một công việc bất đồng bộ; nếu cleanup vẫn phải hoàn thành, owner bên ngoài cần quản lý và xử lý lỗi của công việc ấy một cách tường minh.
+
+Idempotent cleanup vẫn là một lựa chọn tốt nếu resource có thể được dispose từ nhiều đường khác nhau. Tuy nhiên, nó không thay thế ownership rõ ràng: đừng vừa đóng cùng một socket trong teardown producer vừa đóng lại trong mọi finalizer consumer.
+
+## Kiểm thử cả complete error và unsubscribe
+
+Đừng chỉ test happy path. Ví dụ sau dùng assertion có sẵn của Node.js và source đồng bộ để kiểm tra contract mà không cần đợi timer:
+
+```ts
+import { strict as assert } from 'node:assert';
+import { finalize, NEVER, of, throwError } from 'rxjs';
+
+const completeEvents: string[] = [];
+of(1).pipe(
+  finalize(() => completeEvents.push('cleanup')),
+).subscribe({
+  complete: () => completeEvents.push('complete'),
+});
+assert.deepEqual(completeEvents, ['complete', 'cleanup']);
+
+const errorEvents: string[] = [];
+throwError(() => new Error('boom')).pipe(
+  finalize(() => errorEvents.push('cleanup')),
+).subscribe({
+  error: () => errorEvents.push('error'),
+  complete: () => errorEvents.push('complete'),
+});
+assert.deepEqual(errorEvents, ['error', 'cleanup']);
+
+let cleanupCount = 0;
+let completeCount = 0;
+const subscription = NEVER.pipe(
+  finalize(() => { cleanupCount += 1; }),
+).subscribe({
+  complete: () => { completeCount += 1; },
+});
+
+assert.equal(cleanupCount, 0);
+subscription.unsubscribe();
+subscription.unsubscribe();
+assert.equal(cleanupCount, 1);
+assert.equal(completeCount, 0);
+assert.equal(subscription.closed, true);
+```
+
+Với pipeline thật, thêm test theo scope: ba attempt retry có ba cleanup attempt nhưng một cleanup operation; query mới làm inner cũ cleanup nhưng không làm outer cleanup. Nếu bạn muốn chứng minh resource đã dừng, spy `abort`, `clearInterval` hoặc `dispose` của adapter — chỉ đếm callback `finalize` thì chưa đủ.
+
+## Checklist trước khi dùng finalize
+
+- Cleanup này phải chạy cả khi thành công, lỗi và hủy chứ? Nếu chỉ dành cho thành công, chọn callback khác.
+- Scope là một attempt, toàn operation, từng inner, một consumer hay producer được chia sẻ?
+- Setup có bắt đầu ở mỗi lượt subscribe bằng `defer` hoặc producer không?
+- Có `retry`, `repeat` hoặc fallback làm output sống lâu hơn source ban đầu không?
+- State loading có bị dùng chung cho nhiều operation đồng thời không?
+- Producer đã nối teardown với API cancellation của resource chưa?
+- Callback có ném lỗi hoặc trả công việc bất đồng bộ mà bạn đang kỳ vọng RxJS chờ không?
+- Test đã bao phủ cả error và unsubscribe, thay vì chỉ complete chưa?
+
+## Học tiếp
+
+<Cards>
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Đặt ownership và cleanup cạnh resource được tạo." />
+  <Card title="catchError" href="/docs/loi-hoan-tat/catch-error" description="Phân biệt fallback với cleanup khi source lỗi." />
+  <Card title="retry và retryWhen" href="/docs/loi-hoan-tat/retry-retry-when" description="Thiết kế chính sách thử lại và phạm vi từng attempt." />
+  <Card title="switchMap" href="/docs/higher-order-observables/switch-map" description="Theo dõi cancellation và vòng đời của inner stream." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — finalize](https://rxjs.dev/api/operators/finalize): API và ba đường kích hoạt callback.
+- [RxJS 7.8.2 — mã nguồn finalize](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/finalize.ts): đăng ký callback vào teardown của subscriber.
+- [RxJS 7.8.2 — mã nguồn retry](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/retry.ts): unsubscribe attempt cũ và resubscribe khi retry.
+- [RxJS 7.8.2 — mã nguồn catchError](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/catchError.ts): cleanup source lỗi trước khi subscribe fallback, kể cả lỗi đồng bộ.
+- [RxJS — share](https://rxjs.dev/api/operators/share) và [shareReplay](https://rxjs.dev/api/operators/shareReplay): scope execution được chia sẻ và ref counting.
+- [RxJS — fromFetch](https://rxjs.dev/api/fetch/fromFetch): abort request theo teardown và tùy chọn selector cho response body.

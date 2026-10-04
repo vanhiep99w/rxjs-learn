@@ -3,8 +3,646 @@ title: Sync và async scheduling
 description: So sánh thực thi đồng bộ, microtask và macrotask.
 ---
 
-Trang này sẽ trình bày **Sync và async scheduling** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Một dòng `subscribe()` đôi khi gọi `next` ngay trước khi dòng kế tiếp chạy; ở chỗ khác, cùng callback ấy lại xuất hiện sau Promise hoặc timer. Nếu chỉ nhớ “Observable là async”, thứ tự log, state update và cleanup sẽ rất khó đoán. Cách chắc chắn hơn là tách ba câu hỏi: **source bắt đầu khi nào, notification được giao khi nào, và công việc đang nằm ở hàng đợi nào của JavaScript?**
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi phiên bản">
+  Bài này dùng public API của **RxJS 7.8.2** và thuật ngữ event loop của JavaScript. Trong HTML standard, `setTimeout` tạo một **task**; từ “macrotask” vẫn được dùng phổ biến để phân biệt nó với microtask. Ví dụ tập trung vào thứ tự tương đối, không coi thời gian timer là cam kết chính xác.
 </Callout>
+
+## Mục lục
+
+- [Mental model về thời điểm thực thi](#mental-model-về-thời-điểm-thực-thi)
+  - [Ba điểm có thể được lập lịch](#ba-điểm-có-thể-được-lập-lịch)
+- [Event loop với call stack microtask và task](#event-loop-với-call-stack-microtask-và-task)
+  - [Đồng bộ chạy trên call stack hiện tại](#đồng-bộ-chạy-trên-call-stack-hiện-tại)
+  - [Microtask chạy sau stack hiện tại](#microtask-chạy-sau-stack-hiện-tại)
+  - [Task chạy ở lượt event loop sau](#task-chạy-ở-lượt-event-loop-sau)
+- [Observable không tự động biến code thành async](#observable-không-tự-động-biến-code-thành-async)
+  - [Source đồng bộ](#source-đồng-bộ)
+  - [Source bất đồng bộ](#source-bất-đồng-bộ)
+- [Bốn scheduler thường gặp](#bốn-scheduler-thường-gặp)
+  - [queueScheduler giữ công việc đồng bộ](#queuescheduler-giữ-công-việc-đồng-bộ)
+  - [asapScheduler defer qua microtask](#asapscheduler-defer-qua-microtask)
+  - [asyncScheduler dùng event loop cho timer](#asyncscheduler-dùng-event-loop-cho-timer)
+  - [animationFrameScheduler đi theo nhịp render](#animationframescheduler-đi-theo-nhịp-render)
+- [Đọc thứ tự thực thi](#đọc-thứ-tự-thực-thi)
+  - [Một ví dụ chỉ dùng scheduler](#một-ví-dụ-chỉ-dùng-scheduler)
+  - [Đừng dựa vào thứ tự không thuộc contract](#đừng-dựa-vào-thứ-tự-không-thuộc-contract)
+- [Ba cách đưa scheduling vào pipeline](#ba-cách-đưa-scheduling-vào-pipeline)
+  - [scheduled cho input có sẵn](#scheduled-cho-input-có-sẵn)
+  - [observeOn dời notification downstream](#observeon-dời-notification-downstream)
+  - [subscribeOn dời lúc subscribe vào source](#subscribeon-dời-lúc-subscribe-vào-source)
+  - [Đặt operator đúng ranh giới](#đặt-operator-đúng-ranh-giới)
+- [Scheduling và cancellation](#scheduling-và-cancellation)
+- [Chọn scheduler trong code thực tế](#chọn-scheduler-trong-code-thực-tế)
+- [Những bẫy thường gặp](#những-bẫy-thường-gặp)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Mental model về thời điểm thực thi
+
+Scheduler không phải thread pool và cũng không phải một “chế độ async” áp lên toàn bộ RxJS. Nó là abstraction gồm một clock và cách xếp công việc để chạy ngay, chạy sau stack hiện tại, chạy ở lượt event loop sau, hoặc chạy theo frame của trình duyệt.
+
+Hãy hình dung scheduler như người phát số thứ tự ở quầy dịch vụ: nó quyết định ai được gọi tiếp và khi nào. Ẩn dụ dừng ở thứ tự; công việc vẫn chạy trên JavaScript thread hiện tại, không tự chuyển sang CPU khác.
+
+### Ba điểm có thể được lập lịch
+
+Khi đọc một pipeline, tách ba thời điểm sau:
+
+1. **Subscription** — lúc RxJS subscribe vào source và kích hoạt setup hoặc side effect của source.
+2. **Source work** — lúc producer đọc array, chạy timer, nhận event hoặc hoàn tất Promise.
+3. **Notification delivery** — lúc `next`, `error` hoặc `complete` đi qua operator tới Observer.
+
+```text
+subscribe()            source work                 Observer
+    │                       │                          ▲
+    ├── kích hoạt source ──►│── next/error/complete ──┤
+    │                       │                          │
+    └── subscribeOn ────────┘       observeOn ────────┘
+        dời subscription            dời notification
+```
+
+`subscribeOn()` tác động chủ yếu lên nhánh bên trái. `observeOn()` đặt một ranh giới giao notification ở nhánh bên phải. Còn source như Promise, DOM event hoặc timer đã có quy tắc scheduling riêng của nó.
+
+## Event loop với call stack microtask và task
+
+Trước khi gắn tên scheduler RxJS vào từng hàng đợi, hãy khóa mental model JavaScript. Trong một lượt điển hình, runtime chạy code đồng bộ trên call stack, làm rỗng microtask queue, rồi mới chuyển sang task tiếp theo; trình duyệt có thể render giữa các lượt phù hợp.
+
+```text
+┌──────────────────────────── Một lượt event loop ────────────────────────────┐
+│ call stack hiện tại ──► làm rỗng microtask queue ──► có thể render          │
+└───────────────────────────────────────────────────────────────┬─────────────┘
+                                                                ▼
+                                                    task tiếp theo rồi lặp lại
+```
+
+Đây là mô hình đủ dùng để dự đoán phần lớn pipeline. Chi tiết giữa browser, Node.js, fake timer và test environment có thể khác, nên code nghiệp vụ không nên phụ thuộc vào một cuộc đua quá sát giữa các API scheduling khác nhau.
+
+### Đồng bộ chạy trên call stack hiện tại
+
+Code đồng bộ hoàn thành trước khi runtime lấy microtask hoặc task tiếp theo. Nếu một Observable phát đồng bộ, callback `next` cũng nằm trong call stack của `subscribe()`.
+
+```ts
+console.log('A');
+
+const add = (left: number, right: number) => left + right;
+console.log(add(2, 3));
+
+console.log('B');
+```
+
+Kết quả luôn là `A`, `5`, `B`. Không có hàng đợi nào chen vào giữa.
+
+### Microtask chạy sau stack hiện tại
+
+Promise reaction và `queueMicrotask()` đưa callback vào microtask queue. Runtime chỉ chạy chúng khi stack hiện tại rỗng, nhưng sẽ làm rỗng hàng đợi này trước khi lấy task timer kế tiếp.
+
+```ts
+console.log('A');
+
+Promise.resolve().then(() => console.log('Promise'));
+queueMicrotask(() => console.log('queueMicrotask'));
+
+console.log('B');
+```
+
+Kết quả:
+
+```text
+A
+B
+Promise
+queueMicrotask
+```
+
+Hai microtask được xử lý theo thứ tự đã xếp. Nếu một microtask liên tục tạo microtask mới, runtime tiếp tục làm rỗng hàng đợi và có thể chưa quay lại render hoặc task khác. “Chạy sớm hơn timer” không đồng nghĩa “miễn phí”.
+
+### Task chạy ở lượt event loop sau
+
+Callback của `setTimeout()` là task. Delay `0` chỉ có nghĩa “không yêu cầu chờ thêm”, không có nghĩa callback chạy ngay hoặc đúng sau 0 ms.
+
+```ts
+console.log('A');
+
+setTimeout(() => console.log('timer'), 0);
+Promise.resolve().then(() => console.log('Promise'));
+
+console.log('B');
+```
+
+Kết quả thông thường:
+
+```text
+A
+B
+Promise
+timer
+```
+
+Promise chạy trước vì microtask queue được làm rỗng trước task timer. Timer còn có thể bị chậm bởi code đồng bộ dài, tab nền hoặc cơ chế giới hạn timer của runtime.
+
+## Observable không tự động biến code thành async
+
+Observable chỉ định nghĩa cách producer gửi notification cho consumer. **Source và scheduler mới quyết định thời điểm notification xuất hiện.** Đây là lý do `of()` khác `from(Promise.resolve(...))` dù cả hai đều trả `Observable`.
+
+### Source đồng bộ
+
+`of()`, `from(array)` và custom Observable gọi `subscriber.next()` ngay thường phát đồng bộ nếu bạn không chèn scheduler.
+
+```ts
+import { of } from 'rxjs';
+
+console.log('trước subscribe');
+
+of('ready').subscribe({
+  next: (value) => console.log('next:', value),
+  complete: () => console.log('complete'),
+});
+
+console.log('sau subscribe');
+```
+
+Kết quả:
+
+```text
+trước subscribe
+next: ready
+complete
+sau subscribe
+```
+
+Callback đã chạy xong trước khi `subscribe()` trả về. Vì vậy đoạn code sau là lỗi logic phổ biến:
+
+```ts
+import { of, Subscription } from 'rxjs';
+
+let subscription: Subscription | undefined;
+
+subscription = of('ready').subscribe(() => {
+  // Callback chạy trước khi phép gán ở ngoài hoàn tất.
+  console.log(subscription); // undefined
+});
+```
+
+Đừng dựa vào việc biến `subscription` đã được gán bên trong callback đầu tiên. Hãy thiết kế callback tự đủ dữ liệu, hoặc dùng operator để mô tả lifecycle thay vì điều khiển ngược qua biến bên ngoài.
+
+### Source bất đồng bộ
+
+Promise, timer và DOM event vốn đã bất đồng bộ. `from()` không đổi quy tắc của nguồn; nó chỉ chuyển kết quả thành notification RxJS.
+
+```ts
+import { from } from 'rxjs';
+
+console.log('trước subscribe');
+
+from(Promise.resolve('ready')).subscribe({
+  next: (value) => console.log('next:', value),
+  complete: () => console.log('complete'),
+});
+
+console.log('sau subscribe');
+```
+
+Kết quả:
+
+```text
+trước subscribe
+sau subscribe
+next: ready
+complete
+```
+
+<Callout type="warn" title="Async không nói gì về cold hay hot">
+  Đồng bộ/bất đồng bộ trả lời **khi nào** notification xảy ra. Cold/hot trả lời **producer thuộc về từng subscription hay được chia sẻ**. Một `interval()` có thể vừa cold vừa async; một `Subject` có thể phát đồng bộ và hot.
+</Callout>
+
+## Bốn scheduler thường gặp
+
+RxJS 7.8.2 cung cấp nhiều scheduler, nhưng bốn scheduler dưới đây bao phủ hầu hết tình huống ứng dụng. Chọn theo ranh giới bạn thật sự cần, không chọn `asyncScheduler` chỉ vì tên nghe “an toàn hơn”.
+
+| Scheduler | Khi delay bằng `0` | Hàng đợi hoặc nhịp gần nhất | Dùng mặc định khi |
+| --- | --- | --- | --- |
+| `queueScheduler` | Đồng bộ | Hàng đợi FIFO nội bộ | Cần tránh đệ quy lồng stack nhưng vẫn giữ cùng lượt gọi |
+| `asapScheduler` | Sau code đồng bộ hiện tại | Microtask trong implementation mặc định RxJS 7.8.2 | Cần defer sớm, trước timer thông thường |
+| `asyncScheduler` | Bất đồng bộ | Task của event loop, theo cơ chế timer | Cần delay, interval hoặc nhường sang lượt event loop sau |
+| `animationFrameScheduler` | Trước frame render kế tiếp trong browser | `requestAnimationFrame` | Gom cập nhật hình ảnh theo nhịp vẽ |
+
+Với delay lớn hơn `0`, `queueScheduler`, `asapScheduler` và `animationFrameScheduler` rơi về hành vi timer của `asyncScheduler`. Vì thế bảng trên chỉ mô tả trường hợp không delay.
+
+### queueScheduler giữ công việc đồng bộ
+
+`queueScheduler.schedule()` không delay sẽ chạy action ngay. Điểm khác biệt nằm ở scheduling lồng nhau: action mới được xếp sau action đang chạy thay vì gọi lồng thêm một tầng stack.
+
+```ts
+import { queueScheduler } from 'rxjs';
+
+console.log('A');
+
+queueScheduler.schedule(() => {
+  console.log('B');
+  queueScheduler.schedule(() => console.log('D'));
+  console.log('C');
+});
+
+console.log('E');
+```
+
+Kết quả:
+
+```text
+A
+B
+C
+D
+E
+```
+
+`D` đợi action chứa `B` và `C` kết thúc, nhưng toàn bộ hàng đợi vẫn được xử lý trước dòng `E`. Dùng `queueScheduler` khi bạn cần “trampoline” để làm phẳng đệ quy; đừng dùng nó nếu mục tiêu là nhường quyền cho browser render.
+
+### asapScheduler defer qua microtask
+
+`asapScheduler` đợi code đồng bộ hiện tại kết thúc rồi chạy sớm nhất có thể. Trong implementation mặc định của RxJS 7.8.2, action không delay được flush qua microtask dựa trên `Promise.resolve().then(...)`.
+
+```ts
+import { asapScheduler } from 'rxjs';
+
+console.log('A');
+asapScheduler.schedule(() => console.log('B'));
+console.log('C');
+```
+
+Kết quả:
+
+```text
+A
+C
+B
+```
+
+Đây là lựa chọn thực dụng để phá reentrancy hoặc dời notification ra khỏi call stack hiện tại mà không chờ một timer task. Nhưng nếu action tự xếp action mới vô hạn, microtask queue có thể làm render và input event bị đói.
+
+### asyncScheduler dùng event loop cho timer
+
+`asyncScheduler` lập lịch qua cơ chế timer và phù hợp với delay hoặc công việc lặp lại. Nó gần với mental model của `setTimeout`/`setInterval`, không phải Promise microtask.
+
+```ts
+import { asyncScheduler } from 'rxjs';
+
+console.log('A');
+asyncScheduler.schedule(() => console.log('B'), 0);
+console.log('C');
+```
+
+Kết quả:
+
+```text
+A
+C
+B
+```
+
+Điểm khác `asapScheduler` là `B` chờ tới task của event loop thay vì microtask gần nhất. Nếu yêu cầu của bạn là “sau 500 ms” hoặc “mỗi 5 giây”, đây là lớp scheduling phù hợp. Nếu chỉ cần thoát call stack hiện tại, `asapScheduler` thường diễn đạt ý định rõ hơn.
+
+### animationFrameScheduler đi theo nhịp render
+
+Trong browser, `animationFrameScheduler` chạy action ngay trước lần repaint kế tiếp. Nó hữu ích khi downstream cập nhật vị trí, kích thước hoặc style liên quan trực tiếp đến frame.
+
+```ts
+import { animationFrameScheduler, fromEvent, map, observeOn } from 'rxjs';
+
+const marker = document.querySelector<HTMLElement>('[data-pointer-marker]');
+
+if (!marker) {
+  throw new Error('Không tìm thấy pointer marker');
+}
+
+const pointerX$ = fromEvent<PointerEvent>(document, 'pointermove').pipe(
+  map((event) => event.clientX),
+  observeOn(animationFrameScheduler),
+);
+
+const subscription = pointerX$.subscribe((x) => {
+  marker.style.transform = `translateX(${x}px)`;
+});
+```
+
+Scheduling theo frame không tự giới hạn số event upstream. Nếu pointer event đến dày, nhiều notification vẫn có thể được xếp cho cùng frame. Khi cần lấy một giá trị đại diện cho mỗi frame, hãy kết hợp chiến lược sampling phù hợp thay vì xem `observeOn(animationFrameScheduler)` như rate limiter.
+
+<Callout type="warn" title="Scheduler không tạo parallelism">
+  Cả bốn scheduler trên vẫn chạy JavaScript trên cùng thread. Đẩy một vòng lặp CPU nặng sang `asyncScheduler` chỉ làm nó bắt đầu muộn hơn; khi chạy, nó vẫn chặn event loop. Với CPU-bound work thật sự, hãy chia nhỏ có chủ đích hoặc chuyển sang Web Worker hay worker thread.
+</Callout>
+
+## Đọc thứ tự thực thi
+
+Cách ít sai nhất là ghi mỗi action vào một trong bốn nhóm: call stack hiện tại, `queueScheduler`, microtask/asap, hoặc task/async. Sau đó đọc theo thứ tự hàng đợi, thay vì đoán từ vị trí dòng code.
+
+### Một ví dụ chỉ dùng scheduler
+
+```ts
+import {
+  asapScheduler,
+  asyncScheduler,
+  queueScheduler,
+} from 'rxjs';
+
+console.log('A');
+
+asyncScheduler.schedule(() => console.log('async'));
+asapScheduler.schedule(() => console.log('asap'));
+queueScheduler.schedule(() => console.log('queue'));
+
+console.log('B');
+```
+
+Kết quả với RxJS 7.8.2:
+
+```text
+A
+queue
+B
+asap
+async
+```
+
+- `queue` chạy ngay trong lời gọi `schedule()`.
+- `B` vẫn thuộc call stack hiện tại.
+- `asap` chạy sau stack qua microtask.
+- `async` chạy ở task timer sau đó.
+
+Thứ tự này giúp debug nhanh, nhưng đừng biến nó thành công thức “mọi Promise luôn đứng trước mọi scheduler”. Thứ tự giữa hai công việc cùng hàng đợi còn phụ thuộc công việc nào được enqueue trước.
+
+### Đừng dựa vào thứ tự không thuộc contract
+
+`asapScheduler` cam kết defer sớm; `asyncScheduler` cam kết scheduling kiểu timer. Code ứng dụng nên dựa vào những ranh giới ấy, không dựa vào chi tiết nội bộ như scheduler dùng Promise nào hoặc timer được runtime nhóm ra sao.
+
+Nếu hai cập nhật phải có thứ tự nghiệp vụ, hãy biểu diễn quan hệ đó trong pipeline bằng `concatMap`, `switchMap`, state machine hoặc một nguồn duy nhất. “Trong máy mình log A trước B” không phải synchronization contract.
+
+## Ba cách đưa scheduling vào pipeline
+
+Có ba API dễ bị trộn lẫn: `scheduled()`, `observeOn()` và `subscribeOn()`. Chúng đều nhận scheduler nhưng điều khiển ranh giới khác nhau.
+
+### scheduled cho input có sẵn
+
+`scheduled(input, scheduler)` chuyển `ObservableInput` như array, iterable, Promise hoặc Observable thành một Observable có subscription và emission được điều phối bằng scheduler đã chọn.
+
+```ts
+import { asyncScheduler, scheduled } from 'rxjs';
+
+console.log('trước subscribe');
+
+scheduled([10, 20, 30], asyncScheduler).subscribe({
+  next: (value) => console.log('next:', value),
+  complete: () => console.log('complete'),
+});
+
+console.log('sau subscribe');
+```
+
+Phần output bắt đầu như sau:
+
+```text
+trước subscribe
+sau subscribe
+next: 10
+next: 20
+next: 30
+complete
+```
+
+Với array và `asyncScheduler`, việc duyệt được scheduler điều phối thay vì quét toàn bộ array ngay trong `subscribe()`. Đây là điểm khác quan trọng so với `from(array).pipe(observeOn(asyncScheduler))`: cách thứ hai vẫn duyệt source array đồng bộ trước, rồi mới xếp notification downstream.
+
+<Callout type="idea" title="Ưu tiên API không dùng scheduler argument cũ">
+  Trong RxJS 7, scheduler argument của nhiều creation function như `of()` và `from()` đã deprecated cho RxJS 8. Với code mới, dùng `scheduled(input, scheduler)` khi cần lập lịch cả input; dùng `observeOn()` hoặc `subscribeOn()` khi bạn muốn đặt một ranh giới rõ trong pipeline.
+</Callout>
+
+### observeOn dời notification downstream
+
+`observeOn(scheduler)` subscribe vào source theo cách bình thường, nhưng lập lịch lại mọi `next`, `error` và `complete` trước khi giao cho downstream.
+
+```ts
+import { asapScheduler, observeOn, of, tap } from 'rxjs';
+
+console.log('trước subscribe');
+
+of(1, 2).pipe(
+  tap((value) => console.log('upstream:', value)),
+  observeOn(asapScheduler),
+  tap((value) => console.log('downstream:', value)),
+).subscribe({
+  next: (value) => console.log('observer:', value),
+  complete: () => console.log('complete'),
+});
+
+console.log('sau subscribe');
+```
+
+Kết quả:
+
+```text
+trước subscribe
+upstream: 1
+upstream: 2
+sau subscribe
+downstream: 1
+observer: 1
+downstream: 2
+observer: 2
+complete
+```
+
+Source `of()` và `tap` đầu tiên vẫn chạy đồng bộ. Chỉ đoạn sau `observeOn()` được defer. Vì thế `observeOn(asyncScheduler)` **không chia một source đồng bộ nặng thành các chunk**; source đã làm xong công việc trước khi notification được giao lại.
+
+```text
+source ──► map nặng ──► observeOn(asap) ──► render
+          chạy ngay       ranh giới async     chạy sau
+```
+
+Muốn source array lớn được duyệt theo scheduler, hãy dùng `scheduled()` hoặc thiết kế source có khả năng yield. Muốn trì hoãn giá trị theo thời gian nghiệp vụ, ưu tiên operator như `delay`, `timer` hoặc nhóm time-based operator thay vì dùng `observeOn` như một timer tổng quát.
+
+### subscribeOn dời lúc subscribe vào source
+
+`subscribeOn(scheduler)` lập lịch hành động subscribe vào source. Vì setup của source chưa chạy cho tới lúc action được thực thi, side effect khởi tạo cũng được defer.
+
+```ts
+import { asapScheduler, Observable, subscribeOn } from 'rxjs';
+
+const source$ = new Observable<string>((subscriber) => {
+  console.log('source setup');
+  subscriber.next('ready');
+  subscriber.complete();
+});
+
+console.log('trước subscribe');
+
+source$.pipe(
+  subscribeOn(asapScheduler),
+).subscribe({
+  next: (value) => console.log('next:', value),
+  complete: () => console.log('complete'),
+});
+
+console.log('sau subscribe');
+```
+
+Kết quả:
+
+```text
+trước subscribe
+sau subscribe
+source setup
+next: ready
+complete
+```
+
+Source vẫn phát đồng bộ **bên trong action đã được defer**. Nói cách khác, `subscribeOn()` dời điểm bắt đầu cả execution; nó không nhất thiết đặt một hàng đợi mới giữa từng emission.
+
+### Đặt operator đúng ranh giới
+
+Vị trí của `observeOn()` rất trực quan: operator trước nó chạy upstream, operator sau nó nhận notification trên scheduler mới.
+
+```ts
+source$.pipe(
+  map(parseSynchronously),       // Trước ranh giới.
+  observeOn(asapScheduler),
+  tap(updateViewModel),          // Sau ranh giới.
+);
+```
+
+Với `subscribeOn()`, hãy đặt nó gần source để người đọc thấy ngay source activation bị defer. Khi phối hợp cả hai, đọc pipeline theo hai chiều: subscription đi từ downstream ngược lên source; notification đi từ source xuôi xuống Observer.
+
+```ts
+const result$ = source$.pipe(
+  subscribeOn(asyncScheduler),
+  map(transform),
+  observeOn(asapScheduler),
+);
+```
+
+Trong ví dụ này, subscription vào `source$` bắt đầu ở một async task. Khi source phát, `map()` xử lý trong execution đó; sau đó `observeOn(asapScheduler)` defer việc giao kết quả cho downstream qua ranh giới asap.
+
+<Callout type="warn" title="observeOn lập lịch cả error và complete">
+  Khi thêm `observeOn()`, không chỉ `next` bị dời. `error` và `complete` cũng được schedule, nên cleanup upstream có thể đã xảy ra trước khi Observer downstream thấy terminal notification. Nếu code phụ thuộc thứ tự cleanup, hãy ghi log ở cả hai phía của ranh giới.
+</Callout>
+
+## Scheduling và cancellation
+
+Action đã được xếp lịch vẫn thuộc subscription. Nếu unsubscribe trước khi action chạy, RxJS có thể hủy action đó và không giao notification đã chờ.
+
+```ts
+import { asyncScheduler, observeOn, of } from 'rxjs';
+
+const subscription = of('saved').pipe(
+  observeOn(asyncScheduler),
+).subscribe((value) => console.log(value));
+
+subscription.unsubscribe();
+
+// Không log "saved" vì notification chưa tới lượt chạy.
+```
+
+Tương tự, unsubscribe trước action của `subscribeOn()` có thể ngăn source setup bắt đầu:
+
+```ts
+import { asyncScheduler, Observable, subscribeOn } from 'rxjs';
+
+const source$ = new Observable<void>(() => {
+  console.log('source setup');
+});
+
+const subscription = source$.pipe(
+  subscribeOn(asyncScheduler),
+).subscribe();
+
+subscription.unsubscribe();
+
+// "source setup" không xuất hiện.
+```
+
+Nhưng cancellation chỉ dừng phần công việc mà subscription thật sự sở hữu. Nếu bạn đã tạo Promise hoặc khởi động API bên ngoài trước khi subscribe, hủy scheduled notification không quay ngược side effect ấy. Muốn hủy network request, timer hoặc listener, source phải nối teardown tới `AbortController`, `clearTimeout`, `removeEventListener` hay API tương ứng.
+
+## Chọn scheduler trong code thực tế
+
+Mặc định, **đừng thêm scheduler** nếu thứ tự tự nhiên của source đã đúng. Scheduling tạo thêm ranh giới thời gian, làm stack trace và test khó đọc hơn; nó nên giải quyết một vấn đề cụ thể.
+
+| Nhu cầu | Chọn mặc định | Vì sao |
+| --- | --- | --- |
+| Giữ đồng bộ nhưng tránh đệ quy lồng stack | `queueScheduler` | Action lồng nhau vào FIFO queue nội bộ |
+| Thoát call stack hiện tại sớm nhất có thể | `asapScheduler` | Defer qua microtask trong RxJS 7.8.2 |
+| Delay hoặc lặp theo thời gian | `asyncScheduler` hoặc operator timer | Khớp semantics của task và timer |
+| Cập nhật hình ảnh theo frame browser | `animationFrameScheduler` | Đồng bộ với `requestAnimationFrame` |
+| Điều phối array, iterable hoặc Promise ngay từ source | `scheduled(input, scheduler)` | Scheduler tham gia vào subscription và emission của input |
+| Chỉ dời downstream notification | `observeOn(scheduler)` | Tạo ranh giới rõ giữa upstream và downstream |
+| Dời source activation hoặc setup side effect | `subscribeOn(scheduler)` | Subscription vào source được schedule |
+| Chạy CPU nặng song song | Không scheduler nào ở trên | Dùng Worker hoặc kiến trúc xử lý nền |
+
+Một use case hợp lý của `asapScheduler` là phá reentrancy. Giả sử subscriber có thể phát ngược vào cùng một `Subject`; nếu xử lý ngay, callback mới lồng bên trong callback cũ. `observeOn(asapScheduler)` dời việc xử lý ra sau stack hiện tại:
+
+```ts
+import { asapScheduler, observeOn, Subject } from 'rxjs';
+
+const commands$ = new Subject<number>();
+
+commands$.pipe(
+  observeOn(asapScheduler),
+).subscribe((command) => {
+  console.log('xử lý:', command);
+
+  if (command < 3) {
+    commands$.next(command + 1);
+  }
+});
+
+commands$.next(1);
+console.log('đã gửi command đầu');
+```
+
+Dòng `đã gửi command đầu` xuất hiện trước `xử lý: 1`. Việc phát ngược không còn lồng trực tiếp vào call stack gọi `commands$.next(1)`. Dù vậy, nếu chuỗi phản hồi không có điều kiện dừng, bạn chỉ đổi stack overflow thành một chuỗi microtask vô hạn. Sửa lifecycle và điều kiện kết thúc vẫn là phần quan trọng hơn.
+
+## Những bẫy thường gặp
+
+1. **Nghĩ mọi Observable đều async.** `of()` và `from(array)` phát đồng bộ theo mặc định; callback có thể chạy trước dòng sau `subscribe()`.
+2. **Gọi `queueScheduler` là microtask.** Không delay, nó vẫn đồng bộ. Hàng đợi của nó chỉ làm phẳng scheduling lồng nhau.
+3. **Xem `asapScheduler` và `asyncScheduler` là một.** Một bên defer qua microtask trong RxJS 7.8.2, bên kia đi qua cơ chế timer/task; ranh giới render và event khác nhau.
+4. **Dùng `observeOn()` để chữa source CPU nặng.** Source và operator upstream vẫn chạy trước ranh giới. Hãy schedule từ source, chia nhỏ thuật toán hoặc chuyển công việc sang Worker.
+5. **Tin rằng async đồng nghĩa song song.** Scheduler thay đổi thời điểm, không thêm thread.
+6. **Cho rằng `setTimeout(..., 0)` chạy ngay.** Callback phải chờ stack, microtask và các ràng buộc timer của runtime.
+7. **Dùng microtask cho vòng lặp không giới hạn.** Chuỗi microtask có thể chặn render và task input dù mỗi callback riêng lẻ rất ngắn.
+8. **Quên `error` và `complete` cũng đi qua `observeOn()`.** Terminal notification downstream có thể đến sau teardown upstream.
+9. **Tạo side effect trước `subscribeOn()`.** `subscribeOn()` chỉ defer subscription; Promise hoặc request đã tạo ở ngoài vẫn chạy trước. Bọc việc tạo resource trong `defer()` hoặc custom Observable nếu cần lazy execution.
+10. **Dựa vào thứ tự chi tiết giữa nhiều runtime.** Browser, Node.js, Zone.js và fake timer có thể khác ở lớp implementation. Test invariant nghiệp vụ, không test một chuỗi log ngẫu nhiên nếu thứ tự ấy không phải contract.
+
+## Bài tập tự kiểm tra
+
+1. Chạy cùng một Observer với `of('A')` và `from(Promise.resolve('A'))`; đặt log trước và sau `subscribe()` rồi giải thích từng dòng.
+2. Lập lịch lần lượt bằng `asyncScheduler`, `asapScheduler` và `queueScheduler` như ví dụ trong bài. Đổi thứ tự gọi `schedule()` và ghi lại phần nào thay đổi, phần nào không.
+3. Đặt một `tap()` trước và một `tap()` sau `observeOn(asapScheduler)`. Thêm log ở source để xác định chính xác ranh giới đồng bộ.
+4. Thay `observeOn(asyncScheduler)` bằng `scheduled(array, asyncScheduler)` cho một array nhỏ. So sánh lúc array được duyệt và lúc Observer nhận giá trị.
+5. Subscribe vào custom Observable qua `subscribeOn(asyncScheduler)`, rồi unsubscribe ngay. Xác nhận setup có chạy hay không.
+6. Tạo chuỗi phản hồi qua `Subject` có điều kiện dừng. So sánh không scheduler, `queueScheduler` và `asapScheduler` để thấy khác biệt giữa reentrancy, queue đồng bộ và microtask.
+
+Sau đó, lấy một pipeline thật trong dự án và đánh dấu ba điểm: source activation, công việc upstream và notification downstream. Nếu không chỉ được scheduler đang giải quyết vấn đề nào ở một trong ba điểm ấy, hãy thử bỏ nó.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Mô hình Scheduler" href="/docs/thoi-gian-schedulers/scheduler-model" description="Đi sâu vào clock, action và hàng đợi đứng sau scheduler." />
+  <Card title="Time-based operators" href="/docs/thoi-gian-schedulers/time-based-operators" description="Áp dụng delay, timer và các operator phụ thuộc thời gian." />
+  <Card title="Virtual time" href="/docs/thoi-gian-schedulers/virtual-time" description="Thay thời gian thật bằng clock xác định trong kiểm thử." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Viết assertion bằng marble và virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS 7.8.2 — Scheduler guide](https://github.com/ReactiveX/rxjs/blob/7.8.2/docs_app/content/guide/scheduler.md)
+- [RxJS 7.8.2 — `queueScheduler`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/scheduler/queue.ts)
+- [RxJS 7.8.2 — `asapScheduler`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/scheduler/asap.ts)
+- [RxJS 7.8.2 — microtask implementation của `asapScheduler`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/util/Immediate.ts)
+- [RxJS 7.8.2 — `asyncScheduler`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/scheduler/async.ts)
+- [RxJS 7.8.2 — `animationFrameScheduler`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/scheduler/animationFrame.ts)
+- [RxJS 7.8.2 — `scheduled`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/scheduled/scheduled.ts)
+- [RxJS 7.8.2 — `observeOn`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/observeOn.ts)
+- [RxJS 7.8.2 — `subscribeOn`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/subscribeOn.ts)
+- [RxJS — deprecation của scheduler argument](https://rxjs.dev/deprecations/scheduler-argument)
+- [MDN — Using microtasks in JavaScript](https://developer.mozilla.org/en-US/docs/Web/API/HTML_DOM_API/Microtask_guide)
+- [MDN — JavaScript execution model và event loop](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Execution_model)

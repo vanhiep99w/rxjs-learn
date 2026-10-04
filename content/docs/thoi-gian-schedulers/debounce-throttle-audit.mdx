@@ -3,8 +3,333 @@ title: Debounce, throttle và audit
 description: Chọn chiến lược giới hạn tần suất emission.
 ---
 
-Trang này sẽ trình bày **Debounce, throttle và audit** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Một ô tìm kiếm phát event sau mỗi phím bấm, `pointermove` có thể chạy dồn dập, còn nút lưu đôi khi bị click hai lần. Đẩy mọi event xuống bước xử lý tiếp theo vừa tốn tài nguyên, vừa dễ tạo race condition. RxJS có ba chiến lược quen thuộc để giảm tần suất: `debounce`, `throttle` và `audit` — nhưng mỗi chiến lược giữ lại một giá trị khác nhau.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="idea" title="Quy tắc chọn nhanh">
+  Chọn `debounceTime` khi bạn cần **giá trị cuối sau lúc stream yên**; chọn `throttleTime` khi cần **phản hồi ngay bằng giá trị đầu**; chọn `auditTime` khi cần **giá trị mới nhất ở cuối mỗi cửa sổ đang hoạt động**.
 </Callout>
+
+## Mục lục
+
+- [Mô hình chọn operator](#mô-hình-chọn-operator)
+  - [Cùng một stream ba kết quả](#cùng-một-stream-ba-kết-quả)
+- [DebounceTime đợi khoảng lặng](#debouncetime-đợi-khoảng-lặng)
+  - [Cơ chế](#cơ-chế)
+  - [Ví dụ live search](#ví-dụ-live-search)
+  - [Khi debounceTime không phù hợp](#khi-debouncetime-không-phù-hợp)
+- [ThrottleTime phản hồi ngay rồi khóa cửa sổ](#throttletime-phản-hồi-ngay-rồi-khóa-cửa-sổ)
+  - [Leading và trailing](#leading-và-trailing)
+  - [Ví dụ chặn click dồn](#ví-dụ-chặn-click-dồn)
+- [AuditTime lấy giá trị mới nhất ở cuối cửa sổ](#audittime-lấy-giá-trị-mới-nhất-ở-cuối-cửa-sổ)
+  - [Ví dụ render theo animation frame](#ví-dụ-render-theo-animation-frame)
+  - [AuditTime không phải sampleTime](#audittime-không-phải-sampletime)
+- [Khi khoảng chờ phải thay đổi](#khi-khoảng-chờ-phải-thay-đổi)
+- [Hoàn tất lỗi và hủy subscription](#hoàn-tất-lỗi-và-hủy-subscription)
+- [Bảng quyết định](#bảng-quyết-định)
+  - [Checklist trước khi chọn](#checklist-trước-khi-chọn)
+- [Bước tiếp theo](#bước-tiếp-theo)
+
+## Mô hình chọn operator
+
+Đừng bắt đầu bằng câu hỏi “operator nào nhanh hơn?”. Câu hỏi đúng là: **trong một burst event, giá trị nào có ý nghĩa với nghiệp vụ?**
+
+- Nếu chỉ kết quả sau cùng mới có ý nghĩa, hãy chờ stream yên bằng `debounceTime`.
+- Nếu event đầu tiên phải tạo phản hồi ngay, hãy mở một cửa sổ khóa bằng `throttleTime`.
+- Nếu cần cập nhật đều trong lúc stream còn bận nhưng luôn muốn dữ liệu mới nhất, hãy dùng `auditTime`.
+
+Với scheduler mặc định, tham số thời gian của ba operator `*Time` được tính bằng mili giây. Chúng giới hạn emission ở phía client của pipeline; chúng không làm nguồn ngừng phát event và cũng không tự giảm công việc đã xảy ra trước vị trí của operator.
+
+### Cùng một stream ba kết quả
+
+Giả sử nguồn phát năm giá trị và ta dùng cửa sổ `300 ms`:
+
+```text
+Nguồn: A@0 ─ B@100 ─ C@180 ───────── D@700 ─ E@760
+
+Debounce:
+A đặt hạn @300
+B dời hạn @400
+C dời hạn @480 ───────────────► C@480
+D đặt hạn @1000
+E dời hạn @1060 ──────────────► E@1060
+
+Throttle mặc định:
+A@0 ─► phát A, khóa đến @300
+B và C bị bỏ
+D@700 ─► phát D, khóa đến @1000
+E bị bỏ
+
+Audit:
+A mở cửa sổ 0..300, giữ giá trị mới nhất ─► C@300
+D mở cửa sổ 700..1000, giữ mới nhất ─────► E@1000
+```
+
+| Operator | Output trong ví dụ | Điều làm cửa sổ thay đổi |
+| --- | --- | --- |
+| `debounceTime(300)` | `C@480`, `E@1060` | Mỗi event dời lại deadline |
+| `throttleTime(300)` | `A@0`, `D@700` | Event đầu mở cửa sổ cố định |
+| `auditTime(300)` | `C@300`, `E@1000` | Event đầu mở cửa sổ cố định |
+
+Điểm dễ nhầm nằm ở `debounceTime` và `auditTime`: cả hai đều giữ giá trị mới nhất, nhưng chỉ `debounceTime` reset đồng hồ sau từng event. Vì vậy một nguồn phát liên tục có thể khiến `debounceTime` im lặng mãi, còn `auditTime` vẫn phát định kỳ theo các cửa sổ được kích hoạt.
+
+## DebounceTime đợi khoảng lặng
+
+`debounceTime(dueTime)` phù hợp khi một chuỗi event chỉ biểu diễn quá trình người dùng đi tới một trạng thái cuối: gõ từ khóa, thay đổi kích thước cửa sổ hoặc chỉnh nhiều field trước khi autosave. Operator chờ đủ một khoảng không có event mới rồi mới chuyển tiếp giá trị gần nhất.
+
+### Cơ chế
+
+Mỗi giá trị mới thay giá trị đang chờ và bắt đầu lại khoảng lặng. Nếu nguồn tiếp tục phát nhanh hơn `dueTime`, downstream chưa nhận gì cả.
+
+```ts
+import { debounceTime } from 'rxjs';
+
+const stableValue$ = source$.pipe(
+  debounceTime(300),
+);
+```
+
+`debounceTime` không giống `delay`. `delay(300)` dời **mọi** giá trị đi 300 ms; `debounceTime(300)` loại các giá trị bị event mới theo sau quá sớm và chỉ giữ giá trị cuối của burst.
+
+### Ví dụ live search
+
+Live search thường không cần gọi API sau từng phím. Pipeline dưới đây chuyển DOM event thành chuỗi trước, chờ người dùng ngừng gõ, bỏ từ khóa trùng rồi hủy request cũ nếu một từ khóa mới xuất hiện:
+
+```ts
+import {
+  debounceTime,
+  distinctUntilChanged,
+  fromEvent,
+  map,
+  of,
+  switchMap,
+} from 'rxjs';
+
+const input = document.querySelector<HTMLInputElement>('#product-search')!;
+
+const results$ = fromEvent<InputEvent>(input, 'input').pipe(
+  map((event) => (event.target as HTMLInputElement).value.trim()),
+  debounceTime(300),
+  distinctUntilChanged(),
+  switchMap((query) =>
+    query.length >= 2 ? searchProducts(query) : of([]),
+  ),
+);
+
+results$.subscribe(renderProducts);
+```
+
+Ở đây `debounceTime` giảm số request, còn `switchMap` giải quyết một vấn đề khác: response của request cũ không được phép ghi đè kết quả mới. Chỉ debounce mà bỏ `switchMap` vẫn có thể gặp stale response khi mạng chậm.
+
+Đặt `map` trước `debounceTime` giúp phần còn lại của pipeline làm việc với domain value là chuỗi, thay vì giữ nguyên cả `InputEvent`. `distinctUntilChanged` nằm sau debounce để hai trạng thái cuối giống nhau không gọi lại API.
+
+### Khi debounceTime không phù hợp
+
+Đừng dùng debounce nếu downstream phải nhận tiến độ trong lúc nguồn vẫn liên tục phát. Ví dụ, người dùng kéo một slider suốt ba giây thì `debounceTime(300)` có thể chỉ phát khi họ thả tay; UI phụ thuộc downstream sẽ trông như bị đứng.
+
+Một lỗi khác là đặt debounce sau công việc đắt đỏ:
+
+```ts
+// Không giảm chi phí của expensiveTransform vì hàm đã chạy trước debounce.
+source$.pipe(
+  map(expensiveTransform),
+  debounceTime(300),
+);
+```
+
+Nếu phép biến đổi không cần thiết cho việc quyết định debounce, hãy đặt nó phía sau:
+
+```ts
+source$.pipe(
+  debounceTime(300),
+  map(expensiveTransform),
+);
+```
+
+<Callout type="warn" title="Debounce không phải cơ chế bảo vệ server">
+  Nó giảm request trong tình huống bình thường, nhưng client khác hoặc code khác vẫn có thể gọi API. Rate limit, idempotency và validation quan trọng phải được thực thi ở server.
+</Callout>
+
+## ThrottleTime phản hồi ngay rồi khóa cửa sổ
+
+`throttleTime(duration)` mặc định phát giá trị đầu tiên ngay lập tức, sau đó bỏ các giá trị tới trong cửa sổ `duration`. Khi cửa sổ đóng, event tiếp theo lại được quyền đi qua.
+
+```ts
+import { throttleTime } from 'rxjs';
+
+const firstValuePerWindow$ = source$.pipe(
+  throttleTime(1000),
+);
+```
+
+Đây là lựa chọn tốt khi phản hồi đầu tiên quan trọng hơn trạng thái cuối: tạo ripple cho click, xử lý phím tắt giữ liên tục hoặc hạn chế một action có thể bị kích hoạt dồn dập.
+
+### Leading và trailing
+
+`throttleTime` cho phép chọn giá trị ở đầu cửa sổ (`leading`) và cuối cửa sổ (`trailing`). Cấu hình mặc định là `{ leading: true, trailing: false }`.
+
+```ts
+import { asyncScheduler, throttleTime } from 'rxjs';
+
+const position$ = pointerMoves$.pipe(
+  throttleTime(100, asyncScheduler, {
+    leading: true,
+    trailing: true,
+  }),
+);
+```
+
+| Cấu hình | Hành vi | Khi nên dùng |
+| --- | --- | --- |
+| `{ leading: true, trailing: false }` | Phát giá trị đầu, bỏ phần còn lại | Cần phản hồi ngay; trạng thái cuối không quan trọng |
+| `{ leading: true, trailing: true }` | Phát đầu và giá trị mới nhất ở cuối | Cần phản hồi ngay nhưng vẫn phải cập nhật trạng thái cuối |
+| `{ leading: false, trailing: true }` | Chờ cuối cửa sổ rồi phát giá trị mới nhất | Muốn trailing behavior có cấu hình throttle rõ ràng |
+| `{ leading: false, trailing: false }` | Không phát giá trị | Hầu như không có use case thực tế |
+
+Khi `trailing: true`, giá trị cuối được giữ lại để phát ở ranh giới cửa sổ; đây **không phải debounce** vì event mới không dời ranh giới đó. Với stream bận liên tục, các trailing emission có thể tiếp tục xuất hiện theo nhịp cửa sổ.
+
+### Ví dụ chặn click dồn
+
+Nếu mục tiêu chỉ là bỏ accidental double-click trong một khoảng ngắn, throttle diễn đạt ý đó trực tiếp:
+
+```ts
+import { fromEvent, throttleTime } from 'rxjs';
+
+const saveButton = document.querySelector<HTMLButtonElement>('#save')!;
+
+fromEvent(saveButton, 'click').pipe(
+  throttleTime(1000),
+).subscribe(() => saveDraft());
+```
+
+Nhưng nếu nút phải bị khóa **cho tới khi request hoàn tất**, một cửa sổ một giây là sai abstraction: request có thể mất 100 ms hoặc 5 giây. Khi đó dùng `exhaustMap` để bỏ click mới trong lúc request hiện tại còn chạy:
+
+```ts
+import { exhaustMap, fromEvent } from 'rxjs';
+
+fromEvent(saveButton, 'click').pipe(
+  exhaustMap(() => saveDraft()),
+).subscribe(showSaveResult);
+```
+
+Mình chọn `throttleTime` cho giới hạn dựa trên đồng hồ; mình chọn `exhaustMap` cho giới hạn dựa trên lifecycle của tác vụ.
+
+## AuditTime lấy giá trị mới nhất ở cuối cửa sổ
+
+`auditTime(duration)` bắt đầu một cửa sổ khi thấy event đầu tiên. Trong lúc cửa sổ mở, nó liên tục thay giá trị đang giữ; tới cuối cửa sổ, nó phát giá trị mới nhất. Sau đó operator chờ event tiếp theo để mở cửa sổ mới.
+
+```ts
+import { auditTime } from 'rxjs';
+
+const latestValuePerActiveWindow$ = source$.pipe(
+  auditTime(100),
+);
+```
+
+Cách nghĩ thực dụng là: throttle mặc định trả lời “event nào đến đầu tiên?”, còn audit trả lời “đến lúc cập nhật, trạng thái mới nhất là gì?”. Vì vậy audit hợp với scroll position, pointer position, telemetry hoặc state cập nhật dày mà downstream chỉ cần snapshot gần nhất.
+
+### Ví dụ render theo animation frame
+
+DOM không cần render lại sau mọi `pointermove`. Ta có thể gom các event xảy ra giữa hai frame và dùng tọa độ mới nhất ở frame kế tiếp:
+
+```ts
+import {
+  animationFrameScheduler,
+  auditTime,
+  fromEvent,
+  map,
+} from 'rxjs';
+
+const pointerPosition$ = fromEvent<PointerEvent>(document, 'pointermove').pipe(
+  auditTime(0, animationFrameScheduler),
+  map(({ clientX, clientY }) => ({ x: clientX, y: clientY })),
+);
+
+pointerPosition$.subscribe(({ x, y }) => {
+  cursor.style.transform = `translate3d(${x}px, ${y}px, 0)`;
+});
+```
+
+`animationFrameScheduler` căn việc phát với animation frame thay vì một timer tùy ý. `auditTime(0, animationFrameScheduler)` vì thế thường là mặc định tốt cho luồng cập nhật hình ảnh: trong mỗi frame đang chờ, chỉ vị trí mới nhất được render.
+
+<Callout type="warn" title="Operator không tự làm callback rẻ hơn">
+  Nếu bạn đặt phép đo layout hoặc tính toán nặng trước `auditTime`, công việc đó vẫn chạy sau mọi source event. Hãy đưa phần đắt đỏ xuống sau operator khi semantics cho phép.
+</Callout>
+
+### AuditTime không phải sampleTime
+
+`auditTime(500)` và `sampleTime(500)` đều có thể phát giá trị mới nhất, nhưng đồng hồ của chúng bắt đầu khác nhau:
+
+- `auditTime` mở cửa sổ khi source phát event đầu tiên; không có event thì không có cửa sổ.
+- `sampleTime` tạo nhịp lấy mẫu định kỳ ngay từ lúc subscribe, rồi phát giá trị mới nhất nếu source đã có giá trị mới kể từ nhịp trước.
+
+Nếu cần các mốc đồng hồ cố định cho dashboard, `sampleTime` thường dễ dự đoán hơn. Nếu muốn cửa sổ bám theo lúc hoạt động thực sự bắt đầu, chọn `auditTime`.
+
+## Khi khoảng chờ phải thay đổi
+
+Các operator hậu tố `Time` dùng một khoảng cố định. Khi mỗi giá trị cần thời lượng khác nhau, dùng bản selector: `debounce`, `throttle` hoặc `audit`. Selector trả về một Observable điều khiển thời điểm kết thúc khoảng chờ.
+
+Ví dụ, từ khóa ngắn được chờ lâu hơn vì thường người dùng chưa gõ xong:
+
+```ts
+import { debounce, timer } from 'rxjs';
+
+const adaptiveQuery$ = query$.pipe(
+  debounce((query) => timer(query.length < 3 ? 500 : 200)),
+);
+```
+
+Cách chọn vẫn không đổi:
+
+| Operator selector | Câu hỏi nó trả lời |
+| --- | --- |
+| `debounce(value => duration$)` | Sau giá trị này, nguồn đã yên đủ lâu chưa? |
+| `throttle(value => duration$, config)` | Sau khi nhận giá trị này, khóa emission bao lâu? |
+| `audit(value => duration$)` | Khi cửa sổ do giá trị này mở kết thúc, giá trị mới nhất là gì? |
+
+Chỉ dùng selector khi thời lượng thật sự phụ thuộc vào giá trị hoặc một tín hiệu khác. Nếu mọi cửa sổ đều là `300 ms`, bản `*Time` ngắn hơn và dễ đọc hơn.
+
+## Hoàn tất lỗi và hủy subscription
+
+Timer đang chờ ảnh hưởng đến lúc output hoàn tất. Đây là chi tiết dễ gây bất ngờ trong stream ngắn:
+
+| Tình huống | `debounceTime` | `throttleTime` | `auditTime` |
+| --- | --- | --- | --- |
+| Source `complete` khi còn giá trị chờ | Phát giá trị chờ ngay rồi complete | Mặc định không có trailing value; nếu `trailing: true`, chờ hết cửa sổ, phát rồi complete | Chờ hết cửa sổ, phát giá trị mới nhất rồi complete |
+| Source `error` | Chuyển tiếp error; bỏ giá trị chờ | Chuyển tiếp error; bỏ giá trị chờ | Chuyển tiếp error; bỏ giá trị chờ |
+| Downstream unsubscribe | Hủy timer và bỏ giá trị chờ | Hủy timer và trạng thái chờ | Hủy timer và giá trị chờ |
+
+Vì unsubscribe không flush giá trị, đừng trông chờ `takeUntil(destroy$)` sẽ ép một autosave đang debounce chạy lần cuối. Nếu nghiệp vụ cần flush trước khi đóng màn hình, hãy mô hình hóa hành động flush riêng thay vì dựa vào teardown.
+
+## Bảng quyết định
+
+| Nhu cầu | Operator mặc định | Lý do |
+| --- | --- | --- |
+| Search sau khi người dùng ngừng gõ | `debounceTime` | Chỉ trạng thái cuối sau khoảng lặng có ý nghĩa |
+| Autosave sau chuỗi chỉnh sửa | `debounceTime` | Mỗi thay đổi mới dời deadline lưu |
+| Phản hồi ngay cho event đầu của burst | `throttleTime` | Leading emission đi qua ngay |
+| Lấy cả trạng thái đầu và cuối của burst | `throttleTime` với leading và trailing | Phản hồi sớm mà không mất cập nhật cuối |
+| Cập nhật vị trí mới nhất trong lúc kéo hoặc scroll | `auditTime` | Cửa sổ không reset; cuối cửa sổ lấy dữ liệu mới nhất |
+| Snapshot theo nhịp đồng hồ cố định | `sampleTime` | Tick bắt đầu từ lúc subscribe, không bám event đầu |
+| Bỏ trigger mới trong lúc tác vụ cũ đang chạy | `exhaustMap` | Giới hạn theo lifecycle, không theo số mili giây |
+| Hủy tác vụ cũ khi trigger mới đến | `switchMap` | Chỉ kết quả của trigger mới nhất còn hiệu lực |
+
+### Checklist trước khi chọn
+
+1. Downstream cần giá trị **đầu tiên**, **cuối cùng**, hay **mới nhất tại mỗi mốc cập nhật**?
+2. Có chấp nhận chờ source yên không? Nếu source không bao giờ yên, pipeline có được phép không phát gì không?
+3. Cửa sổ có reset sau mỗi event hay giữ nguyên từ event đầu?
+4. Có cần trailing value để không mất trạng thái cuối không?
+5. Giới hạn dựa trên thời gian hay dựa trên lúc một request hoàn tất?
+6. Công việc đắt đỏ đã được đặt sau operator giới hạn tần suất chưa?
+7. Test có cần truyền `TestScheduler` vào tham số scheduler để chạy bằng virtual time không?
+
+Mặc định của mình là `debounceTime` cho text input, `auditTime` cho luồng UI liên tục cần trạng thái mới nhất, và `throttleTime` khi event đầu phải có phản hồi ngay. Nếu yêu cầu nói về request đang chạy thay vì một khoảng thời gian, hãy chuyển sang higher-order mapping operator thay vì cố chỉnh vài con số mili giây.
+
+## Bước tiếp theo
+
+Hãy lấy một stream thật trong ứng dụng, ghi rõ timeline đầu vào và output mong muốn trước khi chọn operator. Sau đó dùng virtual time để biến các mốc thời gian đó thành test xác định, không phải test ngủ chờ timer thật.
+
+<Cards>
+  <Card title="Time-based operators" href="/docs/thoi-gian-schedulers/time-based-operators" description="Mở rộng sang các operator tạo và điều khiển stream theo thời gian." />
+  <Card title="Virtual time" href="/docs/thoi-gian-schedulers/virtual-time" description="Kiểm thử logic thời gian nhanh và xác định bằng scheduler ảo." />
+</Cards>

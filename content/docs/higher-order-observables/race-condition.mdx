@@ -3,8 +3,421 @@ title: Race condition
 description: Nhận diện và ngăn kết quả bất đồng bộ ghi đè sai thứ tự.
 ---
 
-Trang này sẽ trình bày **Race condition** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn gõ `rx`, rồi đổi thành `rxjs`. Kết quả cho `rxjs` đã hiện lên, nhưng một lát sau màn hình lại hiển thị kết quả của `rx`. Request không nhất thiết bị lỗi; ứng dụng đang cho response cũ ghi đè ý định mới. Bài này giúp bạn nhận diện race condition đó và chọn chính sách xử lý phù hợp, thay vì chỉ thêm debounce rồi hy vọng request sẽ về đúng thứ tự.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi và kiến thức nền">
+  Ví dụ dùng TypeScript và API RxJS 7.8.2. Bạn nên biết `pipe`, `subscribe` và [outer stream, inner stream](/docs/higher-order-observables/higher-order-stream). Timer và các mốc thời gian là minh họa, không phải benchmark. Ví dụ HTTP chạy trong trình duyệt và giả định ứng dụng có endpoint tìm kiếm riêng.
 </Callout>
+
+## Mục lục
+
+- [Race condition ở đây là gì](#race-condition-ở-đây-là-gì)
+  - [Một thread vẫn có thể gặp race condition](#một-thread-vẫn-có-thể-gặp-race-condition)
+  - [Xác định kết quả nào được phép cập nhật UI](#xác-định-kết-quả-nào-được-phép-cập-nhật-ui)
+- [Tái hiện lỗi bằng mergeMap](#tái-hiện-lỗi-bằng-mergemap)
+- [Giữ kết quả mới nhất bằng switchMap](#giữ-kết-quả-mới-nhất-bằng-switchmap)
+  - [Unsubscribe không đồng nghĩa với dừng mọi công việc](#unsubscribe-không-đồng-nghĩa-với-dừng-mọi-công-việc)
+- [Debounce và input không hợp lệ](#debounce-và-input-không-hợp-lệ)
+  - [Khoảng chờ trước khi switchMap nhận input mới](#khoảng-chờ-trước-khi-switchmap-nhận-input-mới)
+  - [Đừng lọc mất tín hiệu hủy](#đừng-lọc-mất-tín-hiệu-hủy)
+- [Ví dụ search với state thuộc đúng query](#ví-dụ-search-với-state-thuộc-đúng-query)
+  - [Vì sao state được phát từ inner](#vì-sao-state-được-phát-từ-inner)
+  - [Lỗi request và teardown](#lỗi-request-và-teardown)
+- [Khi không thể hủy producer](#khi-không-thể-hủy-producer)
+- [Chọn chính sách theo nghiệp vụ](#chọn-chính-sách-theo-nghiệp-vụ)
+- [Race condition khi ghi dữ liệu lên server](#race-condition-khi-ghi-dữ-liệu-lên-server)
+- [Kiểm chứng bằng marble test](#kiểm-chứng-bằng-marble-test)
+- [Checklist và bài tập](#checklist-và-bài-tập)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Race condition ở đây là gì
+
+Giả sử request A tìm `rx` bắt đầu trước request B tìm `rxjs`, nhưng A mất nhiều thời gian hơn. Nếu cả hai callback đều ghi vào cùng một vùng kết quả, thứ tự response quyết định UI cuối cùng:
+
+```text
+Thời gian minh họa
+0 ms     Gõ rx     → bắt đầu A
+50 ms    Gõ rxjs   → bắt đầu B
+150 ms   B trả về  → UI hiển thị kết quả rxjs
+300 ms   A trả về  → UI bị ghi đè thành kết quả rx
+```
+
+Race condition xuất hiện khi tính đúng đắn phụ thuộc vào thứ tự hoàn tất bất đồng bộ mà ứng dụng không kiểm soát. Trong tình huống này, lỗi không nằm ở việc A chậm; lỗi nằm ở việc A vẫn được phép cập nhật vùng UI đã thuộc về B.
+
+Hình dung bạn đặt một món, sau đó đổi sang món khác, nhưng quầy vẫn gọi tên bạn cho cả hai phiếu. Bạn cần quy tắc nhận phiếu nào, không chỉ cần người phục vụ nhanh hơn. Ví von dừng ở đó: bỏ phiếu cũ ở client không có nghĩa bếp, tức server, đã dừng công việc.
+
+### Một thread vẫn có thể gặp race condition
+
+Callback JavaScript trong cùng một event loop không cần chạy cùng lúc để tạo lỗi này. Hai request có thể cùng chờ network; callback B chạy trước, rồi callback A chạy sau và ghi đè state. Đây là thứ tự các tác vụ bất đồng bộ, không phải hai thread cùng sửa một ô nhớ tại cùng thời điểm.
+
+Vì vậy, thêm scheduler hoặc đổi chỗ một `setTimeout` không giải quyết được yêu cầu nghiệp vụ. Bạn cần quy định quyền cập nhật state, độc lập với tốc độ response.
+
+### Xác định kết quả nào được phép cập nhật UI
+
+Với search, quy tắc thường là **latest intent wins**: sau khi nhận query mới, kết quả của query trước không còn quyền cập nhật vùng tìm kiếm đó. “Mới nhất” là thứ tự input được tiếp nhận, không phải response về cuối cùng.
+
+Nhưng quy tắc này không áp dụng cho mọi màn hình. Nếu bạn tải nhiều sản phẩm độc lập, mỗi kết quả đều có ích và phải cập nhật đúng dòng theo `id`. Nếu bạn gửi các lệnh thay đổi cùng một đơn hàng, có thể mọi lệnh đều phải được xử lý theo thứ tự. Hãy xác định chính sách trước, rồi mới chọn flattening operator.
+
+## Tái hiện lỗi bằng mergeMap
+
+Ví dụ sau không cần backend. Mỗi timer giả lập một request phát đúng một response rồi complete:
+
+```ts
+import { map, merge, mergeMap, of, timer } from 'rxjs';
+
+const queries$ = merge(
+  of('rx'),
+  timer(50).pipe(map(() => 'rxjs')),
+);
+
+function search$(query: string) {
+  const durationMs = query === 'rx' ? 300 : 100;
+  return timer(durationMs).pipe(
+    map(() => ({ query, items: [`Kết quả cho ${query}`] })),
+  );
+}
+
+queries$.pipe(
+  mergeMap((query) => search$(query)),
+).subscribe((result) => {
+  console.log('UI nhận:', result.query, result.items);
+});
+
+// Khoảng 150 ms: UI nhận: rxjs ['Kết quả cho rxjs']
+// Khoảng 300 ms: UI nhận: rx   ['Kết quả cho rx']
+```
+
+`mergeMap` không sai: nó giữ các inner đang chạy và chuyển tiếp kết quả nào phát ra. Chính sách “nhận mọi response” mới là thứ không khớp với một vùng search chỉ hiển thị query hiện tại.
+
+Nested subscribe cũng dễ tạo lỗi tương tự: outer nhận query rồi tự `.subscribe()` từng request; các inner không tự hủy nhau. Chuyển thành một pipeline giúp bạn quản lý ownership, nhưng nếu pipeline ấy vẫn dùng `mergeMap` và mọi response đều ghi vào một state chung, race condition vẫn còn.
+
+## Giữ kết quả mới nhất bằng switchMap
+
+Trong ví dụ trên, thay subscription bằng đoạn sau; đừng giữ cả hai subscription nếu bạn chỉ muốn thử phiên bản đã sửa:
+
+```ts
+import { switchMap } from 'rxjs';
+
+queries$.pipe(
+  switchMap((query) => search$(query)),
+).subscribe((result) => {
+  console.log('UI nhận:', result.query, result.items);
+});
+
+// Khoảng 150 ms: UI nhận: rxjs ['Kết quả cho rxjs']
+// Không có kết quả rx ở downstream.
+```
+
+Khi `queries$` phát `rxjs`, `switchMap` unsubscribe inner của `rx` trước khi tạo và subscribe inner mới. Timer cũ được dọn, nên nó không phát response cũ xuống observer.
+
+```text
+0 ms     nhận rx    → subscribe A
+50 ms    nhận rxjs  → unsubscribe A → subscribe B
+150 ms   B phát     → downstream nhận kết quả rxjs
+300 ms   A         → không còn subscription để cập nhật UI
+```
+
+Mình chọn `switchMap` mặc định cho read request mà input mới thay thế hoàn toàn input cũ: search, xem chi tiết theo ID đang chọn, hoặc tải dữ liệu theo bộ lọc hiện tại. Nó bảo vệ output từ các inner cũ **sau khi input mới đã đến chính operator đó**; ranh giới này rất quan trọng khi đặt debounce phía trước.
+
+### Unsubscribe không đồng nghĩa với dừng mọi công việc
+
+Cần tách ba việc khác nhau:
+
+| Việc | `switchMap` đảm bảo gì? |
+| --- | --- |
+| Ngừng nhận emission từ inner cũ ở downstream | Có, sau khi switch và unsubscribe inner cũ |
+| Dừng timer hoặc request phía client | Phụ thuộc teardown của producer; timer được dọn, `ajax` abort XHR đang chạy |
+| Dừng xử lý hoặc hoàn tác dữ liệu trên server | Không đảm bảo |
+
+`from(fetch(url))` bọc Promise không tự abort `fetch`. Request có thể tiếp tục chạy, nhưng kết quả resolve không còn được chuyển tới subscriber đã đóng. Muốn abort transport, dùng `AbortController` gắn với teardown hoặc API Observable có hỗ trợ cancellation.
+
+<Callout type="warn" title="Side effect ngoài subscription vẫn có thể chạy">
+  Nếu bạn gọi `fetch(url).then(result => updateUi(result))` bên ngoài đường phát value của inner, callback Promise ấy không tự bị vô hiệu hóa bởi `switchMap`. Đưa dữ liệu vào inner rồi cập nhật UI ở downstream; đừng để producer tự ghi vào state chung qua một đường khác.
+</Callout>
+
+## Debounce và input không hợp lệ
+
+### Khoảng chờ trước khi switchMap nhận input mới
+
+Pipeline thường gặp là `input$ → debounceTime(250) → switchMap(search$)`. Nó hợp lý nếu yêu cầu là “chỉ đổi query có hiệu lực sau khi người dùng ngừng gõ”. Nhưng nó không có nghĩa request cũ bị hủy ngay khi một ký tự mới xuất hiện.
+
+Giả sử A đã chạy. Người dùng nhập B, nhưng `debounceTime` đang giữ B trong 250 ms. Nếu A trả về trong khoảng đó, `switchMap` chưa thấy B nên A vẫn có thể cập nhật UI. Debounce giảm tần suất tạo request; nó **không tự thiết lập quyền sở hữu state theo raw input**.
+
+Nếu yêu cầu là “vừa nhận query mới thì bỏ kết quả cũ ngay, nhưng vẫn chờ trước khi gửi request mới”, đưa khoảng chờ vào bên trong `switchMap`:
+
+```text
+Input mới → switchMap hủy cả timer/request của query cũ
+          → timer 250 ms cho query mới
+          → gửi request nếu timer không bị query tiếp theo hủy
+```
+
+Ví dụ hoàn chỉnh ở phần sau dùng cấu trúc này. Khoảng 250 ms là lựa chọn minh họa; bạn cần chọn theo trải nghiệm ứng dụng, không coi nó là điều kiện đảm bảo đúng thứ tự.
+
+### Đừng lọc mất tín hiệu hủy
+
+Một bẫy khác là đặt `filter(query => query.length >= 2)` trước `switchMap`. Khi người dùng xóa ô tìm kiếm, chuỗi rỗng bị filter chặn. `switchMap` không biết input đã thay đổi, nên request cũ vẫn active và có thể đưa kết quả trở lại màn hình vừa được xóa.
+
+Đưa quyết định “không gửi request” vào projection: input không hợp lệ vẫn đến `switchMap` để hủy inner cũ, rồi trả `of(idleState)` để xóa kết quả. `EMPTY` cũng không gửi request và complete ngay, nhưng không phát state; nếu UI cần chuyển sang idle, `of(...)` thể hiện điều đó rõ hơn.
+
+`distinctUntilChanged` có vai trò khác: nó bỏ query liên tiếp có cùng giá trị sau normalization. Nếu trim khoảng trắng được coi là cùng query, không cần hủy chỉ vì người dùng thêm một dấu cách ở cuối. Nếu refresh cùng query là một ý định mới, cần trigger riêng hoặc bỏ deduplication cho trường hợp đó.
+
+## Ví dụ search với state thuộc đúng query
+
+Giả sử `GET /api/search?q=...` trả JSON có dạng `{ items: string[] }`. Đây là endpoint minh họa của ứng dụng, không có sẵn trong repository. Hàm dưới nhận input element và một hàm render do bạn cung cấp; gọi hàm cleanup khi màn hình unmount.
+
+```ts
+import {
+  catchError,
+  defer,
+  distinctUntilChanged,
+  fromEvent,
+  map,
+  of,
+  startWith,
+  switchMap,
+  timeout,
+  timer,
+} from 'rxjs';
+import { ajax } from 'rxjs/ajax';
+
+type SearchResponse = { items: string[] };
+
+type SearchState =
+  | { status: 'idle'; query: string }
+  | { status: 'waiting'; query: string }
+  | { status: 'loading'; query: string }
+  | { status: 'success'; query: string; items: string[] }
+  | { status: 'error'; query: string; message: string };
+
+function mountSearch(
+  input: HTMLInputElement,
+  render: (state: SearchState) => void,
+): () => void {
+  const query$ = fromEvent(input, 'input').pipe(
+    map(() => input.value.trim()),
+    startWith(input.value.trim()),
+    distinctUntilChanged(),
+  );
+
+  const subscription = query$.pipe(
+    switchMap((query) => {
+      if (query.length < 2) {
+        return of<SearchState>({ status: 'idle', query });
+      }
+
+      return timer(250).pipe(
+        switchMap(() =>
+          defer(() => ajax.getJSON<SearchResponse>(
+            `/api/search?q=${encodeURIComponent(query)}`,
+          )).pipe(
+            timeout({ first: 5_000 }),
+            map((response): SearchState => ({
+              status: 'success',
+              query,
+              items: response.items,
+            })),
+            catchError((error: unknown) => of<SearchState>({
+              status: 'error',
+              query,
+              message: error instanceof Error
+                ? error.message
+                : 'Không tải được kết quả',
+            })),
+            startWith<SearchState>({ status: 'loading', query }),
+          ),
+        ),
+        startWith<SearchState>({ status: 'waiting', query }),
+      );
+    }),
+  ).subscribe(render);
+
+  return () => subscription.unsubscribe();
+}
+```
+
+Trong browser, gọi `mountSearch(inputElement, renderSearch)` sau khi input đã tồn tại. `renderSearch` cần thể hiện rõ từng trạng thái: idle xóa kết quả, waiting cho biết đang chờ người dùng ngừng gõ, loading cho biết request đã bắt đầu, success hiển thị items và error hiển thị lỗi. Với chính sách latest intent wins nghiêm ngặt, waiting và loading cũng phải xóa hoặc đánh dấu dữ liệu cũ là stale, không tiếp tục trình bày nó như kết quả của query mới.
+
+`SearchResponse` chỉ là kiểu TypeScript, không validate JSON lúc runtime. Nếu cần bảo vệ trước response sai schema, validate bên trong inner trước khi tạo success state. Deadline 5 giây cũng chỉ là cấu hình minh họa cho request một response.
+
+### Vì sao state được phát từ inner
+
+Mỗi state mang `query` và đi qua cùng đường output với response. Khi query thay đổi, outer `switchMap` hủy toàn bộ inner trước đó, gồm timer, request và quyền phát state. Chuỗi rỗng cũng có state idle ngay, nên request cũ không được tiếp tục chiếm vùng kết quả.
+
+Điều này tránh một lỗi loading khá khó thấy: bạn đặt `tap(() => loading = true)` trước `switchMap`, nhưng lại đặt `finalize(() => loading = false)` trong mỗi request. Khi B đến, `tap` bật loading cho B; sau đó `switchMap` hủy A và `finalize` của A tắt loading. B đang chạy nhưng UI lại báo đã hết loading.
+
+`finalize` không sai; nó chạy cả khi complete, error và unsubscribe. Sai ở chỗ cleanup của A được phép sửa một cờ chung đã thuộc về B. Với search, mình ưu tiên state emission như ví dụ trên và dành `finalize` cho cleanup tài nguyên. Nếu bắt buộc dùng state mutable, mọi callback sửa state, kể cả cleanup, phải kiểm tra ownership của request.
+
+### Lỗi request và teardown
+
+`catchError` nằm trong request inner để lỗi một query trở thành error state, không làm listener input chết. Nếu đặt `catchError(() => of(errorState))` sau outer `switchMap`, request lỗi làm toàn bộ upstream bị unsubscribe; fallback phát xong rồi complete, nên input tiếp theo không còn tạo request qua subscription đó.
+
+`defer` giữ thao tác tạo request trong inner, đồng thời đưa exception đồng bộ của factory vào error channel để `catchError` ở đây xử lý. Không gọi `.subscribe()` trong projection: một inner tự subscribe sẽ không còn thuộc lifecycle do `switchMap` quản lý.
+
+Hàm cleanup gọi `unsubscribe()` trên subscription cuối, nên hủy cả event listener, timer chờ và XHR đang chạy. Nếu dự án dùng notifier, đặt `takeUntil(destroy$)` sau outer `switchMap` để hủy cả inner; notifier phải phát value. Chỉ complete outer không hủy request đang active: `switchMap` còn chờ inner hiện tại complete.
+
+Ví dụ có một subscriber. Thêm subscriber khác vào cold pipeline có thể tạo execution và request riêng; trạng thái “mới nhất” của một subscription không khóa được request do subscription khác tạo.
+
+## Khi không thể hủy producer
+
+Nếu một SDK chỉ trả Promise và bạn muốn viết theo callback/`async`, có thể dùng generation ID để bỏ kết quả hết quyền cập nhật UI. Ví dụ sau độc lập với pipeline RxJS ở trên:
+
+```ts
+let generation = 0;
+
+async function searchLatest(query: string): Promise<void> {
+  const requestId = ++generation;
+  const normalized = query.trim();
+
+  if (normalized.length < 2) {
+    console.log('idle: xóa kết quả');
+    return;
+  }
+
+  console.log('loading', normalized);
+
+  try {
+    const response = await fetch(
+      `/api/search?q=${encodeURIComponent(normalized)}`,
+    );
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const data = await response.json();
+
+    if (requestId !== generation) return;
+    console.log('success', normalized, data);
+  } catch (error: unknown) {
+    if (requestId !== generation) return;
+    console.error('error', normalized, error);
+  } finally {
+    if (requestId === generation) {
+      console.log('loading kết thúc', normalized);
+    }
+  }
+}
+```
+
+Gọi `searchLatest` cho mỗi input có hiệu lực, kể cả chuỗi rỗng. Counter tăng trước validation để xóa input cũng vô hiệu hóa request trước đó. Khi owner unmount, tăng `generation` để callback còn pending không sửa UI đã bị tháo.
+
+Điểm chính không phải con số ID, mà là **kiểm tra quyền trước mọi thay đổi state**, gồm success, error và loading cleanup. Chỉ guard success thì lỗi muộn của request cũ vẫn có thể ghi đè màn hình mới. Counter này dành cho một owner của một vùng search; đừng dùng chung nó để vô hiệu hóa các công việc độc lập.
+
+Cách này không tiết kiệm network và không abort producer. Với một flow đã dùng RxJS, mình ưu tiên `switchMap` và giữ side effect ở downstream thay vì thêm counter mutable chỉ để làm lại ownership mà subscription đã cung cấp.
+
+## Chọn chính sách theo nghiệp vụ
+
+| Yêu cầu | Chính sách thường phù hợp | Điều cần nhớ |
+| --- | --- | --- |
+| Input mới thay thế read request cũ | `switchMap` | Hủy quyền phát của inner cũ, không bảo đảm server dừng |
+| Mọi lệnh đều cần xử lý theo thứ tự | `concatMap` | Chờ inner complete; queue có thể tăng, không phải durable queue |
+| Các tác vụ độc lập đều cần kết quả | `mergeMap` với concurrency phù hợp | Output có thể đảo thứ tự; cập nhật theo ID thay vì một state chung |
+| Bỏ trigger mới trong lúc tác vụ đang bận | `exhaustMap` | Giữ tác vụ đầu, không giữ ý định mới nhất |
+
+Đừng đổi từ `mergeMap` sang `concatMap` chỉ để “không đảo response” trong search. UI vẫn lần lượt hiển thị các query đã lỗi thời, còn query hiện tại phải xếp hàng. Ngược lại, đổi mọi lệnh ghi sang `switchMap` có thể làm mất việc mà nghiệp vụ bắt buộc phải thực hiện.
+
+Operator tên `race` cũng không phải thuốc chữa race condition này: nó chọn source thắng cuộc theo notification đầu tiên, không thực hiện chính sách latest intent wins theo input. Tên giống nhau không có nghĩa bài toán giống nhau.
+
+## Race condition khi ghi dữ liệu lên server
+
+Với autosave, client nhận bản A rồi bản B của cùng một tài liệu. Nếu dùng `switchMap`, UI có thể chỉ nhận response của B. Nhưng server có thể đã nhận cả hai write và áp dụng A sau B. Khi tải lại trang, bạn lại thấy bản A: output client đúng không chứng minh dữ liệu lưu trên server đúng.
+
+Mình thường cân nhắc `concatMap` khi mọi write phải được gửi đủ và tuần tự trong một execution. Tuy nhiên, nó chỉ chờ response trước khi bắt đầu request kế tiếp. Nếu server trả `202 Accepted` trong khi job còn chạy, thứ tự response không chứng minh thứ tự commit. Hai tab hoặc hai thiết bị cũng không đi qua cùng queue client.
+
+<Callout type="warn" title="Abort không phải rollback">
+  Client abort HTTP chỉ kết thúc transport phía client khi producer hỗ trợ. Server có thể đã ghi dữ liệu. Timeout hoặc mất response cũng không chứng minh thao tác chưa thành công; retry write cần cơ chế chống trùng phù hợp.
+</Callout>
+
+Nếu dữ liệu có yêu cầu nhất quán, backend phải có chính sách tương ứng:
+
+- **Optimistic concurrency**: gửi version hoặc ETag, dùng cập nhật có điều kiện như `If-Match`; version không khớp thì báo conflict. Client cần quyết định reload, merge hay gửi lại, không âm thầm coi conflict là thành công.
+- **Ordering cho cùng resource**: queue hoặc sequence được server kiểm tra, kèm quy tắc rõ ràng khi lệnh đến sai thứ tự. “Giữ bản mới nhất” cần định nghĩa mới nhất theo domain, không chỉ dùng timestamp từ các máy client có clock khác nhau.
+- **Idempotency**: dùng key cho cùng một ý định ghi để retry không tạo tác động trùng. Cơ chế này chống lặp, không tự giải quyết thứ tự giữa hai write khác nhau.
+
+Không có một flattening operator nào thay thế các bảo đảm đó. Chọn operator để điều phối client; chọn version, transaction hoặc queue phía server theo yêu cầu lưu dữ liệu.
+
+## Kiểm chứng bằng marble test
+
+Test sau dùng assertion của Node.js và `TestScheduler`. A được nhận trước B nhưng trả response muộn hơn. Test kiểm tra cả output lẫn thời điểm unsubscribe A, vì chỉ nhìn value cuối cùng dễ bỏ sót lifecycle sai.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { mergeMap, switchMap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+const scheduler = new TestScheduler((actual, expected) => {
+  deepStrictEqual(actual, expected);
+});
+
+scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+  const queries = cold('a---b------|');
+  const slow = cold('--------x|');
+  const fast = cold('--y|');
+
+  const select = (query: string) => query === 'a' ? slow : fast;
+
+  expectObservable(queries.pipe(mergeMap(select)))
+    .toBe('------y-x--|');
+  expectObservable(queries.pipe(switchMap(select)))
+    .toBe('------y----|');
+
+  expectSubscriptions(slow.subscriptions).toBe([
+    '^--------!', // mergeMap: A phát x rồi complete tại frame 9.
+    '^---!',     // switchMap: A bị hủy khi B đến tại frame 4.
+  ]);
+  expectSubscriptions(fast.subscriptions).toBe([
+    '----^--!',  // B subscribe tại frame 4, complete tại frame 7.
+    '----^--!',
+  ]);
+});
+```
+
+Trong `run`, mỗi dấu `-` là một frame thời gian ảo. `x` của A nằm tại frame 8, `y` của B tại frame 6; `^` biểu diễn subscribe và `!` biểu diễn unsubscribe. Hai subscription vào cùng `queries` ở đây là chủ ý để so sánh hai chính sách; mỗi subscription tạo execution độc lập.
+
+Marble test kiểm chứng subscription và emission của Observable, không chứng minh backend dừng xử lý khi abort. Với ví dụ search hoàn chỉnh, bổ sung các test sau:
+
+- Query mới đến trong lúc timer đang chờ: timer cũ bị hủy, request cũ chưa được tạo.
+- Query mới hoặc chuỗi rỗng đến trong lúc request đang chạy: inner cũ bị unsubscribe ngay; chuỗi rỗng phát idle state.
+- Request A trả trong khoảng debounce của B: A không cập nhật UI với cấu trúc timer nằm trong outer `switchMap`.
+- Request lỗi rồi query kế tiếp xuất hiện: listener còn sống và query mới vẫn chạy.
+- Owner unmount giữa request: không có success, error hoặc loading callback cũ sửa UI sau teardown.
+
+## Checklist và bài tập
+
+Trước khi coi lỗi đã được sửa, kiểm tra:
+
+- [ ] “Mới nhất” được định nghĩa theo input có hiệu lực, không theo response đến cuối.
+- [ ] Success, error và loading đều thuộc cùng query hoặc request ID.
+- [ ] Input rỗng và input không hợp lệ vẫn tới được điểm hủy inner cũ.
+- [ ] Vị trí debounce khớp thời điểm bạn muốn vô hiệu hóa kết quả cũ.
+- [ ] Không có nested subscribe hoặc Promise callback tự sửa state ngoài pipeline.
+- [ ] Teardown hủy cả outer và inner; không có subscriber khác vô tình tạo request riêng.
+- [ ] Write request có chính sách nhất quán ở server nếu abort client không đủ.
+- [ ] Test cố ý cho response về ngược thứ tự, không chỉ thử mạng nhanh ở happy path.
+
+Bạn có thể tự kiểm tra bằng ba thay đổi nhỏ:
+
+1. Thay `switchMap` trong ví dụ timer bằng `concatMap`. Kết quả nào xuất hiện, và query mới phải đợi bao lâu? **Cả hai kết quả xuất hiện; request `rxjs` chỉ bắt đầu sau khi `rx` complete, nên trả về khoảng 400 ms tính từ đầu.**
+2. Đặt filter độ dài trước outer `switchMap`, rồi xóa input trong lúc request đang chạy. Request cũ có bị hủy bởi lần xóa ấy không? **Không, vì lần xóa không tới operator quản lý inner.**
+3. Chỉ guard success bằng generation ID nhưng không guard catch/finally. UI còn bị ảnh hưởng bởi A sau khi B bắt đầu không? **Có, lỗi hoặc cleanup muộn của A vẫn có thể sửa state chung.**
+
+Bước tiếp theo: lấy flow search hoặc chọn ID trong ứng dụng của bạn, giả lập response đầu chậm hơn response sau, rồi viết assertion cho cả state và subscription. Đó là cách chứng minh chính sách đúng mà không phụ thuộc may mắn của tốc độ mạng.
+
+## Học tiếp
+
+<Cards>
+  <Card title="switchMap" href="/docs/higher-order-observables/switch-map" description="Hiểu cơ chế thay inner và ranh giới cancellation." />
+  <Card title="concatMap" href="/docs/higher-order-observables/concat-map" description="Xử lý các công việc cần giữ đủ và theo thứ tự." />
+  <Card title="mergeMap" href="/docs/higher-order-observables/merge-map" description="Chạy đồng thời khi kết quả thuộc các tài nguyên độc lập." />
+  <Card title="Debounce, throttle và audit" href="/docs/thoi-gian-schedulers/debounce-throttle-audit" description="Tách chính sách thời gian khỏi chính sách chọn request." />
+  <Card title="Nested subscribe" href="/docs/troubleshooting/nested-subscribe" description="Nhận diện inner subscription không có ownership rõ ràng." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm chứng output và teardown bằng thời gian ảo." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS API: switchMap](https://rxjs.dev/api/operators/switchMap).
+- [Source switchMap tại tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/switchMap.ts): unsubscribe inner cũ trước projection mới; chờ inner khi outer complete.
+- [Source ajax tại tag 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/ajax/ajax.ts): teardown abort XHR chưa hoàn tất.
+- [RxJS API: debounceTime](https://rxjs.dev/api/operators/debounceTime).
+- [RxJS API: finalize](https://rxjs.dev/api/operators/finalize).
+- [RxJS API: TestScheduler](https://rxjs.dev/api/testing/TestScheduler).

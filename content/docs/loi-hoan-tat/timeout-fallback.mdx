@@ -3,8 +3,419 @@ title: Timeout và fallback
 description: Giới hạn thời gian chờ và cung cấp đường lui an toàn.
 ---
 
-Trang này sẽ trình bày **Timeout và fallback** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn gọi API để tải dữ liệu, bật loading, rồi chờ mãi vì request không trả kết quả cũng không báo lỗi. `catchError` chưa giúp được: không có error thì chẳng có gì để bắt. `timeout` đặt giới hạn cho thời gian chờ một value; khi vượt giới hạn, bạn có thể báo lỗi hoặc chuyển sang nguồn fallback, chẳng hạn cache có đánh dấu dữ liệu cũ.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Ví dụ dùng **RxJS 7.8.2**, TypeScript và import từ `rxjs`. Các nguồn mô phỏng không cần backend; những mốc thời gian là số minh họa, không phải khuyến nghị cho production. Bạn nên biết [error channel](/docs/loi-hoan-tat/error-channel) và [catchError](/docs/loi-hoan-tat/catch-error).
 </Callout>
+
+## Mục lục
+
+- [Timeout đo thời gian chờ value](#timeout-đo-thời-gian-chờ-value)
+- [Chọn first hay each](#chọn-first-hay-each)
+  - [first giới hạn value đầu tiên](#first-giới-hạn-value-đầu-tiên)
+  - [each giới hạn khoảng im lặng](#each-giới-hạn-khoảng-im-lặng)
+  - [Kết hợp first và each](#kết-hợp-first-và-each)
+- [Cấu hình timeout trong RxJS 7](#cấu-hình-timeout-trong-rxjs-7)
+- [Chuyển sang fallback bằng with](#chuyển-sang-fallback-bằng-with)
+- [Bắt riêng TimeoutError bằng catchError](#bắt-riêng-timeouterror-bằng-catcherror)
+- [Giữ luồng tương tác sống sau timeout](#giữ-luồng-tương-tác-sống-sau-timeout)
+- [Timeout retry và ngân sách chờ](#timeout-retry-và-ngân-sách-chờ)
+- [Unsubscribe có hủy request thật không](#unsubscribe-có-hủy-request-thật-không)
+- [Những bẫy cần tránh](#những-bẫy-cần-tránh)
+- [Kiểm thử bằng TestScheduler](#kiểm-thử-bằng-testscheduler)
+- [Checklist trước khi dùng](#checklist-trước-khi-dùng)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Timeout đo thời gian chờ value
+
+Hãy hình dung bạn đặt đồ ăn và hẹn: nếu quá một khoảng thời gian chưa có món thì chọn phương án khác. Với `timeout`, “có món” là một notification `next`, **không phải** `complete`. Giới hạn của ví von này là RxJS chỉ quan sát notification ở vị trí operator; nó không biết request bên dưới đã làm được bao nhiêu việc.
+
+Trong thời gian cho phép, output chuyển tiếp các value của source. Nếu timer hết hạn trước value cần chờ, `timeout` unsubscribe khỏi source rồi thực hiện một trong hai đường:
+
+- Không có `with`: phát `TimeoutError` xuống error channel.
+- Có `with`: subscribe vào nguồn fallback do factory trả về, không tự phát `TimeoutError`.
+
+```text
+source ── chờ value ── hết hạn
+                         │ unsubscribe source
+                         ├── không có with ──► TimeoutError
+                         └── có with ────────► fallback ──► output
+```
+
+Các value đã phát trước timeout không bị thu hồi. Sau khi chuyển sang fallback, subscription này không quay lại source cũ dù source có dữ liệu muộn hơn.
+
+Nếu source complete hoặc error trước khi timer hết hạn, notification đó đi xuống như bình thường và timer được dọn. Đặc biệt, `EMPTY.pipe(timeout({ first: 1_000 }))` complete ngay, không chờ một giây để báo timeout. Timeout không bảo đảm nguồn phải phát ít nhất một value; nếu cần kiểm tra nguồn rỗng, đó là bài toán của `throwIfEmpty` hoặc `defaultIfEmpty`.
+
+## Chọn first hay each
+
+Mình chọn config object thay vì shorthand vì người đọc thấy ngay đang giới hạn lần chờ đầu hay mọi khoảng chờ. Với một request chỉ phát response cuối cùng rồi complete, `first` thường diễn đạt đúng mục tiêu. Với heartbeat, `each` hợp lý hơn vì bạn cần phát hiện stream đã im lặng quá lâu.
+
+### first giới hạn value đầu tiên
+
+`first` dạng số tính bằng millisecond từ lúc subscribe. Sau value đầu tiên, nếu không cấu hình `each`, operator không còn giám sát thời gian chờ value tiếp theo hay thời gian chờ complete.
+
+```ts
+import { map, timeout, timer, TimeoutError } from 'rxjs';
+
+const response$ = timer(3_000).pipe(map(() => 'Response từ API'));
+
+response$.pipe(
+  timeout({ first: 1_000 }),
+).subscribe({
+  next: (value) => console.log(value),
+  error: (error: unknown) => {
+    console.log(error instanceof TimeoutError); // true, khoảng 1 giây sau subscribe
+  },
+});
+```
+
+Không có log response: timer nguồn bị unsubscribe trước mốc ba giây. Đây là nguồn mô phỏng; với request thật, việc hủy tác vụ phụ thuộc teardown của nguồn.
+
+`first` cũng nhận `Date`, ví dụ `timeout({ first: new Date(Date.now() + 1_000) })`. Đó là hạn tuyệt đối cho **value đầu tiên**, không phải deadline để toàn stream complete. Nếu tạo `Date` một lần rồi subscribe lại sau, deadline cũ không tự được gia hạn; dùng số nếu bạn muốn mỗi subscription có cùng thời gian chờ tương đối.
+
+### each giới hạn khoảng im lặng
+
+`each` đặt timer mới sau mỗi `next`. Khi không có `first`, `each` cũng giới hạn lần chờ từ subscribe đến value đầu tiên.
+
+Ví dụ giả sử `each: 1_000`, source phát `A` ở 400 ms, phát `B` ở 900 ms rồi không phát gì nữa và chưa complete:
+
+```text
+Mốc từ subscribe      0 ms       400 ms       900 ms       1.900 ms
+source                subscribe  A            B            im lặng
+hạn chờ đang áp dụng  1.000 ms    1.400 ms     1.900 ms     timeout
+output                           A            B            TimeoutError
+```
+
+Tổng thời gian đã vượt một giây nhưng chưa timeout ở mốc 1.000 ms, vì `B` đã reset timer. `each` không giới hạn tổng thời lượng stream. Nếu nguồn phát đều trước mỗi hạn, stream có thể sống vô hạn.
+
+Sau value cuối cùng, timer của `each` vẫn chạy nếu source chưa complete. Vì vậy một nguồn phát `A` rồi giữ mở cũng có thể timeout; một nguồn phát `A` rồi complete ngay thì không.
+
+### Kết hợp first và each
+
+Đôi khi thiết lập kết nối mất lâu hơn nhịp phát sau khi đã kết nối. Bạn có thể cho phép value đầu tiên đến trong ba giây, nhưng chỉ cho phép một giây im lặng giữa các value sau đó:
+
+```ts
+import { interval, take, timeout } from 'rxjs';
+
+interval(800).pipe(
+  timeout({ first: 3_000, each: 1_000 }),
+  take(3),
+).subscribe({
+  next: (value) => console.log(value),
+  error: (error: unknown) => console.error(error),
+  complete: () => console.log('complete'),
+});
+// Khoảng 800, 1.600, 2.400 ms: 0, 1, 2; sau đó complete.
+```
+
+`first` thắng ở lần chờ đầu; `each` chỉ áp dụng sau value đầu tiên. Không nên áp `each` lên một stream vốn có khoảng im lặng hợp lệ, như thao tác click của người dùng: người dùng ngừng click không có nghĩa là hệ thống lỗi.
+
+## Cấu hình timeout trong RxJS 7
+
+Bảng này tóm tắt config object; bạn cần cung cấp ít nhất một trong `first` hoặc `each`.
+
+| Thuộc tính | Kiểu | Ý nghĩa |
+| --- | --- | --- |
+| `first` | `number` hoặc `Date` | Hạn cho value đầu tiên; số là millisecond tương đối, `Date` là thời điểm tuyệt đối. |
+| `each` | `number` | Millisecond tối đa chờ value tiếp theo; dùng cả cho value đầu nếu không có `first`. Nên dùng khoảng thời gian dương. |
+| `with` | `(info) => ObservableInput` | Factory tạo nguồn thay thế khi timeout, không chạy khi source error thông thường. |
+| `meta` | Kiểu do bạn chọn | Ngữ cảnh tùy chọn, ví dụ tên operation, được đưa vào thông tin timeout. |
+| `scheduler` | `SchedulerLike` | Scheduler quản lý timer; mặc định là `asyncScheduler`. |
+
+Trong RxJS 7.8.2, `timeout(1_000)` tương đương `timeout({ each: 1_000 })`, **không phải** `first`. `timeout(date)` tương đương `timeout({ first: date })`. Khi gặp code dùng `timeoutWith`, có thể chuyển sang config `timeout({ first: ..., with: ... })` hoặc `timeout({ each: ..., with: ... })` theo ý nghĩa cũ; `timeoutWith` đã deprecated trong dòng RxJS 7.
+
+Factory `with` nhận `TimeoutInfo`, còn `TimeoutError` mặc định có thuộc tính `info` chứa thông tin này:
+
+| Trường | Dùng để làm gì |
+| --- | --- |
+| `meta` | Gắn log với operation hoặc request context đã cung cấp. |
+| `seen` | Số value source đã phát trước timeout; bằng `0` nếu chưa có value nào. |
+| `lastValue` | Theo kiểu API là value cuối hoặc `null`; không nên dựa vào trường này để giữ cache trong RxJS 7.8.2. |
+
+<Callout type="warn" title="Giữ cache riêng thay vì dựa vào lastValue">
+  Trong implementation RxJS 7.8.2, teardown nguồn reset `lastValue` về `null` trước khi gọi factory timeout. Vì vậy trường này có thể là `null` dù `seen` lớn hơn `0`. Nếu fallback cần dữ liệu trước đó, hãy quản lý cache riêng; không dùng `info.lastValue` như nơi lưu state đáng tin cậy.
+</Callout>
+
+## Chuyển sang fallback bằng with
+
+Khi chỉ muốn đổi nguồn vì **hết thời gian chờ**, mình chọn `with`: intent nằm ngay cạnh giới hạn chờ, và lỗi khác của source vẫn được chuyển tiếp. Fallback nên có metadata để UI biết đang dùng dữ liệu cache, thay vì trông như response mới từ server.
+
+```ts
+import { map, Observable, of, timeout, timer } from 'rxjs';
+
+type Product = { id: number; name: string };
+type ProductState = {
+  origin: 'network' | 'cache';
+  stale: boolean;
+  products: Product[];
+};
+
+const cachedProducts: Product[] = [{ id: 1, name: 'Bàn phím' }];
+const network$: Observable<Product[]> = timer(3_000).pipe(
+  map(() => [{ id: 2, name: 'Chuột' }]),
+);
+
+const state$: Observable<ProductState> = network$.pipe(
+  map((products): ProductState => ({
+    origin: 'network', stale: false, products,
+  })),
+  timeout({
+    first: 1_000,
+    meta: { operation: 'load-products' },
+    with: (info) => {
+      console.warn('Timeout:', info.meta.operation, 'seen:', info.seen);
+      return of<ProductState>({
+        origin: 'cache', stale: true, products: cachedProducts,
+      });
+    },
+  }),
+);
+
+state$.subscribe({
+  next: (state) => console.log(state.origin, state.stale),
+  error: (error: unknown) => console.error(error),
+  complete: () => console.log('complete'),
+});
+// Khoảng 1 giây: cảnh báo với seen: 0; tiếp theo cache true; rồi complete.
+```
+
+Factory chạy khi timeout xảy ra, không phải khi tạo pipeline. Nếu việc đọc cache cần tạo Promise, hãy tạo Promise bên trong factory hoặc dùng `defer`, tránh bắt đầu tác vụ fallback từ trước khi cần đến nó.
+
+`with` trả về một `ObservableInput`; dùng `of(state)` để phát một object hoặc `of(products)` để phát cả array làm một value. Trả array trực tiếp sẽ phát từng phần tử, còn array rỗng sẽ complete mà không phát dữ liệu nào.
+
+**Giới hạn timeout hiện tại không được tự áp lại cho fallback.** Output sau khi chuyển nguồn đi theo vòng đời fallback: `of(...)` phát rồi complete, `EMPTY` complete không có value, còn `NEVER` có thể giữ loading mãi. Nếu fallback là một request khác, đặt một `timeout` riêng trong pipeline của request đó. Factory throw hoặc fallback error thì lỗi đi xuống downstream, cần handler riêng nếu bạn muốn khôi phục tiếp.
+
+Fallback không luôn an toàn. Với số dư hoặc xác nhận thanh toán, dữ liệu cũ có thể gây quyết định sai; khi không có dữ liệu thay thế hợp lệ, hãy phát trạng thái timeout rõ ràng hoặc chuyển lỗi lên tầng biết cách xử lý.
+
+## Bắt riêng TimeoutError bằng catchError
+
+Dùng `catchError` khi tầng xử lý lỗi cần phân loại timeout cùng lỗi mạng, lỗi quyền truy cập hay lỗi nghiệp vụ. Đừng biến mọi lỗi thành cache chỉ vì chúng cùng đi qua error channel.
+
+```ts
+import {
+  catchError, NEVER, of, throwError, timeout, TimeoutError,
+} from 'rxjs';
+
+NEVER.pipe(
+  timeout({ first: 1_000, meta: 'load-profile' }),
+  catchError((error: unknown) => {
+    if (error instanceof TimeoutError) {
+      console.warn('Quá thời gian chờ:', error.info?.meta);
+      return of({ status: 'timeout' as const, message: 'Bạn thử lại sau nhé' });
+    }
+    return throwError(() => error);
+  }),
+).subscribe({
+  next: (state) => console.log(state.status),
+  error: (error: unknown) => console.error('Lỗi không được khôi phục:', error),
+  complete: () => console.log('complete'),
+});
+// Khoảng 1 giây: cảnh báo, next chứa status timeout, rồi complete.
+```
+
+Trong ví dụ này, timeout là `error` từ operator, còn `{ status: 'timeout' }` là một **value trên next channel** sau khi khôi phục. Nếu dùng `with: () => of(...)` ngay trong `timeout`, downstream `catchError` không nhận `TimeoutError` từ lần hết hạn đó nữa; nguồn đã chuyển sang fallback rồi.
+
+## Giữ luồng tương tác sống sau timeout
+
+Một nút refresh có thể được bấm nhiều lần. Mình giới hạn thời gian **từng request bên trong** `switchMap`, không giới hạn khoảng cách giữa các lần click ở outer stream. Như vậy một request treo không làm UI mất khả năng nhận thao tác tiếp theo.
+
+```ts
+import { NEVER, Observable, of, Subject, switchMap, timeout } from 'rxjs';
+
+type LoadState =
+  | { status: 'ready'; data: string }
+  | { status: 'timeout' };
+
+function load(mode: 'slow' | 'fast'): Observable<LoadState> {
+  return mode === 'slow'
+    ? NEVER
+    : of<LoadState>({ status: 'ready', data: 'Dữ liệu mới' });
+}
+
+const refresh$ = new Subject<'slow' | 'fast'>();
+
+refresh$.pipe(
+  switchMap((mode) => load(mode).pipe(
+    timeout({
+      first: 500,
+      with: () => of<LoadState>({ status: 'timeout' }),
+    }),
+  )),
+).subscribe({
+  next: (state) => console.log(state.status),
+  error: (error: unknown) => console.error(error),
+  complete: () => console.log('complete'),
+});
+
+refresh$.next('slow'); // Khoảng 500 ms: timeout, nhưng outer vẫn được lắng nghe.
+setTimeout(() => {
+  refresh$.next('fast'); // ready
+  refresh$.complete();   // complete
+}, 800);
+```
+
+Nếu người dùng bấm lại trước 500 ms, `switchMap` hủy request cũ để chạy request mới. Cancellation không phải timeout nên factory của request cũ không chạy. `finalize` trong inner vẫn chạy ở cả trường hợp hủy lẫn timeout, thích hợp để cleanup resource của từng request.
+
+`timeout` đặt **sau** `switchMap` đo thời gian chờ output của cả pipeline, không tạo timer riêng cho từng request. Nếu timeout toàn pipeline rồi fallback bằng `of(...)`, output complete và không còn nghe click nữa. Cách ấy chỉ hợp lý khi bạn thật sự muốn kết thúc cả workflow.
+
+Ví dụ trên chỉ khôi phục timeout. Nếu cần UI tiếp tục nhận refresh sau lỗi mạng thông thường, thêm `catchError` phân loại lỗi **trong inner**; `with` không xử lý lỗi ấy.
+
+## Timeout retry và ngân sách chờ
+
+`retry` subscribe lại upstream khi có error. Vì vậy thứ tự operator quyết định mỗi attempt có một giới hạn riêng hay cả chuỗi retry cùng dùng một timer.
+
+```ts
+import { defer, NEVER, of, retry, timeout } from 'rxjs';
+
+// Mô phỏng request mới ở mỗi subscription; mọi attempt đều treo.
+const request$ = defer(() => NEVER);
+
+const perAttempt$ = request$.pipe(
+  timeout({ first: 1_000 }),
+  retry({ count: 1, delay: 200 }),
+  // Fallback chỉ sau khi đã dùng hết lượt retry.
+  timeout({ first: 1_500, with: () => of('Hết ngân sách chờ tổng') }),
+);
+
+const withoutTotalBudget$ = request$.pipe(
+  timeout({ first: 1_000 }),
+  retry({ count: 1, delay: 200 }),
+);
+
+perAttempt$.subscribe(console.log);
+// Khoảng 1.500 ms: Hết ngân sách chờ tổng; attempt thứ hai bị hủy giữa chừng.
+
+withoutTotalBudget$.subscribe({
+  error: () => console.log('Hết hai attempt'),
+});
+// Khoảng 2.200 ms: Hết hai attempt (1.000 + 200 + 1.000).
+```
+
+Timer `first` trước `retry` được tạo lại ở mỗi attempt. Timer phía sau `retry` sống trong subscription bên ngoài, nên tính cả delay giữa các attempt. `count: 1` là một lần thử lại, tức tối đa hai attempt.
+
+<Callout type="warn" title="Ngân sách tổng ở đây chỉ đúng với nguồn phát kết quả cuối">
+  `timeout({ first: ... })` phía ngoài chỉ giới hạn thời gian đến value đầu tiên của toàn chuỗi, không buộc toàn chuỗi complete trong hạn đó. Nếu source phát progress hoặc nhiều kết quả, `first` không còn là deadline toàn operation sau value đầu. Với workflow như vậy, cần thiết kế deadline riêng, không thay bằng `each` rồi coi đó là giới hạn tổng.
+</Callout>
+
+Nếu `timeout` trước `retry` có `with` trả fallback thành công, `retry` không thấy timeout error để thử lại. Khi muốn thử nguồn chính trước rồi mới dùng cache, hãy để timeout trong attempt phát lỗi, retry có giới hạn, sau đó dùng `catchError` để chọn fallback khi hết lượt.
+
+Retry cũng có thể lặp lại tác vụ ghi dữ liệu. Đừng retry thanh toán chỉ vì client hết thời gian chờ: server có thể đã xử lý xong. Cần idempotency key hoặc cơ chế tra cứu trạng thái trước khi quyết định gửi lại.
+
+## Unsubscribe có hủy request thật không
+
+Timeout luôn đóng subscription tới source tại vị trí đó, nhưng không thể tự hủy mọi tác vụ JavaScript đã bắt đầu. Cần phân biệt hủy việc **nhận kết quả** với hủy việc **thực hiện tác vụ**.
+
+| Nguồn | Khi timeout unsubscribe |
+| --- | --- |
+| `timer`, `interval` | Hủy scheduled work của subscription. |
+| Custom Observable | Chạy teardown bạn đã trả về; muốn hủy resource phải viết teardown tương ứng. |
+| `from(fetch(...))` hoặc `from(promise)` | Ngừng chuyển kết quả tới subscriber; Promise/tác vụ bên dưới không tự bị abort. |
+| Observable HTTP có teardown abort | Có thể abort request ở client, tùy implementation. |
+| Nguồn được share với consumer khác | Subscription hiện tại bị hủy; upstream có thể tiếp tục phục vụ consumer còn lại. |
+
+Với `fetch`, thường cần `AbortController` hoặc nguồn như `fromFetch` có cơ chế abort. Tuy nhiên response headers và body là hai bước khác nhau: `first` chỉ nhìn value mà nguồn phát, nên hãy xác định rõ đang đo “có response” hay “đọc xong JSON”. Xem [HTTP và ajax](/docs/tich-hop/http-ajax) để thiết kế nguồn HTTP phù hợp.
+
+Ngay cả khi client abort thành công, server không nhất thiết rollback công việc đã làm. Timeout chỉ nói “client không nhận được value đúng hạn”, không chứng minh operation thất bại ở server.
+
+## Những bẫy cần tránh
+
+| Bẫy | Vì sao sai | Cách chọn lại |
+| --- | --- | --- |
+| Dùng `delay` để giới hạn chờ | `delay` làm notification đến muộn, không phát lỗi vì nguồn chậm. | Dùng `timeout` để giới hạn chờ. |
+| Dùng `takeUntil(timer(...))` như timeout error | Nó complete output khi notifier phát, không tự báo `TimeoutError`. | Chọn chủ đích: hủy yên lặng hay báo quá hạn. |
+| Đặt `first` sau nguồn phát progress | Một event progress đáp ứng `first`, dù response cuối chưa có. | Lọc đúng event kết quả trước `timeout` nếu cần giới hạn chờ kết quả cuối. |
+| Dùng `each` làm deadline tổng | Mỗi `next` reset timer. | Chỉ dùng nó cho giới hạn khoảng im lặng. |
+| Trông chờ fallback được giám sát tiếp | Timer cũ thuộc source đã bị hủy. | Đặt timeout riêng trên fallback có thể treo. |
+| Chọn cache nhưng giấu trạng thái stale | UI dễ coi dữ liệu cũ là mới. | Phát state có `origin`, `stale` hoặc thời điểm cache. |
+| Đặt timeout trên stream click hoặc tìm kiếm outer | Khoảng nghỉ của người dùng bị coi là lỗi. | Đặt trong inner request. |
+
+<Callout type="warn" title="Timeout không ngắt được code đồng bộ đang block">
+  Timer mặc định chạy qua scheduler và event loop. Nếu một hàm đồng bộ chiếm main thread, timer không thể chen vào để dừng nó đúng hạn. Timeout không phải công cụ giới hạn CPU; cần chia nhỏ công việc hoặc chuyển sang worker khi phù hợp.
+</Callout>
+
+## Kiểm thử bằng TestScheduler
+
+Đừng dùng `setTimeout` thật để kiểm tra ranh giới 1 ms. `TestScheduler.run` cho bạn thời gian ảo; trong marble bên dưới, mỗi `-` là 1 ms. Ví dụ chạy bằng Node với TypeScript đã được biên dịch, dùng `node:assert/strict` thay cho globals của test runner.
+
+Ba tình huống cần chứng minh: source bị hủy khi quá hạn, timer được reset sau `next`, và fallback không bị cùng config timeout giám sát lại. Dấu `|` là complete; ngoặc gom các notification xảy ra cùng frame.
+
+```ts
+import { deepStrictEqual } from 'node:assert/strict';
+import { timeout } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+function scheduler() {
+  return new TestScheduler((actual, expected) => {
+    deepStrictEqual(actual, expected);
+  });
+}
+
+// 1. first: nguồn chưa phát thì hết hạn ở frame 3, fallback phát và complete.
+scheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('------a|');
+  const fallback = cold('(f|)');
+  const output = source.pipe(timeout({ first: 3, with: () => fallback }));
+
+  expectObservable(output).toBe('---(f|)');
+  expectSubscriptions(source.subscriptions).toBe('^--!');
+  expectSubscriptions(fallback.subscriptions).toBe('---(^!)');
+});
+
+// 2. each: A ở frame 2, B ở frame 4, hết hạn ở frame 7.
+scheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const source = cold('--a-b------c|');
+  const fallback = cold('(f|)');
+  const output = source.pipe(timeout({ each: 3, with: () => fallback }));
+
+  expectObservable(output).toBe('--a-b--(f|)');
+  expectSubscriptions(source.subscriptions).toBe('^------!');
+});
+
+// 3. first được đáp ứng thì không giám sát các value sau;
+// fallback chậm hơn first cũng không bị timeout lại.
+scheduler().run(({ cold, expectObservable, expectSubscriptions }) => {
+  const timely = cold('--a--------b|');
+  expectObservable(timely.pipe(timeout({ first: 3 })))
+    .toBe('--a--------b|');
+
+  const silent = cold('------------a|');
+  const fallback = cold('-----f|');
+  const output = silent.pipe(timeout({ first: 3, with: () => fallback }));
+
+  expectObservable(output).toBe('--------f|');
+  expectSubscriptions(silent.subscriptions).toBe('^--!');
+  expectSubscriptions(fallback.subscriptions).toBe('---^-----!');
+});
+```
+
+Tiếp theo, thêm test cho source complete rỗng trước hạn, source error thông thường không gọi `with`, và người dùng hủy trước hạn. Với UI tương tác, test phải xác nhận request kế tiếp vẫn chạy sau timeout của request trước, chứ không chỉ kiểm tra có value fallback.
+
+## Checklist trước khi dùng
+
+- Mình đang chờ value đầu, chờ giữa các value, hay chờ toàn operation complete?
+- Value nhìn thấy tại vị trí `timeout` là progress, response headers hay dữ liệu cuối?
+- Giới hạn chờ đã dựa trên yêu cầu UX và số đo latency thực tế chưa?
+- Fallback có hợp lệ về nghiệp vụ, có metadata stale và có thể tự treo không?
+- Lỗi không phải timeout có được chuyển lên hoặc xử lý đúng tầng không?
+- Timeout áp cho từng inner request hay chủ đích kết thúc cả workflow?
+- Retry có giới hạn số lượt, thời gian tổng và bảo vệ tác vụ ghi dữ liệu không?
+- Teardown thực sự abort resource hay chỉ ngừng nhận kết quả?
+
+## Học tiếp
+
+<Cards>
+  <Card title="catchError" href="/docs/loi-hoan-tat/catch-error" description="Phân loại lỗi và đặt ranh giới khôi phục đúng tầng." />
+  <Card title="retry và retryWhen" href="/docs/loi-hoan-tat/retry-retry-when" description="Thử lại có giới hạn trước khi dùng fallback." />
+  <Card title="finalize" href="/docs/loi-hoan-tat/finalize" description="Cleanup khi request complete, lỗi hoặc bị hủy." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Kiểm thử thời gian và subscription bằng virtual time." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS API: timeout](https://rxjs.dev/api/operators/timeout).
+- [Mã nguồn timeout của RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/timeout.ts): config, overload, chuyển nguồn và thông tin timeout.
+- [RxJS API: timeoutWith](https://rxjs.dev/api/operators/timeoutWith): hướng chuyển sang config `with` trong RxJS 7.
+- [RxJS: TestScheduler và marble testing](https://rxjs.dev/guide/testing/marble-testing).
+- [RxJS API: fromFetch](https://rxjs.dev/api/fetch/fromFetch).

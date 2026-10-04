@@ -3,8 +3,485 @@ title: Error channel
 description: Hiểu lỗi là tín hiệu kết thúc và ảnh hưởng đến pipeline.
 ---
 
-Trang này sẽ trình bày **Error channel** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Giả sử bạn có một ô tìm kiếm: request đầu tiên thất bại, UI hiện thông báo lỗi, nhưng gõ từ khóa tiếp theo lại không gửi request nào nữa. Vấn đề thường không nằm ở event listener. Lỗi đã đi ra khỏi request con và kết thúc cả subscription đang nghe từ khóa.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Bài này giúp bạn xác định **lỗi kết thúc đoạn nào của pipeline**, rồi chọn giữa dừng, thay nguồn, thử lại hoặc biểu diễn thất bại như dữ liệu. Có callback `error` chưa đủ để nguồn tiếp tục chạy.
+
+<Callout type="info" title="Phạm vi và kiến thức trước khi đọc">
+  Ví dụ dùng TypeScript và public API của **RxJS 7.x**, đối chiếu với RxJS 7.8.2. Bạn nên biết `pipe()`, `subscribe({ next, error, complete })` và [vòng đời của stream](/docs/nen-tang/vong-doi-stream). Bài chỉ giới thiệu recovery để giải thích error channel; các chính sách fallback và retry nằm ở bài riêng.
 </Callout>
+
+## Mục lục
+
+- [Error là điểm kết thúc chứ không phải dữ liệu](#error-là-điểm-kết-thúc-chứ-không-phải-dữ-liệu)
+  - [Contract áp dụng cho từng execution](#contract-áp-dụng-cho-từng-execution)
+  - [Lỗi đi downstream và đóng subscription liên quan](#lỗi-đi-downstream-và-đóng-subscription-liên-quan)
+- [Những đường đưa lỗi vào error channel](#những-đường-đưa-lỗi-vào-error-channel)
+  - [Exception trong operator](#exception-trong-operator)
+  - [Tạo nguồn lỗi bằng throwError](#tạo-nguồn-lỗi-bằng-throwerror)
+  - [Exception trong callback bất đồng bộ](#exception-trong-callback-bất-đồng-bộ)
+- [Error handler không phải recovery](#error-handler-không-phải-recovery)
+  - [try catch quanh subscribe không thay thế error handler](#try-catch-quanh-subscribe-không-thay-thế-error-handler)
+  - [Exception trong Observer nằm ngoài pipeline](#exception-trong-observer-nằm-ngoài-pipeline)
+- [catchError thay nguồn chứ không tiếp tục nguồn cũ](#catcherror-thay-nguồn-chứ-không-tiếp-tục-nguồn-cũ)
+  - [Một fallback hữu hạn](#một-fallback-hữu-hạn)
+  - [Chỉ bắt lỗi từ phía upstream](#chỉ-bắt-lỗi-từ-phía-upstream)
+- [Giữ luồng sự kiện sống khi request con lỗi](#giữ-luồng-sự-kiện-sống-khi-request-con-lỗi)
+  - [So sánh catchError bên trong và bên ngoài](#so-sánh-catcherror-bên-trong-và-bên-ngoài)
+  - [Khi nào nên kết thúc cả pipeline](#khi-nào-nên-kết-thúc-cả-pipeline)
+- [Thất bại nghiệp vụ có thể là dữ liệu](#thất-bại-nghiệp-vụ-có-thể-là-dữ-liệu)
+- [Retry và cleanup sau lỗi](#retry-và-cleanup-sau-lỗi)
+- [Checklist và bài tập](#checklist-và-bài-tập)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Error là điểm kết thúc chứ không phải dữ liệu
+
+Một Observer nhận ba loại notification: `next(value)` để nhận dữ liệu, `error(reason)` để nhận lỗi kết thúc và `complete()` để nhận tín hiệu kết thúc bình thường. “Error channel” là tên gọi đường notification `error` trong giao thức đó, không phải một Observable thứ hai luôn chạy song song với dữ liệu.
+
+### Contract áp dụng cho từng execution
+
+Contract có thể viết gọn như sau:
+
+```text
+next* (error | complete)?
+
+Dữ liệu rồi lỗi:       --a--b--X
+Dữ liệu rồi hoàn tất:  --a--b--|
+Không kết thúc:       --a--b--c--...
+
+X = error, | = complete
+```
+
+Một execution có thể gửi nhiều `next`, nhưng chỉ có tối đa một terminal notification: **hoặc `error`, hoặc `complete`**. Sau `error`, Observer không nhận thêm `next` hay `complete` từ execution đó. Không có terminal notification cũng hợp lệ, chẳng hạn một stream DOM event còn đang được lắng nghe.
+
+Quy tắc này thuộc về execution/subscription, không có nghĩa rằng mọi Observable cùng tên trong ứng dụng đều chết. Subscribe lại vào một cold Observable thường tạo execution mới; với `Subject` đã nhận `error`, subscribe mới vẫn nhận lỗi đã lưu, chứ không khởi động lại Subject.
+
+### Lỗi đi downstream và đóng subscription liên quan
+
+Trong pipeline thông thường, lỗi đi từ nơi phát sinh qua các operator phía sau đến Observer cuối, trừ khi có operator đổi hướng xử lý:
+
+```text
+source ──next──► map ──next──► filter ──next──► Observer
+                 │
+                 └──error──► filter ──error──► Observer.error
+
+Terminal error: đóng các subscription liên quan và chạy teardown.
+```
+
+`filter()` không biến error thành một giá trị để kiểm tra predicate. Lỗi đi theo error channel nên operator xử lý dữ liệu bình thường như `map()` hay `filter()` không “bỏ qua lỗi rồi lấy phần tử tiếp theo”.
+
+Khi output kết thúc do lỗi, RxJS đóng chuỗi subscription liên quan. Với higher-order operator như `mergeMap`, một inner Observable lỗi mà không được bắt có thể làm output lỗi và unsubscribe cả outer source lẫn các inner đang chạy. Đây không phải broadcast tới mọi subscription khác trong ứng dụng; nguồn được share có quy tắc vòng đời riêng.
+
+<Callout type="warn" title="Đóng subscription không tự dừng mọi side effect">
+  Notification gửi đến subscriber đã đóng sẽ không được chuyển tiếp, nhưng JavaScript producer vẫn có thể chạy code phía sau `subscriber.error()`. Timer, listener và request bên ngoài chỉ được dọn nếu nguồn có teardown phù hợp. Unsubscribe khỏi một Promise đã chạy cũng không tự hủy công việc của Promise đó.
+</Callout>
+
+## Những đường đưa lỗi vào error channel
+
+Không phải cứ có `throw` ở bất kỳ đâu là `catchError` bắt được. Bạn cần nhìn xem code đang chạy bên trong operator, trong producer hay ở boundary của consumer.
+
+### Exception trong operator
+
+RxJS chuyển exception đồng bộ từ callback của operator như `map()` sang error notification. Ví dụ này dừng ở phần tử `0`, dù source còn phần tử `5`:
+
+```ts
+import { map, of } from 'rxjs';
+
+const subscription = of(2, 0, 5)
+  .pipe(
+    map((divisor) => {
+      if (divisor === 0) {
+        throw new Error('Không thể chia cho 0');
+      }
+      return 10 / divisor;
+    }),
+  )
+  .subscribe({
+    next: (value) => console.log('next:', value),
+    error: (reason: unknown) => {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      console.log('error:', message);
+    },
+    complete: () => console.log('complete'),
+  });
+
+console.log('closed:', subscription.closed);
+```
+
+Kết quả:
+
+```text
+next: 5
+error: Không thể chia cho 0
+closed: true
+```
+
+Không có `next: 2` và không có `complete`. `of()` phát đồng bộ, nên khi `subscribe()` trả về thì subscription đã đóng. Exception trong callback đồng bộ của `tap()` cũng được chuyển sang error channel; một thao tác logging có thể làm pipeline lỗi nếu chính logger ném exception.
+
+### Tạo nguồn lỗi bằng throwError
+
+Khi một hàm cần **trả về Observable** nhưng không thể cung cấp dữ liệu, dùng `throwError(() => error)`. Factory tạo error khi có subscription, còn Observable trả về phát error ngay khi được subscribe.
+
+```ts
+import { of, throwError, type Observable } from 'rxjs';
+
+function loadLabel$(id: number): Observable<string> {
+  if (id <= 0) {
+    return throwError(() => new Error('id phải lớn hơn 0'));
+  }
+  return of(`Nhãn ${id}`);
+}
+
+loadLabel$(0).subscribe({
+  next: (label) => console.log('next:', label),
+  error: (reason: unknown) => {
+    console.log('error:', reason instanceof Error ? reason.message : String(reason));
+  },
+  complete: () => console.log('complete'),
+});
+```
+
+Kết quả chỉ có:
+
+```text
+error: id phải lớn hơn 0
+```
+
+Trong callback đồng bộ của `map()`, mình dùng `throw new Error(...)` vì RxJS đã có boundary bắt exception. Trong hàm cần giữ contract trả Observable, mình dùng `throwError()` vì caller có thể tiếp tục compose bằng `pipe()` trước khi subscribe.
+
+| Biểu thức | Điều xảy ra |
+| --- | --- |
+| `of(new Error('Lỗi'))` | Phát một đối tượng `Error` qua `next`, rồi complete; đây vẫn là dữ liệu. |
+| `throwError(() => new Error('Lỗi'))` | Trả Observable phát `error` khi subscribe. |
+| `throw new Error('Lỗi')` trong callback đồng bộ của `map` | Operator chuyển exception sang error channel. |
+| `throw new Error('Lỗi')` trước khi tạo hoặc trả Observable | Exception xảy ra trong lời gọi JavaScript; pipeline chưa tồn tại để bắt nó. |
+
+RxJS 7 không có generic riêng cho kiểu error: `Observable<T>` chỉ mô tả kiểu giá trị `next`. Dù thường gửi đối tượng `Error`, error channel vẫn có thể nhận string, object hoặc giá trị khác. Vì vậy, annotate callback là `unknown` rồi narrow trước khi đọc `message`; đừng giả định mọi lỗi đều là `Error`.
+
+### Exception trong callback bất đồng bộ
+
+RxJS bắt được exception đồng bộ khi chạy hàm khởi tạo của `new Observable(...)`. Nhưng `setTimeout` chạy callback ở một call stack khác: exception ném trong đó không tự trở thành error notification của Observable.
+
+Nếu tự viết producer, bạn phải đưa lỗi trở lại channel bằng `subscriber.error(reason)` và cung cấp teardown:
+
+```ts
+import { Observable, finalize } from 'rxjs';
+
+const parsed$ = new Observable<unknown>((subscriber) => {
+  const timerId = setTimeout(() => {
+    try {
+      const value: unknown = JSON.parse('{broken-json}');
+      subscriber.next(value);
+      subscriber.complete();
+    } catch (reason) {
+      subscriber.error(reason);
+    }
+  }, 0);
+
+  return () => {
+    clearTimeout(timerId);
+    console.log('teardown: dọn timer');
+  };
+});
+
+parsed$
+  .pipe(finalize(() => console.log('finalize: kết thúc pipeline')))
+  .subscribe({
+    next: (value) => console.log('next:', value),
+    error: (reason: unknown) => {
+      console.log('error:', reason instanceof Error ? reason.name : 'UnknownError');
+    },
+    complete: () => console.log('complete'),
+  });
+```
+
+Sau khi timer callback chạy:
+
+```text
+error: SyntaxError
+teardown: dọn timer
+finalize: kết thúc pipeline
+```
+
+Không có `complete`, nhưng cleanup vẫn chạy. Nếu đã có Promise, ưu tiên `from(promise)` hoặc `defer(() => promiseFactory())`: rejection của Promise được adapter đưa vào error channel. Ngược lại, `async` callback truyền cho `subscribe()` không được RxJS chờ hay tự xử lý rejection; callback `async` truyền cho `map()` trả về Promise như một giá trị, không tự flatten nó.
+
+## Error handler không phải recovery
+
+Callback `error` trong `subscribe()` là boundary để hiển thị lỗi, báo telemetry hoặc chuyển trách nhiệm cho ứng dụng. Giá trị callback này trả về không trở thành dữ liệu của stream. `return of(...)` ở đây cũng không khiến RxJS subscribe vào fallback.
+
+Vì vậy, error handler của ví dụ chia số không thể yêu cầu `of(2, 0, 5)` tiếp tục từ `5`. Nếu muốn recovery, đặt chính sách đó trong pipeline trước boundary `subscribe()`.
+
+### try catch quanh subscribe không thay thế error handler
+
+Với cấu hình mặc định của RxJS 7, lỗi đi tới subscription không có callback `error` sẽ được báo qua cơ chế unhandled error trên call stack khác. Điều này có thể xảy ra ngay cả khi source phát lỗi đồng bộ. `try/catch` quanh lời gọi `subscribe()` không phải cách bắt error notification đáng tin cậy.
+
+`try/catch` thông thường vẫn đúng cho exception JavaScript trước khi pipeline hình thành, hoặc bên trong callback bất đồng bộ mà bạn tự quản lý như ví dụ timer. Nhưng để xử lý lỗi của Observable, dùng `catchError()` và/hoặc `subscribe({ error })` theo đúng boundary.
+
+### Exception trong Observer nằm ngoài pipeline
+
+Một bẫy khác: bạn đặt `catchError()` trước `subscribe()`, nhưng thao tác render trong callback `next` lại ném lỗi. `catchError()` không bắt được exception đó, vì Observer là consumer cuối, không phải upstream của operator.
+
+Với cấu hình mặc định của RxJS 7, exception đồng bộ từ callback `next`, `error` hoặc `complete` của Observer được báo như unhandled error. Riêng exception trong callback `next` không tự biến thành error notification và không tự đóng nguồn; nguồn còn có thể gửi notification tiếp theo.
+
+<Callout type="warn" title="Đừng chuyển mọi lỗi render thành fallback dữ liệu">
+  Error handler của stream xử lý error notification, không phải mọi exception trong UI. Nếu phép biến đổi dữ liệu có thể thất bại, đặt nó trong operator trước boundary xử lý lỗi. Nếu chính thao tác render có thể thất bại, xử lý ở UI boundary phù hợp; một fallback HTTP không sửa được bug render.
+</Callout>
+
+## catchError thay nguồn chứ không tiếp tục nguồn cũ
+
+Đến đây bạn đã biết error đóng execution bị lỗi. Vậy làm sao output vẫn có dữ liệu sau đó? `catchError()` nhận lỗi upstream, chọn một Observable thay thế và chuyển notification của Observable mới xuống downstream.
+
+### Một fallback hữu hạn
+
+```ts
+import { catchError, map, of } from 'rxjs';
+
+of(2, 0, 5)
+  .pipe(
+    map((divisor) => {
+      if (divisor === 0) {
+        throw new Error('Không thể chia cho 0');
+      }
+      return 10 / divisor;
+    }),
+    catchError((reason: unknown) => {
+      console.log('catch:', reason instanceof Error ? reason.message : String(reason));
+      return of(-1);
+    }),
+  )
+  .subscribe({
+    next: (value) => console.log('next:', value),
+    error: () => console.log('error ở output'),
+    complete: () => console.log('complete'),
+  });
+```
+
+Kết quả:
+
+```text
+next: 5
+catch: Không thể chia cho 0
+next: -1
+complete
+```
+
+`-1` đến từ fallback, không phải từ source cũ. Phần tử `5` của source không được xử lý tiếp, nên không có `next: 2`. Callback `complete` ở output chạy vì **Observable thay thế** đã complete; execution nguồn lỗi không gửi cả error lẫn complete.
+
+Sơ đồ chuyển nguồn rất ngắn:
+
+```text
+source:    --2--0(X)     [execution nguồn kết thúc]
+output:    --5-----(-1)--|   [giá trị sau lỗi đến từ fallback]
+```
+
+Ở đây `-1` chỉ là giá trị minh họa, không phải khuyến nghị giấu lỗi trong một con số đặc biệt. Với ứng dụng thật, dùng fallback có nghĩa rõ ràng hoặc một kiểu trạng thái để UI phân biệt dữ liệu thật với thất bại.
+
+### Chỉ bắt lỗi từ phía upstream
+
+`catchError()` chỉ nhìn thấy lỗi từ đoạn trước nó, không nhìn ngược lại lỗi phát sinh phía sau:
+
+```text
+source → map A → catchError → map B → Observer
+         lỗi A: bắt được     lỗi B: không bắt được bởi catchError này
+```
+
+Observable thay thế cũng có thể lỗi. Lỗi của fallback đi tiếp xuống downstream; cùng `catchError` đó không tự bắt lại lỗi của chính fallback. Nếu cần fallback nhiều tầng, phải mô tả các tầng đó rõ ràng, nhưng mình không thêm nhiều tầng mặc định vì dễ che mất nguyên nhân gốc.
+
+| Lựa chọn khi bắt lỗi | Hành vi output |
+| --- | --- |
+| `return of(fallback)` | Phát fallback rồi complete; không tiếp tục execution cũ. |
+| `return EMPTY` | Complete ngay mà không phát thêm giá trị. |
+| `return throwError(() => reason)` | Chuyển lỗi xuống tầng sau, giữ nguyên reason. |
+| Dùng `retry(...)` | Subscribe lại upstream khi có error; đây là execution mới. |
+
+Trả `EMPTY` không phải “bỏ qua đúng phần tử lỗi” nếu bạn đặt nó cuối cả pipeline: nó kết thúc output. Muốn chỉ bỏ một operation con, bạn cần đặt boundary bên trong operation đó.
+
+## Giữ luồng sự kiện sống khi request con lỗi
+
+Ô tìm kiếm có hai vòng đời khác nhau: stream từ khóa sống theo màn hình, còn mỗi request là một operation hữu hạn. Mặc định, mình bắt lỗi request **bên trong flattening operator** nếu người dùng vẫn có thể nhập lại. Như vậy một request lỗi không trở thành terminal error của cả stream từ khóa.
+
+### So sánh catchError bên trong và bên ngoài
+
+Ví dụ sau dùng `Subject` để giả lập sự kiện và `load$()` đồng bộ để kết quả dễ kiểm tra. Nó minh họa vị trí error boundary, không mô phỏng độ trễ HTTP hay cancellation của `switchMap`.
+
+```ts
+import { Subject, catchError, of, switchMap, throwError } from 'rxjs';
+
+type SearchState =
+  | { kind: 'ok'; query: string; items: string[] }
+  | { kind: 'error'; query: string; message: string };
+
+function load$(query: string) {
+  return query === 'bad'
+    ? throwError(() => new Error('Request thất bại'))
+    : of<SearchState>({ kind: 'ok', query, items: [`Kết quả ${query}`] });
+}
+
+function errorState(query: string, reason: unknown): SearchState {
+  return {
+    kind: 'error',
+    query,
+    message: reason instanceof Error ? reason.message : String(reason),
+  };
+}
+
+function run(mode: 'inside' | 'outside'): void {
+  const query$ = new Subject<string>();
+
+  const state$ = mode === 'inside'
+    ? query$.pipe(
+        switchMap((query) =>
+          load$(query).pipe(
+            catchError((reason: unknown) => of(errorState(query, reason))),
+          ),
+        ),
+      )
+    : query$.pipe(
+        switchMap((query) => load$(query)),
+        catchError((reason: unknown) => of(errorState('toàn pipeline', reason))),
+      );
+
+  const subscription = state$.subscribe({
+    next: (state) => console.log(mode, state.kind, state.query),
+    error: () => console.log(mode, 'unhandled pipeline error'),
+    complete: () => console.log(mode, 'complete'),
+  });
+
+  query$.next('rxjs');
+  query$.next('bad');
+  query$.next('angular');
+  console.log(mode, 'closed:', subscription.closed);
+
+  // Cleanup của demo; unsubscribe không gọi complete handler.
+  subscription.unsubscribe();
+  query$.complete();
+}
+
+run('inside');
+run('outside');
+```
+
+Kết quả:
+
+```text
+inside ok rxjs
+inside error bad
+inside ok angular
+inside closed: false
+outside ok rxjs
+outside error toàn pipeline
+outside complete
+outside closed: true
+```
+
+Ở nhánh `inside`, error của request `bad` được đổi thành một `SearchState` qua `next`. Fallback complete chỉ kết thúc inner đó; `switchMap` vẫn lắng nghe `query$`, nên `angular` được xử lý.
+
+Ở nhánh `outside`, inner error truyền qua `switchMap` làm đoạn upstream của `catchError` kết thúc và unsubscribe khỏi `query$`. Fallback phát một trạng thái rồi complete output. `query$` bản thân không bị gọi `error`, nhưng subscription này không còn nghe nó, nên `angular` không tạo request mới.
+
+### Khi nào nên kết thúc cả pipeline
+
+Bắt lỗi ở inner không phải quy tắc tuyệt đối. Nếu lỗi cho biết session đã hết hạn và màn hình không thể tiếp tục hợp lệ, bạn có thể để lỗi đi ra boundary chung để điều hướng hoặc yêu cầu đăng nhập lại. Với một job chạy một lần, fallback ở cuối pipeline cũng có thể đúng vì không có nguồn sự kiện dài hạn cần giữ sống.
+
+Đặt error boundary theo **phạm vi được phép thất bại**. Lỗi cục bộ của request tìm kiếm thường không nên kết thúc màn hình; lỗi phá vỡ invariant của cả flow thì không nên bị đổi thành một kết quả rỗng để flow chạy tiếp như bình thường.
+
+## Thất bại nghiệp vụ có thể là dữ liệu
+
+Nếu “không tìm thấy sản phẩm” hoặc “dữ liệu nhập không hợp lệ” là kết quả dự kiến mà người dùng có thể sửa, bạn không nhất thiết phải dùng terminal error. Có thể biểu diễn từng kết quả bằng discriminated union và gửi qua `next`.
+
+Ví dụ dưới đây giữ một lần parse lỗi thành dữ liệu để các input phía sau vẫn được xử lý:
+
+```ts
+import { map, of } from 'rxjs';
+
+type ParseResult =
+  | { kind: 'ok'; value: unknown }
+  | { kind: 'invalid'; input: string; message: string };
+
+function parseOne(input: string): ParseResult {
+  try {
+    const value: unknown = JSON.parse(input);
+    return { kind: 'ok', value };
+  } catch (reason) {
+    return {
+      kind: 'invalid',
+      input,
+      message: reason instanceof Error ? reason.message : String(reason),
+    };
+  }
+}
+
+of('{"id":1}', '{broken-json}', '{"id":2}')
+  .pipe(map(parseOne))
+  .subscribe({
+    next: (result) => console.log('next:', result.kind),
+    error: () => console.log('error'),
+    complete: () => console.log('complete'),
+  });
+```
+
+Kết quả:
+
+```text
+next: ok
+next: invalid
+next: ok
+complete
+```
+
+Khác với `catchError` ở cuối pipeline, `parseOne()` bắt exception trước khi nó thoát khỏi phép biến đổi một phần tử. Execution chưa bị error, nên source vẫn xử lý input kế tiếp. Lỗi parse ở đây là kết quả dự kiến của bộ kiểm tra input; trong một flow yêu cầu cấu hình hợp lệ mới được chạy, bạn có thể chọn terminal error thay vì tiếp tục.
+
+Điểm đánh đổi là consumer phải xử lý nhánh `invalid`, còn `catchError` và `retry` không phản ứng với nó vì nó chỉ là dữ liệu. Đừng đổi mọi exception thành `{ kind: 'error' }` một cách máy móc: bug lập trình hoặc invariant bị phá cần được phát hiện và xử lý ở boundary phù hợp.
+
+## Retry và cleanup sau lỗi
+
+`retry()` không khôi phục một execution đã lỗi. Nó tạo subscription mới vào upstream. Với cold request Observable, đó có thể là request mới; với nguồn nóng đã terminal error như một `Subject` lỗi, subscribe lại không tạo producer khỏe mạnh.
+
+Nếu upstream đã phát giá trị trước khi lỗi, retry có thể phát lại các giá trị đó. Retry một operation có side effect ghi dữ liệu còn có thể lặp lại thao tác ghi, nên cần cân nhắc idempotency, phân loại lỗi và giới hạn số lần thử. Không dùng retry vô hạn làm mặc định.
+
+| Nhu cầu | Cơ chế phù hợp | Điều cần nhớ |
+| --- | --- | --- |
+| Thử lại lỗi tạm thời | `retry` với giới hạn và delay phù hợp | Subscribe lại; side effect có thể lặp. |
+| Chạy lại sau complete | `repeat` | Không xử lý terminal error. |
+| Có dữ liệu thay thế hợp lệ | `catchError` trả fallback | Output chuyển sang nguồn khác. |
+| Cleanup khi error, complete hoặc hủy | Teardown của producer và `finalize` ở pipeline | Không phụ thuộc riêng vào complete handler. |
+| Ghi nhận error mà không recovery | `tap({ error: ... })` hoặc error handler tại boundary | Logging không làm nguồn sống lại; tránh log trùng nhiều tầng. |
+
+Callback `complete` không chạy trên đường error nên không dùng nó làm nơi duy nhất tắt loading. Nếu loading gắn với từng request trong stream dài hạn, đặt `finalize()` trong inner request; đặt ở cuối outer stream sẽ chỉ chạy khi cả subscription dài hạn kết thúc. Tương tự, `finalize` trước `retry` gắn với từng lần thử, còn sau `retry` gắn với toàn operation có retry.
+
+## Checklist và bài tập
+
+Trước khi thêm `catchError`, hãy trả lời:
+
+- Lỗi là exception kỹ thuật khiến operation không thể tiếp tục, hay một kết quả nghiệp vụ dự kiến?
+- Lỗi phát sinh trong operator, producer async hay Observer? Boundary nào thực sự nhìn thấy nó?
+- Một request lỗi có được phép kết thúc stream sự kiện của màn hình không?
+- Fallback complete thì output nào complete: inner operation hay cả pipeline?
+- Consumer có phân biệt được fallback với dữ liệu thật không?
+- Retry có lặp side effect không, và có giới hạn số lần thử không?
+- Teardown và loading có được dọn cả khi error và unsubscribe không?
+
+Thử sửa ví dụ tìm kiếm theo ba cách rồi dự đoán log trước khi chạy:
+
+1. Đổi fallback `inside` thành `EMPTY`: không có dòng `inside error bad`, nhưng `inside ok angular` vẫn xuất hiện vì outer còn sống.
+2. Đổi fallback `outside` thành `EMPTY`: output complete sau `bad`, không phát trạng thái lỗi và vẫn không xử lý `angular`.
+3. Đổi fallback `inside` thành `throwError(() => reason)`: error đi ra output, error handler chạy và subscription đóng; `angular` không được xử lý.
+
+Sau đó áp dụng cùng câu hỏi vào một pipeline thật của bạn: khoanh phạm vi “operation con” và “vòng đời màn hình”, rồi đặt recovery ở phạm vi nhỏ nhất có thể tiếp tục hợp lệ.
+
+## Nguồn tham khảo
+
+- [RxJS 7.8.2 — Observable guide](https://github.com/ReactiveX/rxjs/blob/7.8.2/docs_app/content/guide/observable.md): contract, notification và disposal.
+- [RxJS 7.8.2 — Subscriber](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/Subscriber.ts): terminal notification, cleanup và xử lý exception ở Observer.
+- [RxJS 7.8.2 — OperatorSubscriber](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/OperatorSubscriber.ts): chuyển exception đồng bộ của callback operator xuống error channel.
+- [RxJS 7.8.2 — catchError](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/catchError.ts): thay Observable khi upstream lỗi.
+- [RxJS 7.8.2 — throwError](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/throwError.ts): tạo Observable phát error khi subscribe.
+
+## Học tiếp
+
+<Cards>
+  <Card title="catchError" href="/docs/loi-hoan-tat/catch-error" description="Chọn fallback, chuyển tiếp lỗi và đặt recovery đúng tầng." />
+  <Card title="retry và retryWhen" href="/docs/loi-hoan-tat/retry-retry-when" description="Thiết kế retry có giới hạn và tránh lặp side effect ngoài ý muốn." />
+  <Card title="finalize" href="/docs/loi-hoan-tat/finalize" description="Đặt cleanup đúng vòng đời của request và toàn pipeline." />
+  <Card title="Higher-order stream" href="/docs/higher-order-observables/higher-order-stream" description="Phân biệt outer source, inner Observable và output khi compose operation." />
+</Cards>

@@ -3,21 +3,234 @@ title: Nền tảng
 description: Xây dựng mô hình tư duy reactive và hiểu các khái niệm cốt lõi trước khi viết RxJS.
 ---
 
-Đây là trang khung cho nhóm **Nền tảng** trong lộ trình học RxJS.
+Khi một màn hình vừa nhận DOM event, vừa gọi API, vừa nghe WebSocket và còn phải hủy công việc cũ, phần khó không nằm ở từng callback. Phần khó là trả lời nhất quán: dữ liệu nào đến trước, lỗi đi đâu, khi nào luồng kết thúc và ai chịu trách nhiệm dọn tài nguyên.
+
+Nhóm **Nền tảng** giúp bạn xây mental model để trả lời những câu hỏi đó trước khi học hàng chục operator. Đây là trang định hướng: bạn sẽ chạy một pipeline nhỏ, biết cách đọc nó và chọn đúng bài chi tiết để học tiếp.
+
+<Callout type="info" title="Phạm vi phiên bản">
+  Nội dung và ví dụ trên trang này dùng public API ổn định của **RxJS 7.8.x**. Các import đều đi từ `rxjs`; trang không giả định API dự kiến của RxJS 8.
+</Callout>
 
 ## Mục lục
 
-- [Phạm vi dự kiến](#phạm-vi-dự-kiến)
-- [Các bài trong nhóm](#các-bài-trong-nhóm)
+- [Nền tảng giúp bạn làm được gì](#nền-tảng-giúp-bạn-làm-được-gì)
+- [Mental model của RxJS](#mental-model-của-rxjs)
+  - [Luồng dữ liệu đi xuôi](#luồng-dữ-liệu-đi-xuôi)
+  - [Quyền dừng đi ngược](#quyền-dừng-đi-ngược)
+- [Đọc một pipeline từ đầu đến cuối](#đọc-một-pipeline-từ-đầu-đến-cuối)
+  - [Code TypeScript](#code-typescript)
+  - [Kết quả và vòng đời](#kết-quả-và-vòng-đời)
+- [Bản đồ năm bài nền tảng](#bản-đồ-năm-bài-nền-tảng)
+- [Cách đi qua nhóm nền tảng](#cách-đi-qua-nhóm-nền-tảng)
+  - [Nếu bạn mới bắt đầu](#nếu-bạn-mới-bắt-đầu)
+  - [Nếu bạn đã từng dùng RxJS](#nếu-bạn-đã-từng-dùng-rxjs)
+- [Checklist để đọc một stream](#checklist-để-đọc-một-stream)
+- [Chọn RxJS hay công cụ đơn giản hơn](#chọn-rxjs-hay-công-cụ-đơn-giản-hơn)
+- [Những bẫy nên nhận ra sớm](#những-bẫy-nên-nhận-ra-sớm)
+- [Đi tiếp từ nền tảng](#đi-tiếp-từ-nền-tảng)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
 
-## Phạm vi dự kiến
+## Nền tảng giúp bạn làm được gì
 
-Nhóm này giải thích bối cảnh, thuật ngữ và mô hình tư duy cần có để đọc và thiết kế stream RxJS.
+Sau nhóm này, mục tiêu không phải là nhớ thật nhiều tên operator. Bạn cần nhìn một đoạn RxJS và chỉ ra được:
 
-## Các bài trong nhóm
+- **Producer** nào đang tạo dữ liệu: mảng, timer, DOM event, request hay socket.
+- `Observable` mô tả execution nào và execution đó bắt đầu lúc nào.
+- Operator đang biến đổi giá trị hay thay đổi quy tắc về thời gian, lỗi và concurrency.
+- `Observer` nhận `next`, `error`, `complete` ở đâu.
+- `Subscription` thuộc về ai và teardown chạy khi nào.
 
-- **[RxJS là gì?](/docs/nen-tang/rxjs-la-gi)** — Vai trò của RxJS và vấn đề mà thư viện giải quyết.
-- **[Reactive programming](/docs/nen-tang/reactive-programming)** — Mô hình lập trình phản ứng với dữ liệu và sự kiện theo thời gian.
-- **[Observer pattern](/docs/nen-tang/observer-pattern)** — Mối quan hệ giữa producer, Observable, Observer và Subscription.
-- **[Vòng đời của stream](/docs/nen-tang/vong-doi-stream)** — Các trạng thái next, error, complete và quy tắc kết thúc stream.
-- **[Khi nào dùng RxJS?](/docs/nen-tang/khi-nao-dung-rxjs)** — Cách nhận biết bài toán phù hợp và khi nên chọn giải pháp đơn giản hơn.
+Nếu chưa trả lời được năm câu này, thêm operator thường chỉ làm pipeline khó đoán hơn. Nếu đã trả lời được, những chủ đề như multicasting, `switchMap`, retry hay scheduler sẽ có chỗ rõ ràng trong cùng một mô hình.
+
+## Mental model của RxJS
+
+Hãy hình dung RxJS như một dây chuyền đang hoạt động, không phải một mảng nằm sẵn trong bộ nhớ. Producer đưa giá trị vào; Observable cùng các operator mô tả đường đi; Observer nhận notification; Subscription giữ quyền dừng execution.
+
+```text
+Producer          Observable và operators                 Observer
+DOM event  ───►  source$ ─► map ─► filter ────────────►  next(value)
+timer      ───►                                         error(error)
+WebSocket  ───►                                         complete()
+                       ▲                                      │
+                       └──── teardown ◄── Subscription ◄──────┘
+```
+
+Sơ đồ dùng ASCII vì project hiện chỉ đăng ký bộ MDX component mặc định và chưa cấu hình Mermaid.
+
+### Luồng dữ liệu đi xuôi
+
+Producer gửi notification theo một contract đơn giản:
+
+- `next(value)` có thể xuất hiện không lần nào, một lần hoặc nhiều lần.
+- `error(error)` kết thúc execution do lỗi.
+- `complete()` kết thúc execution bình thường.
+- `error` và `complete` loại trừ nhau; sau terminal notification sẽ không còn `next` hợp lệ.
+
+Operator nhận Observable và trả về Observable mới. Vì vậy, `pipe(...)` **xây mô tả mới chứ không sửa source tại chỗ**. Với phần lớn cold Observable, mô tả ấy còn lazy: chưa có `subscribe()`, producer chưa bắt đầu chạy.
+
+Đây cũng là điểm mà phép so sánh với mảng dừng lại. Mảng chứa các phần tử đã có; Observable có thể đại diện cho giá trị chưa xuất hiện, kéo dài vô hạn, phát đồng bộ hoặc bất đồng bộ, và cần cleanup khi consumer rời đi.
+
+### Quyền dừng đi ngược
+
+`subscribe()` nối Observer vào pipeline và trả về một `Subscription`. Khi consumer gọi `unsubscribe()`, tín hiệu dừng đi ngược qua chuỗi để source cùng các operator giải phóng timer, listener, request hoặc kết nối mà chúng sở hữu.
+
+Có ba đường kết thúc cần phân biệt:
+
+| Đường kết thúc | Ai khởi tạo | Observer có nhận `complete` không? | Teardown có chạy không? |
+| --- | --- | --- | --- |
+| `complete()` | Producer | Có | Có |
+| `error(error)` | Producer hoặc operator | Không | Có |
+| `unsubscribe()` | Consumer | Không | Có |
+
+Điểm dễ nhầm nhất là hàng cuối: unsubscribe không phải complete. Nếu cleanup phải chạy trên mọi đường kết thúc, hãy đặt nó trong teardown của source hoặc dùng `finalize`, đừng chỉ đặt trong callback `complete`.
+
+## Đọc một pipeline từ đầu đến cuối
+
+Giả sử một dashboard nhận nhiệt độ từ cảm biến. Ví dụ rút gọn dưới đây phát ba số đo ban đầu rồi giữ phiên kết nối mở cho đến khi consumer chủ động dừng. Source ngoài đời có thể là WebSocket; source đồng bộ ở đây giúp thứ tự lifecycle dễ quan sát.
+
+### Code TypeScript
+
+```ts
+import { Observable, filter, finalize, map } from 'rxjs';
+
+const temperature$ = new Observable<number>((subscriber) => {
+  console.log('[source] kết nối');
+
+  subscriber.next(28);
+  subscriber.next(31);
+  subscriber.next(35);
+
+  return () => {
+    console.log('[source] ngắt kết nối');
+  };
+});
+
+const alert$ = temperature$.pipe(
+  filter((celsius) => celsius >= 30),
+  map((celsius) => `Cảnh báo: ${celsius}°C`),
+  finalize(() => console.log('[pipeline] finalize')),
+);
+
+const subscription = alert$.subscribe({
+  next: (message) => console.log(message),
+  error: (error: unknown) => console.error('[observer] lỗi', error),
+  complete: () => console.log('[observer] complete'),
+});
+
+subscription.unsubscribe();
+console.log('closed:', subscription.closed);
+```
+
+Output:
+
+```text
+[source] kết nối
+Cảnh báo: 31°C
+Cảnh báo: 35°C
+[source] ngắt kết nối
+[pipeline] finalize
+closed: true
+```
+
+### Kết quả và vòng đời
+
+Có thể đọc ví dụ theo sáu bước:
+
+1. `new Observable(...)` tạo **mô tả** source; callback chưa chạy tại thời điểm này.
+2. `pipe(...)` tạo `alert$`, vẫn chưa kết nối producer.
+3. `subscribe(...)` bắt đầu execution nên `[source] kết nối` xuất hiện.
+4. `filter` loại `28`; `map` đổi hai số còn lại thành message trước khi Observer nhận chúng.
+5. Source không gọi `complete()`, nên phiên vẫn mở sau ba giá trị và callback `complete` không chạy.
+6. `unsubscribe()` chạy teardown của source và `finalize`; sau đó `subscription.closed` là `true`.
+
+Ví dụ này cố ý cho thấy cleanup là một phần của contract, không phải việc phụ làm sau. Trong source thực tế, hàm teardown sẽ gọi `removeEventListener`, `clearInterval`, `WebSocket.close()` hoặc `AbortController.abort()` tùy tài nguyên bên dưới.
+
+<Callout type="warn" title="Unsubscribe chỉ dọn được thứ source đã nối vào teardown">
+  Gói một `Promise` đang chạy bằng `from(promise)` không tự tạo khả năng hủy tác vụ bên dưới. Muốn hủy request thật sự, producer phải nối teardown với cơ chế cancellation như `AbortController`.
+</Callout>
+
+## Bản đồ năm bài nền tảng
+
+Mỗi bài trả lời một câu hỏi khác nhau. Đọc chúng như các lớp của cùng một mô hình, không phải năm định nghĩa rời rạc.
+
+| Bài | Câu hỏi chính | Điều cần mang sang phần sau |
+| --- | --- | --- |
+| [RxJS là gì?](/docs/nen-tang/rxjs-la-gi) | RxJS giải quyết dạng phức tạp nào trong JavaScript? | Nhận ra dữ liệu theo thời gian và vai trò của pipeline. |
+| [Reactive programming](/docs/nen-tang/reactive-programming) | Tư duy theo sự thay đổi và quan hệ dữ liệu khác code imperative ở đâu? | Mô tả *dữ liệu phụ thuộc vào gì* thay vì cập nhật từng bước rời rạc. |
+| [Observer pattern](/docs/nen-tang/observer-pattern) | Producer, Observable, Observer và Subscription phối hợp thế nào? | Biết execution bắt đầu ở đâu và consumer nhận notification ra sao. |
+| [Vòng đời của stream](/docs/nen-tang/vong-doi-stream) | `next`, `error`, `complete` và unsubscribe tuân theo quy tắc nào? | Đặt error handling và cleanup đúng đường kết thúc. |
+| [Khi nào dùng RxJS?](/docs/nen-tang/khi-nao-dung-rxjs) | Khi nào abstraction này đáng chi phí học và bảo trì? | Chọn RxJS vì bài toán stream, không chỉ vì code có async. |
+
+Trang index chỉ cung cấp bản đồ. Khi cần contract chi tiết, ví dụ edge case hoặc tiêu chí ra quyết định, hãy mở đúng bài thay vì suy ra từ đoạn overview ngắn này.
+
+## Cách đi qua nhóm nền tảng
+
+### Nếu bạn mới bắt đầu
+
+Đi theo thứ tự trong bảng. Sau mỗi bài, tự lấy một tình huống quen thuộc như ô tìm kiếm hoặc timer và gọi tên producer, Observable, Observer, Subscription. Cách này hữu ích hơn học thuộc định nghĩa vì nó buộc mental model gắn với code.
+
+Sau [Vòng đời của stream](/docs/nen-tang/vong-doi-stream), hãy quay lại ví dụ cảm biến phía trên và thử trả lời: điều gì thay đổi nếu source gọi `complete()` ngay sau `35`? Bạn nên dự đoán callback `complete`, teardown, `finalize` và trạng thái `closed` trước khi chạy code.
+
+### Nếu bạn đã từng dùng RxJS
+
+Bạn có thể đọc theo chỗ hổng thay vì theo thứ tự. Nếu hay quên unsubscribe, bắt đầu ở vòng đời stream. Nếu pipeline đầy nested subscribe hoặc Subject toàn cục, ôn lại Observer pattern và bài chọn RxJS. Nếu vẫn gọi mọi Observable là “async”, xem lại source đồng bộ trong ví dụ phía trên.
+
+Dù đi đường nào, đừng bỏ bài [Khi nào dùng RxJS?](/docs/nen-tang/khi-nao-dung-rxjs). Biết viết RxJS và biết lúc không nên viết là hai kỹ năng khác nhau.
+
+## Checklist để đọc một stream
+
+Khi gặp một pipeline chưa quen, đọc từ boundary thay vì đoán theo tên biến:
+
+1. **Source là gì?** Nó phát đồng bộ hay chờ event? Hữu hạn hay có thể sống mãi?
+2. **Khi nào source bắt đầu?** Lúc tạo Observable, lúc subscribe hay đã chạy độc lập từ trước?
+3. **Mỗi operator đổi điều gì?** Giá trị, thời gian, số lượng emission, error path hay số execution?
+4. **Có bao nhiêu subscription?** Mỗi subscription tạo producer riêng hay dùng chung producer?
+5. **Terminal signal đi đâu?** Lỗi được bắt hay làm kết thúc toàn chuỗi? Stream có tự complete không?
+6. **Ai sở hữu teardown?** Lifecycle nào gọi unsubscribe, và tài nguyên bên dưới có thật sự hủy được không?
+
+Đây là checklist nên mang sang mọi phần của tài liệu. Nó ngăn hai lỗi phổ biến: chỉ nhìn happy path của `next`, và cho rằng mọi Observable đều có cùng hành vi hot, cold, sync hoặc async.
+
+## Chọn RxJS hay công cụ đơn giản hơn
+
+Mặc định, mình chọn công cụ ít abstraction nhất nhưng vẫn diễn đạt đúng bài toán:
+
+| Tình huống | Lựa chọn mặc định | Khi RxJS bắt đầu đáng giá |
+| --- | --- | --- |
+| Một phép biến đổi đồng bộ | Function hoặc Array methods | Dữ liệu thực sự đến qua thời gian và cần ghép với stream khác. |
+| Một request, một kết quả | `Promise` với `async`/`await` | Request phụ thuộc event, cần retry, cancellation hoặc concurrency policy. |
+| Một event handler ngắn | `addEventListener` | Cần debounce, combine nhiều nguồn hoặc chia sẻ lifecycle cleanup. |
+| Nhiều request cạnh tranh | Tùy control flow hiện có | Cần nói rõ “mới nhất thắng”, xếp hàng, chạy song song hay bỏ qua. |
+| WebSocket hoặc timer dài hạn | Callback có thể đủ | Có nhiều phép biến đổi, reconnect, error recovery và teardown cần ghép lại. |
+
+RxJS không làm complexity biến mất; nó chuyển complexity về một ngôn ngữ gồm Observable, operator và lifecycle. Chỉ nên trả chi phí đó khi pipeline làm quan hệ dữ liệu theo thời gian rõ hơn phương án imperative.
+
+## Những bẫy nên nhận ra sớm
+
+- **Cho rằng Observable luôn bất đồng bộ.** `of(1, 2, 3)` có thể phát và complete ngay bên trong lời gọi `subscribe()`; scheduler và source mới quyết định timing.
+- **Subscribe nhiều lần mà không xét lại producer.** Cold Observable thường chạy lại source cho từng subscriber, có thể tạo request, timer hoặc side effect trùng lặp.
+- **Đặt `subscribe` bên trong `subscribe`.** Cách này tách error handling và teardown thành nhiều nhánh. Thường nên biểu diễn tác vụ bên trong thành Observable rồi chọn flattening operator phù hợp.
+- **Dùng `Subject` như global event bus mặc định.** Khi nhiều nơi vừa đọc vừa gọi `next`, data flow và ownership khó truy vết. Hãy ưu tiên Observable chỉ đọc ở boundary.
+- **Đồng nhất unsubscribe với complete.** Consumer hủy sẽ chạy teardown nhưng không làm callback `complete` chạy.
+- **Học operator trước lifecycle.** Biết `map` và `switchMap` chưa đủ nếu bạn không biết source bắt đầu, kết thúc và bị hủy ở đâu.
+
+Khi gặp các vấn đề này trong code thật, [Nested subscribe](/docs/troubleshooting/nested-subscribe), [Memory leak](/docs/troubleshooting/memory-leak) và [Cold và hot Observable](/docs/observable-subscription/cold-va-hot) là ba điểm tra cứu hữu ích.
+
+## Đi tiếp từ nền tảng
+
+Nếu bạn chưa từng viết pipeline, hãy bắt đầu bằng bài tổng quan rồi đi tuần tự. Nếu năm câu hỏi ở checklist đã rõ, chuyển sang nhóm **Bắt đầu** để cài đặt, đọc marble diagram và debug execution thật.
+
+<Cards>
+  <Card title="RxJS là gì?" href="/docs/nen-tang/rxjs-la-gi" description="Bắt đầu từ vấn đề RxJS giải quyết và các mảnh ghép cốt lõi." />
+  <Card title="Reactive programming" href="/docs/nen-tang/reactive-programming" description="Xây cách nhìn dữ liệu và sự kiện như những dòng thay đổi theo thời gian." />
+  <Card title="Vòng đời của stream" href="/docs/nen-tang/vong-doi-stream" description="Hiểu terminal notification, unsubscribe và teardown." />
+  <Card title="Cài đặt RxJS" href="/docs/bat-dau/cai-dat" description="Thiết lập môi trường TypeScript và chạy stream đầu tiên." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — Introduction](https://rxjs.dev/guide/overview) — tổng quan chính thức về Observable, Observer, Subscription và operators.
+- [RxJS — Observable](https://rxjs.dev/guide/observable) — execution, subscription và ví dụ Observable đồng bộ.
+- [RxJS — Subscription](https://rxjs.dev/guide/subscription) — cơ chế hủy execution và gom teardown.
+- [RxJS 7.8.2 source — `Observable`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/Observable.ts) — hành vi `subscribe` và đăng ký teardown.
+- [RxJS 7.8.2 source — `finalize`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/finalize.ts) — callback chạy khi complete, error hoặc unsubscribe.
+- [Gói `rxjs` trên npm](https://www.npmjs.com/package/rxjs) — thông tin phiên bản phát hành và package TypeScript.

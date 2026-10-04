@@ -3,8 +3,477 @@ title: retry và retryWhen
 description: Thử lại với giới hạn, delay và backoff.
 ---
 
-Trang này sẽ trình bày **retry và retryWhen** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Giả sử một request đọc danh sách sản phẩm gặp lỗi `503`. Thử lại có thể giúp người dùng không phải bấm refresh, nhưng thử liên tục khi server đang quá tải chỉ làm tình hình tệ hơn. Bạn cần biết **đang chạy lại đoạn nào**, lỗi nào đáng thử và khi nào phải dừng — không chỉ thêm `retry()` vào cuối pipeline.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Ví dụ dùng **RxJS 7.8.2**, TypeScript và import operator từ `rxjs`. Bạn nên biết `pipe`, `subscribe`, [error channel](/docs/loi-hoan-tat/error-channel) và [cold với hot Observable](/docs/observable-subscription/cold-va-hot). Mình chọn `retry({ count, delay })` cho code mới; phần `retryWhen` giúp bạn đọc và chuyển đổi code cũ.
 </Callout>
+
+## Mục lục
+
+- [retry subscribe lại chứ không tiếp tục từ lỗi](#retry-subscribe-lại-chứ-không-tiếp-tục-từ-lỗi)
+- [Giới hạn số lần thử](#giới-hạn-số-lần-thử)
+- [Cấu hình retry](#cấu-hình-retry)
+  - [Delay cố định và notifier](#delay-cố-định-và-notifier)
+  - [resetOnSuccess không chờ complete](#resetonsuccess-không-chờ-complete)
+- [Nguồn phải tạo lại được công việc](#nguồn-phải-tạo-lại-được-công-việc)
+- [Backoff có giới hạn và phân loại lỗi](#backoff-có-giới-hạn-và-phân-loại-lỗi)
+- [Đặt retry đúng phạm vi](#đặt-retry-đúng-phạm-vi)
+  - [Retry từng request trong switchMap](#retry-từng-request-trong-switchmap)
+  - [Thứ tự với catchError và finalize](#thứ-tự-với-catcherror-và-finalize)
+- [Đọc retryWhen trong code cũ](#đọc-retrywhen-trong-code-cũ)
+  - [Notifier điều khiển vòng đời](#notifier-điều-khiển-vòng-đời)
+  - [Ví dụ giới hạn và cách chuyển đổi](#ví-dụ-giới-hạn-và-cách-chuyển-đổi)
+- [Khi không nên tự động retry](#khi-không-nên-tự-động-retry)
+- [Kiểm thử bằng TestScheduler](#kiểm-thử-bằng-testscheduler)
+- [Checklist trước khi dùng](#checklist-trước-khi-dùng)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## retry subscribe lại chứ không tiếp tục từ lỗi
+
+Khi source phát `error`, subscription đó đã kết thúc. `retry` giữ lỗi chưa cho đi xuống downstream nếu còn lượt thử, rồi **subscribe lại toàn bộ đoạn upstream của nó**. Với nguồn cold, điều này thường chạy lại công việc từ đầu, kể cả request và side effect.
+
+Hình dung bạn gọi lại một cuộc điện thoại bị ngắt: đó là cuộc gọi mới, không phải nối lại đúng câu vừa mất. Nhưng khác với cuộc gọi, RxJS không xóa những value mà subscriber đã nhận ở lần trước.
+
+```text
+Lần đầu:        A ── B ── error
+                           │ retry: subscribe lại source
+Lần thứ hai:               A ── B ── C ── complete
+
+Output:         A ── B ─── A ── B ── C ── complete
+```
+
+Ví dụ sau cố tình phát một value trước khi lỗi để bạn thấy dữ liệu có thể lặp:
+
+```ts
+import { concat, defer, of, retry, throwError } from 'rxjs';
+
+let attempts = 0;
+
+const source$ = defer(() => {
+  attempts += 1;
+  return attempts === 1
+    ? concat(of('A', 'B'), throwError(() => new Error('Mất kết nối')))
+    : of('A', 'B', 'C');
+});
+
+source$.pipe(retry(1)).subscribe({
+  next: (value) => console.log(value),
+  error: (error: unknown) => console.error(error),
+  complete: () => console.log('complete'),
+});
+
+// A
+// B
+// A
+// B
+// C
+// complete
+```
+
+`retry` không rollback state đã cập nhật, không deduplicate dữ liệu, cũng không chỉ thử lại item lỗi. Nếu mỗi `next` khiến UI thêm một dòng hoặc ghi dữ liệu, bạn phải chủ động xử lý trùng lặp hoặc thu hẹp phạm vi retry.
+
+Source `complete` thì output complete luôn; muốn chạy lại sau complete là bài toán của [`repeat`](/docs/loi-hoan-tat/repeat). Unsubscribe là hủy công việc, không phải một lỗi để retry.
+
+## Giới hạn số lần thử
+
+`count` là số lần **subscribe lại**, không tính lần đầu. Vì vậy `retry(2)` và `retry({ count: 2 })` cho tối đa ba lần subscribe nếu `resetOnSuccess` giữ mặc định `false`.
+
+```ts
+import { defer, retry, throwError } from 'rxjs';
+
+let attempts = 0;
+
+const request$ = defer(() => {
+  attempts += 1;
+  console.log('attempt:', attempts);
+  return throwError(() => new Error(`Lỗi lần ${attempts}`));
+});
+
+request$.pipe(retry({ count: 2 })).subscribe({
+  error: (error: unknown) => console.log(
+    error instanceof Error ? error.message : error,
+  ),
+});
+
+// attempt: 1
+// attempt: 2
+// attempt: 3
+// Lỗi lần 3
+```
+
+Khi hết lượt, `retry` chuyển tiếp lỗi từ lần thử cuối cùng, không phát `complete`. `retry(0)` không subscribe lại. Các ví dụ đếm attempt ở đây chỉ dùng một subscriber; biến đếm ngoài `defer` là state mô phỏng, không phải bộ đếm dùng chung nên đưa vào service production.
+
+<Callout type="warn" title="Bỏ count nghĩa là không giới hạn">
+  `retry()`, `retry({})` và `retry({ delay: 1000 })` đều không giới hạn số lần retry. Nguồn lỗi đồng bộ mà không có delay có thể tạo vòng lặp rất nhanh và tràn stack. Với request ứng dụng, hãy ghi rõ cả giới hạn lẫn thời gian chờ.
+</Callout>
+
+## Cấu hình retry
+
+Trong RxJS 7.8.2, `retry` nhận một số hoặc object có các field sau. Operator giữ nguyên kiểu value của source; nó không tạo một kiểu dữ liệu fallback mới.
+
+| Field | Kiểu | Mặc định | Ý nghĩa |
+| --- | --- | --- | --- |
+| `count` | `number` | `Infinity` | Số lần retry tối đa; nên dùng số nguyên không âm. |
+| `delay` | `number` hoặc callback | Không có | Số milliseconds chờ, hoặc hàm `(error, retryCount) => ObservableInput`. Không có delay thì subscribe lại ngay. |
+| `resetOnSuccess` | `boolean` | `false` | Reset bộ đếm retry mỗi khi source phát `next`. |
+
+`retryCount` trong callback `delay` bắt đầu từ **1** cho lần retry đầu tiên. Callback chỉ chạy nếu còn lượt retry; sau khi hết `count`, lỗi đi thẳng xuống downstream. Dù signature dùng `any` cho lỗi, bạn nên nhận `error: unknown` và kiểm tra kiểu trước khi đọc thuộc tính.
+
+### Delay cố định và notifier
+
+Delay cố định thích hợp nếu bạn chỉ cần chờ ngắn giữa các lượt:
+
+```ts
+import { defer, of, retry, throwError } from 'rxjs';
+
+let attempts = 0;
+const request$ = defer(() => ++attempts < 3
+  ? throwError(() => new Error('Tạm thời chưa sẵn sàng'))
+  : of('OK'),
+);
+
+request$.pipe(
+  retry({ count: 2, delay: 500 }),
+).subscribe(console.log);
+// OK sau hai lần chờ 500 ms; thời gian thực còn phụ thuộc scheduler.
+```
+
+Với callback, Observable trả về là **notifier**, tức tín hiệu cho phép thử tiếp. `timer(ms)` phát một value sau thời gian chờ, nên kích hoạt resubscribe; nội dung value ấy không được đưa vào output của source.
+
+| Notifier từ callback `delay` | Kết quả của retry |
+| --- | --- |
+| Phát `next` | Value đầu tiên cho phép retry; subscription notifier được hủy ngay. |
+| Complete mà chưa phát value, chẳng hạn `EMPTY` | Output complete, không chuyển tiếp lỗi source. |
+| Error, chẳng hạn `throwError(() => error)` | Output error với lỗi notifier. Dùng lỗi gốc nếu muốn giữ nguyên nguyên nhân. |
+| Không phát và không kết thúc, chẳng hạn `NEVER` | Output chờ vô hạn cho tới khi bị hủy. |
+
+<Callout type="warn" title="Dừng retry không đồng nghĩa complete">
+  Muốn báo thất bại cho UI, trả `throwError(() => error)` khi quyết định không retry. Trả `EMPTY` sẽ biến thất bại thành complete, khiến `catchError` phía sau không chạy. Không dùng `NEVER` chỉ để giấu lỗi: loading có thể chờ mãi.
+</Callout>
+
+### resetOnSuccess không chờ complete
+
+Tên option dễ khiến bạn nghĩ “request thành công rồi mới reset”. Thực tế, `resetOnSuccess: true` reset bộ đếm trên **mỗi `next`**, không phải khi source complete.
+
+Một nguồn cứ phát `A` rồi error, mỗi lần subscribe lại cũng phát `A` rồi error, sẽ liên tục reset bộ đếm. Dù đặt `count: 2`, tổng số lần retry vẫn có thể không giới hạn. Callback `delay` cũng nhận lại `retryCount = 1` sau mỗi lần reset, nên backoff không tăng như bạn có thể mong đợi.
+
+Mình giữ `false` với request hữu hạn để giới hạn là giới hạn của cả operation. `true` có thể phù hợp với kết nối dài hạn khi bạn muốn đếm các lỗi liên tiếp giữa những value nhận được, nhưng đó không còn là giới hạn tổng số lần kết nối lại.
+
+## Nguồn phải tạo lại được công việc
+
+Subscribe lại chỉ có ích khi source tạo ra một attempt mới. `ajax` thường tạo request mới mỗi subscription; `defer` gọi factory mỗi lần subscribe. Ngược lại, bọc một Promise đã tạo sẵn không làm Promise đó chạy lại.
+
+```ts
+import { defer, from, retry } from 'rxjs';
+
+let calls = 0;
+async function load(): Promise<string> {
+  calls += 1;
+  if (calls < 3) throw new Error('Lỗi tạm thời');
+  return 'OK';
+}
+
+// Sai nếu mục tiêu là gọi load lại: Promise được tạo đúng một lần.
+const eagerPromise = load();
+from(eagerPromise).pipe(
+  retry({ count: 2, delay: 100 }),
+).subscribe({
+  error: () => console.log('Vẫn lỗi, calls =', calls),
+});
+// Vẫn lỗi, calls = 1
+
+// Chạy riêng phần này thay cho eagerPromise, với calls ban đầu bằng 0:
+// defer(() => load()).pipe(
+//   retry({ count: 2, delay: 100 }),
+// ).subscribe(console.log);
+// OK, calls = 3
+```
+
+`defer(() => load())` tạo Promise mới ở mỗi subscription và đưa cả lỗi throw đồng bộ của factory vào error channel. Tuy nhiên, unsubscribe khỏi Observable bọc Promise không tự hủy tác vụ Promise đã chạy; muốn hủy fetch thật sự cần cơ chế như `AbortController` cùng teardown thích hợp.
+
+Với hot source, retry chỉ tạo subscription mới, không bắt producer phát lại dữ liệu cũ. Đặc biệt một `Subject` đã error vẫn giữ trạng thái terminal; subscribe lại vào chính Subject đó nhận lỗi ngay, không “hồi sinh” nó. Cũng không nên mặc định cho rằng resubscribe qua `share` hoặc `shareReplay` chắc chắn tạo request mới: hành vi còn phụ thuộc cấu hình chia sẻ, reset và cache của source.
+
+## Backoff có giới hạn và phân loại lỗi
+
+Retry cùng một khoảng cách từ nhiều client có thể tạo các đợt request đồng loạt. Backoff tăng dần khoảng chờ; jitter thêm độ ngẫu nhiên để các client bớt cùng thử lại một lúc. Đây là chính sách thử lại, không phải đảm bảo service sẽ phục hồi.
+
+Ví dụ dưới đây dành cho **request đọc** bằng `ajax` trong trình duyệt. Các con số là cấu hình minh họa: retry ba lần, trần delay bốn giây. Mình chỉ retry các status đã chọn, thay vì coi mọi lỗi là lỗi tạm thời.
+
+```ts
+import { retry, throwError, timer } from 'rxjs';
+import { ajax, AjaxError } from 'rxjs/ajax';
+
+type Product = { id: number; name: string };
+const retryableStatuses = new Set([408, 429, 502, 503, 504]);
+const baseDelayMs = 500;
+const maxDelayMs = 4000;
+
+const products$ = ajax.getJSON<Product[]>('/api/products').pipe(
+  retry({
+    count: 3,
+    resetOnSuccess: false,
+    delay: (error: unknown, retryCount: number) => {
+      if (!(error instanceof AjaxError)
+        || !retryableStatuses.has(error.status)) {
+        return throwError(() => error);
+      }
+
+      const cap = Math.min(
+        maxDelayMs,
+        baseDelayMs * 2 ** (retryCount - 1),
+      );
+      // Equal jitter: ngẫu nhiên trong khoảng [cap / 2, cap).
+      const waitMs = Math.floor(cap / 2 + Math.random() * cap / 2);
+      console.warn('Retry GET /api/products', { retryCount, waitMs });
+      return timer(waitMs);
+    },
+  }),
+);
+
+products$.subscribe({
+  next: (products) => console.log(products),
+  error: (error: unknown) => console.error('Không tải được sản phẩm', error),
+});
+```
+
+Nếu không có jitter, công thức cho ba lần chờ là `500`, `1000`, `2000` ms. Với jitter ở trên, các khoảng chờ lần lượt nằm trong `[250, 500)`, `[500, 1000)`, `[1000, 2000)` ms. Delay chỉ tính từ lúc attempt trước phát lỗi, không tính thời gian request chạy.
+
+Không retry `400`, `401`, `403`, `404` theo mặc định: thử lại cùng request thường không sửa được input, credentials hay quyền truy cập. Lỗi `500` có đáng retry không phụ thuộc API; lỗi lập trình có thể lặp lại ở mọi attempt. Status `0` của `AjaxError` cũng không đủ để khẳng định lỗi mạng tạm thời vì có thể liên quan CORS hoặc cấu hình khác.
+
+Với `429` hoặc `503`, nếu API có `Retry-After`, policy thực tế nên đọc và tôn trọng header thay vì chỉ dùng công thức local. Header có thể là số giây hoặc HTTP date; cần parse, kiểm tra hợp lệ và cân nhắc thời gian chờ với deadline của operation. Nếu không thể chờ đủ, báo thất bại hoặc để người dùng thử lại sau, đừng retry sớm hơn chỉ vì trần delay local thấp. Ví dụ này chưa xử lý header đó; khi cross-origin, server cũng phải expose header để client đọc được.
+
+<Callout type="info" title="count không phải deadline">
+  Giới hạn ba lần retry không đảm bảo operation kết thúc trong một thời gian cụ thể: một request có thể không phản hồi. Nếu cần, đặt timeout cho từng attempt trước `retry` và thiết kế deadline cho toàn operation ở ngoài vòng retry. Policy cũng phải quyết định timeout có đáng thử lại không; ví dụ `AjaxError` ở trên không tự xử lý `TimeoutError` của operator `timeout`.
+</Callout>
+
+## Đặt retry đúng phạm vi
+
+Một lỗi chỉ nên chạy lại phần công việc mà bạn có thể lặp an toàn. Đặt `retry` sau cả workflow sẽ chạy lại các bước upstream đã hoàn thành, chứ không chỉ bước vừa lỗi.
+
+### Retry từng request trong switchMap
+
+Với tìm kiếm hoặc đổi lựa chọn, mình đặt retry **bên trong inner stream**. Value mới từ outer sẽ hủy request cũ và cả timer đang chờ retry của nó.
+
+```ts
+import {
+  catchError, defer, of, retry, Subject, switchMap, throwError,
+} from 'rxjs';
+
+const queries$ = new Subject<string>();
+
+function search(query: string) {
+  return defer(() => {
+    console.log('request:', query);
+    return query === 'fail'
+      ? throwError(() => new Error('Mô phỏng lỗi tạm thời'))
+      : of([`Kết quả cho ${query}`]);
+  });
+}
+
+queries$.pipe(
+  switchMap((query) => search(query).pipe(
+    retry({ count: 2, delay: 500 }),
+    catchError(() => of([`Không tải được: ${query}`])),
+  )),
+).subscribe(console.log);
+
+queries$.next('fail'); // request: fail, bắt đầu chờ retry
+queries$.next('rxjs'); // Hủy timer cũ; request: rxjs
+queries$.complete();
+// ['Kết quả cho rxjs']
+// Không có attempt thứ hai cho fail, không phát fallback cho fail.
+```
+
+Đây là mô phỏng vòng đời; request thực cần phân loại lỗi như phần backoff. Hủy inner không phát error nên không kích hoạt `catchError`. Với nguồn hỗ trợ teardown, tài nguyên request được dọn; với Promise không hủy được, kết quả cũ không đi xuống subscriber nhưng tác vụ nền có thể vẫn chạy.
+
+Nếu đặt `retry` ngoài `switchMap`, một lỗi inner sẽ khiến toàn chuỗi resubscribe vào outer. Với outer cold, thao tác cũ có thể chạy lại; với outer `Subject`, query vừa phát không được replay, nên UI có thể chờ sự kiện mới thay vì thử lại request vừa lỗi.
+
+### Thứ tự với catchError và finalize
+
+Với một request, thứ tự thường là:
+
+```text
+request → finalize từng attempt → retry → catchError → finalize toàn operation
+```
+
+Đặt `retry` trước `catchError` để hết lượt mới fallback. Nếu `catchError` trước đó đã đổi lỗi thành `of(...)` hoặc `EMPTY`, `retry` không thấy error nữa. Trường hợp handler trước đó rethrow thì lỗi vẫn có thể tới `retry`.
+
+`finalize` trước `retry` chạy khi mỗi attempt kết thúc; `finalize` sau `retry` thuộc subscription bao ngoài, chạy một lần khi operation complete, error hoặc bị hủy. Nếu cần giữ loading trong cả giai đoạn backoff, đừng tắt loading ở `finalize` từng attempt. Trong UI tương tác, hãy đặt phần loading/finalize của operation bên trong inner stream, không ở ngoài toàn stream sự kiện.
+
+Lỗi do `map` hay `tap` đặt **trước** `retry` cũng có thể làm chạy lại request dù request đã thành công. Lỗi do operator đặt **sau** `retry` không được nó xử lý. Vì vậy hãy đặt ranh giới retry sát nguồn request nếu chỉ lỗi request mới đáng thử lại.
+
+## Đọc retryWhen trong code cũ
+
+<Callout type="warn" title="retryWhen đã deprecated">
+  Trong mã nguồn RxJS **7.8.2**, `retryWhen` được đánh dấu deprecated với hướng dẫn dùng option `delay` của `retry`. Trang này vẫn giải thích nó để bạn bảo trì code cũ; không cần chọn API deprecated chỉ để có delay hoặc backoff. Mốc loại bỏ còn phụ thuộc phiên bản RxJS, không phải hành vi của ví dụ đang dùng.
+</Callout>
+
+### Notifier điều khiển vòng đời
+
+`retryWhen((errors$) => notifier$)` nhận một stream mà mỗi lỗi source được phát thành **next value** trên `errors$`. Đây không phải thông báo error của chính `errors$`. Hàm notifier được gọi khi lỗi đầu tiên xuất hiện, và subscription notifier được giữ cho vòng retry đó, không gọi lại factory notifier riêng cho mỗi lỗi.
+
+```text
+source error ──► errors$.next(error) ──► notifier xử lý lỗi
+                                             │
+                              notifier.next  ─┴─► subscribe lại source
+```
+
+- Notifier phát `next`: kích hoạt subscribe lại source; value chỉ là tín hiệu.
+- Notifier complete: output complete, kể cả đang có attempt chạy.
+- Notifier error: output error với lỗi notifier.
+- Notifier im lặng: không có tín hiệu retry; nếu source đã lỗi thì output chờ.
+
+Điểm khác với callback `delay` của `retry` là `retryWhen` dùng notifier lâu dài. Với `retry({ delay })`, callback tạo notifier cho từng lượt và chỉ value đầu tiên của lượt đó được dùng.
+
+### Ví dụ giới hạn và cách chuyển đổi
+
+Trong code cũ, thường dùng số thứ tự của lỗi trong `mergeMap` để tự giới hạn. Ví dụ này luôn lỗi và cho hai lần retry, sau đó chuyển tiếp lỗi cuối.
+
+```ts
+import { defer, mergeMap, retryWhen, throwError, timer } from 'rxjs';
+
+let attempts = 0;
+const request$ = defer(() => {
+  attempts += 1;
+  console.log('attempt:', attempts);
+  return throwError(() => new Error(`Lỗi lần ${attempts}`));
+});
+
+request$.pipe(
+  retryWhen((errors$) => errors$.pipe(
+    mergeMap((error: unknown, index: number) => {
+      const retryNumber = index + 1;
+      return retryNumber <= 2
+        ? timer(retryNumber * 500)
+        : throwError(() => error);
+    }),
+  )),
+).subscribe({
+  error: (error: unknown) => console.error(error),
+});
+// attempt: 1; chờ 500 ms
+// attempt: 2; chờ 1000 ms
+// attempt: 3; error: Lỗi lần 3
+```
+
+Policy tương đương cho code mới là đoạn sau. Dùng nó **thay cho** pipeline `retryWhen` trên, không subscribe cả hai pipeline để so sánh trên cùng biến đếm mô phỏng.
+
+```ts
+import { retry, timer } from 'rxjs';
+
+// request$ là nguồn đã khai báo ở ví dụ trên.
+request$.pipe(
+  retry({
+    count: 2,
+    delay: (_error: unknown, retryCount: number) => timer(retryCount * 500),
+  }),
+).subscribe({
+  error: (error: unknown) => console.error(error),
+});
+```
+
+<Callout type="warn" title="take không phải cách báo hết lượt">
+  `retryWhen(errors$ => errors$.pipe(take(2)))` khiến notifier complete khi đủ hai value. Nó kết thúc output thay vì phát lỗi cuối, và tín hiệu complete có thể hủy attempt vừa được bắt đầu bởi value cuối. Dùng nhánh `throwError` rõ ràng nếu hết lượt phải báo thất bại.
+</Callout>
+
+Không nên chuyển đổi máy móc một notifier dùng chung có logic nút bấm, reset state hoặc complete bên ngoài. Callback `delay` tạo subscription notifier mới cho mỗi lỗi, nên hãy kiểm thử vòng đời, đặc biệt khi tín hiệu là hot Observable hoặc có thể phát nhiều value.
+
+## Khi không nên tự động retry
+
+Với request ghi dữ liệu, client không nhận được response **không chứng minh server chưa xử lý**. Một request tạo đơn hàng có thể đã ghi thành công nhưng response bị mất; gửi lại có thể tạo đơn hàng thứ hai. Chỉ retry khi operation có tính idempotent theo hợp đồng API, hoặc có idempotency key được server dùng để deduplicate. Khi retry cùng một operation, giữ nguyên key đó giữa các attempt.
+
+Cũng không tự retry lỗi validation, lỗi quyền truy cập hay exception do code biến đổi dữ liệu. Làm mới token là một flow có kiểm soát riêng, không phải lặp vô hạn request `401`. Với stream dài hạn, chính sách reconnect còn cần biết resume offset, replay và deduplication; `retry` một mình không bảo đảm nhận đủ hoặc đúng một lần dữ liệu.
+
+Cuối cùng, kiểm tra các tầng đã có retry hay chưa. Nếu client ngoài cho ba attempt và service bên trong cũng cho ba attempt, một operation có thể tạo tới chín request. Chọn tầng sở hữu chính sách thay vì thêm retry ở mọi lớp, và log attempt riêng với lỗi cuối để quan sát đúng mức độ thất bại.
+
+## Kiểm thử bằng TestScheduler
+
+Test nên xác nhận cả output **và số subscription**, vì chỉ thấy dữ liệu cuối chưa chứng minh request không chạy thừa. Các test dưới dùng runner đã có globals `it` và `expect` kiểu Jest/Vitest cùng RxJS; không cần thêm test infrastructure vào site docs.
+
+Trong `TestScheduler.run`, mỗi `-` là một frame 1 ms, `#` là error, `|` là complete; `^` và `!` đánh dấu subscribe/unsubscribe. Delay dưới đây là 2 ms để sơ đồ ngắn, không phải cấu hình request thực.
+
+```ts
+import { EMPTY, retry } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+it('retry hai lần, giữ value lặp và chuyển tiếp lỗi cuối', () => {
+  const scheduler = new TestScheduler((actual, expected) => {
+    expect(actual).toEqual(expected);
+  });
+
+  scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+    const error = new Error('fail');
+    const source = cold('-a-#', { a: 'A' }, error);
+    const output = source.pipe(retry({ count: 2, delay: 2 }));
+
+    expectObservable(output).toBe('-a----a----a-#', { a: 'A' }, error);
+    expectSubscriptions(source.subscriptions).toBe([
+      '^--!',
+      '-----^--!',
+      '----------^--!',
+    ]);
+  });
+});
+
+it('hủy trong thời gian chờ thì không subscribe lại', () => {
+  const scheduler = new TestScheduler((actual, expected) => {
+    expect(actual).toEqual(expected);
+  });
+
+  scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+    const source = cold('-#');
+    const output = source.pipe(retry({ count: 2, delay: 10 }));
+
+    expectObservable(output, '-----!').toBe('-----');
+    expectSubscriptions(source.subscriptions).toBe('^!');
+  });
+});
+
+it('notifier complete không phát value sẽ complete output', () => {
+  const scheduler = new TestScheduler((actual, expected) => {
+    expect(actual).toEqual(expected);
+  });
+
+  scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+    const source = cold('-#');
+    const output = source.pipe(retry({ count: 2, delay: () => EMPTY }));
+
+    expectObservable(output).toBe('-|');
+    expectSubscriptions(source.subscriptions).toBe('^!');
+  });
+});
+```
+
+Test đầu có lỗi ở frame 3, chờ hai frame rồi subscribe lại ở frame 5; lần cuối subscribe ở frame 10 và error ở frame 13. Test thứ hai chứng minh cancellation dọn timer, không tạo attempt mới. Nếu policy dùng jitter, nên tách hàm tính delay và truyền random có thể kiểm soát vào test, thay vì assert thời gian ngẫu nhiên.
+
+Với policy ứng dụng, bổ sung case lỗi không retryable chỉ tạo một attempt, source thành công không bị retry, notifier error giữ đúng lỗi, và `resetOnSuccess: true` có hành vi đúng trên nguồn nhiều value. Với thao tác ghi, test idempotency ở tầng tích hợp, không chỉ bằng marble.
+
+## Checklist trước khi dùng
+
+- Source có tạo công việc mới mỗi subscription không, hay chỉ bọc Promise/Subject cũ?
+- `count` tính retry hay tổng attempt? Có bật `resetOnSuccess` làm mất giới hạn tổng không?
+- Lỗi này có khả năng tạm thời, và chạy lại operation có an toàn về nghiệp vụ không?
+- Đã có delay, trần backoff, jitter và xử lý `Retry-After` khi API yêu cầu chưa?
+- Có timeout từng attempt và deadline cho toàn operation nếu cần không?
+- `retry` nằm ở đúng request/inner stream, trước fallback và tránh lặp side effect không liên quan chưa?
+- Unsubscribe có hủy timer và tài nguyên source không? Loading tồn tại qua backoff và tắt khi hủy chưa?
+- Tầng khác đã retry chưa? Test có đếm subscription và xác nhận lỗi cuối không bị biến thành complete ngoài ý muốn không?
+
+## Học tiếp
+
+<Cards>
+  <Card title="catchError" href="/docs/loi-hoan-tat/catch-error" description="Chọn fallback hoặc chuyển tiếp lỗi sau khi hết lượt retry." />
+  <Card title="finalize" href="/docs/loi-hoan-tat/finalize" description="Dọn tài nguyên đúng vòng đời của attempt và operation." />
+  <Card title="repeat" href="/docs/loi-hoan-tat/repeat" description="Phân biệt chạy lại sau complete với thử lại sau error." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Kiểm tra thời gian, subscription và cancellation bằng thời gian ảo." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS API: retry](https://rxjs.dev/api/operators/retry).
+- [Mã nguồn retry của RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/retry.ts): `RetryConfig`, notifier và cách reset bộ đếm trên `next`.
+- [Mã nguồn retryWhen của RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/retryWhen.ts): lifecycle notifier và ghi chú deprecated.
+- [RxJS API: defer](https://rxjs.dev/api/index/function/defer).
+- [RxJS: Marble testing](https://rxjs.dev/guide/testing/marble-testing).

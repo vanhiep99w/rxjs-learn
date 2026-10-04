@@ -3,8 +3,447 @@ title: catchError
 description: Khôi phục, thay thế hoặc chuyển tiếp lỗi đúng tầng.
 ---
 
-Trang này sẽ trình bày **catchError** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Bạn có một ô tìm kiếm gọi API mỗi khi người dùng nhập từ khóa. Một request lỗi thì hiện thông báo là đủ; nhưng nếu đặt `catchError` sai chỗ, cả stream tìm kiếm có thể kết thúc và những lần nhập sau không còn gọi API. Bài này giúp bạn chọn cách xử lý lỗi và, quan trọng hơn, chọn đúng phạm vi cần khôi phục.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi bài viết">
+  Ví dụ dùng **RxJS 7.8.2**, TypeScript và import operator từ `rxjs`. Bạn nên biết `pipe`, `subscribe` và [outer stream, inner stream](/docs/higher-order-observables/higher-order-stream). Các ví dụ không cần backend; ví dụ tương tác dùng `Subject` để mô phỏng thao tác người dùng.
 </Callout>
+
+## Mục lục
+
+- [catchError thay thế stream đã lỗi](#catcherror-thay-thế-stream-đã-lỗi)
+- [Cú pháp và giá trị trả về](#cú-pháp-và-giá-trị-trả-về)
+- [Chọn chiến lược xử lý lỗi](#chọn-chiến-lược-xử-lý-lỗi)
+  - [Phát fallback bằng of](#phát-fallback-bằng-of)
+  - [Kết thúc nhánh bằng EMPTY](#kết-thúc-nhánh-bằng-empty)
+  - [Chuyển tiếp lỗi bằng throwError](#chuyển-tiếp-lỗi-bằng-throwerror)
+- [Đặt catchError bên trong hay bên ngoài](#đặt-catcherror-bên-trong-hay-bên-ngoài)
+  - [Bắt lỗi từng request bên trong switchMap](#bắt-lỗi-từng-request-bên-trong-switchmap)
+  - [Bắt lỗi toàn pipeline bên ngoài switchMap](#bắt-lỗi-toàn-pipeline-bên-ngoài-switchmap)
+- [Phạm vi bắt lỗi và lỗi của fallback](#phạm-vi-bắt-lỗi-và-lỗi-của-fallback)
+- [Phối hợp với retry và finalize](#phối-hợp-với-retry-và-finalize)
+- [Những lỗi dễ mắc](#những-lỗi-dễ-mắc)
+- [Kiểm thử bằng TestScheduler](#kiểm-thử-bằng-testscheduler)
+- [Checklist trước khi dùng](#checklist-trước-khi-dùng)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## catchError thay thế stream đã lỗi
+
+Một Observable đã phát `error` thì không phát thêm `next` hay `complete` cho subscription đó. `catchError` không làm nguồn ấy sống lại: nó nhận lỗi, chọn một Observable thay thế rồi subscribe vào Observable mới để tiếp tục output.
+
+Hình dung một chuyến giao hàng bị hủy và bạn đặt chuyến khác. Người nhận có thể vẫn nhận được hàng, nhưng chuyến cũ không tiếp tục chạy. Điểm khác với ví dụ đời thường là fallback trong RxJS không nhất thiết có dữ liệu: nó có thể complete ngay, phát lỗi mới hoặc không kết thúc.
+
+```text
+source       ── A ── B ── error
+                            │
+                            ▼
+                       catchError
+                            │ subscribe fallback
+                            ▼
+fallback                    F ── complete
+
+output       ── A ── B ── F ── complete
+```
+
+Các value đã phát trước lỗi được giữ nguyên; không có rollback. Output complete hay error tiếp theo phụ thuộc fallback, không phụ thuộc kết thúc lỗi của source cũ nữa.
+
+```ts
+import { catchError, map, of } from 'rxjs';
+
+of(1, 2, 3, 4).pipe(
+  map((value) => {
+    if (value === 3) {
+      throw new Error('Không xử lý được số 3');
+    }
+    return value * 10;
+  }),
+  catchError(() => of(-1)),
+).subscribe({
+  next: (value) => console.log('next:', value),
+  error: (error: unknown) => console.log('error:', error),
+  complete: () => console.log('complete'),
+});
+
+// next: 10
+// next: 20
+// next: -1
+// complete
+```
+
+Không có `40`: subscription tới nguồn đã kết thúc tại lỗi khi xử lý `3`. Nếu yêu cầu là bỏ riêng item lỗi rồi xử lý `4`, bạn cần đặt ranh giới xử lý lỗi ở từng item, chẳng hạn một inner Observable trong `concatMap` hoặc `mergeMap`, thay vì bắt lỗi toàn bộ chuỗi `map`.
+
+## Cú pháp và giá trị trả về
+
+Signature của RxJS 7.8.2:
+
+```ts
+function catchError<T, O extends ObservableInput<any>>(
+  selector: (err: any, caught: Observable<T>) => O,
+): OperatorFunction<T, T | ObservedValueOf<O>>;
+```
+
+| Thành phần | Ý nghĩa |
+| --- | --- |
+| `err` | Lỗi upstream; có thể là `Error`, chuỗi, object hoặc bất kỳ giá trị nào được phát qua error channel. |
+| `caught` | Observable của đoạn upstream được bọc lại bằng chính `catchError` này; trả nó về sẽ subscribe lại đoạn đó. |
+| `selector` | Chạy khi upstream error, không chạy khi upstream complete hoặc bị unsubscribe. |
+| Giá trị trả về | Một `ObservableInput`, thường là Observable tạo bằng `of`, `EMPTY`, `throwError` hoặc một nguồn fallback khác. |
+| Kiểu output | Hợp của kiểu dữ liệu nguồn và kiểu dữ liệu fallback. |
+
+Dù signature dùng `any` cho lỗi, mình khuyên khai báo `(error: unknown)` trong code ứng dụng rồi kiểm tra kiểu trước khi đọc `message` hoặc các thuộc tính khác.
+
+Mặc định hãy trả về Observable rõ ràng. RxJS cũng nhận Promise và array, nhưng `return []` có nghĩa là chuyển array rỗng thành một nguồn **không phát value nào**, chứ không phát một danh sách rỗng. Muốn UI nhận danh sách rỗng, dùng `of([])` với kiểu phần tử phù hợp.
+
+## Chọn chiến lược xử lý lỗi
+
+Bạn cần quyết định lỗi này có thể chuyển thành dữ liệu hợp lệ hay phải tiếp tục đi lên tầng khác. Mình chỉ dùng fallback khi tầng hiện tại hiểu ý nghĩa nghiệp vụ của nó; không mặc định biến mọi lỗi thành dữ liệu rỗng.
+
+| Lựa chọn | Output sau lỗi | Phù hợp khi |
+| --- | --- | --- |
+| `of(fallback)` | Phát fallback rồi complete. | Có dữ liệu dự phòng hoặc trạng thái lỗi mà UI có thể hiển thị. |
+| `EMPTY` | Complete ngay, không phát thêm value. | Bỏ kết quả của nhánh lỗi là chủ đích. |
+| `throwError(() => error)` | Error; không phát fallback. | Tầng trên cần biết lỗi hoặc quyết định khôi phục. |
+| Observable fallback khác | Theo vòng đời của nguồn thay thế. | Chuyển sang cache hoặc một nguồn dữ liệu khác. |
+| `NEVER` | Không phát, không complete, không error. | Hiếm khi cần giữ nhánh mở vô hạn; không phải cách xử lý lỗi mặc định. |
+
+### Phát fallback bằng of
+
+Với màn hình cần phân biệt “không có kết quả” và “request thất bại”, nên phát một state có discriminator thay vì dùng cùng một array rỗng cho cả hai trường hợp.
+
+```ts
+import { catchError, map, Observable, of, throwError } from 'rxjs';
+
+type Product = { id: number; name: string };
+type ProductState =
+  | { status: 'success'; products: Product[] }
+  | { status: 'error'; message: string };
+
+const products$: Observable<Product[]> = throwError(
+  () => new Error('API tạm thời không phản hồi'),
+);
+
+const state$: Observable<ProductState> = products$.pipe(
+  map((products): ProductState => ({ status: 'success', products })),
+  catchError((error: unknown) => of<ProductState>({
+    status: 'error',
+    message: error instanceof Error ? error.message : 'Lỗi không xác định',
+  })),
+);
+
+state$.subscribe((state) => console.log(state));
+// { status: 'error', message: 'API tạm thời không phản hồi' }
+```
+
+Ví dụ này chỉ mô phỏng một request. Trong ứng dụng, `products$` có thể đến từ `ajax` hoặc service của bạn. Nếu có cache, bạn có thể trả về Observable đọc cache thay cho `of`; khi ấy nên gắn metadata để UI biết đó là dữ liệu cũ.
+
+### Kết thúc nhánh bằng EMPTY
+
+`EMPTY` phù hợp khi không cần tạo một value thay thế. Ví dụ một thao tác làm mới tùy chọn thất bại thì bỏ kết quả của thao tác đó, giữ nguyên dữ liệu đang hiển thị.
+
+```ts
+import { catchError, EMPTY, throwError } from 'rxjs';
+
+throwError(() => new Error('Làm mới thất bại')).pipe(
+  catchError((error: unknown) => {
+    console.warn('Bỏ kết quả refresh:', error);
+    return EMPTY;
+  }),
+).subscribe({
+  next: () => console.log('Không chạy'),
+  error: () => console.log('Không chạy'),
+  complete: () => console.log('complete'),
+});
+// Log cảnh báo, sau đó: complete
+```
+
+<Callout type="warn" title="EMPTY không có nghĩa là tiếp tục source">
+  `EMPTY` chỉ complete phần stream được thay thế. Nếu `catchError` nằm ở cuối pipeline tương tác, cả output complete và không còn nhận sự kiện mới. Đặt nó trong từng inner stream mới giới hạn lỗi ở từng thao tác.
+</Callout>
+
+### Chuyển tiếp lỗi bằng throwError
+
+Tầng truy cập dữ liệu có thể bổ sung ngữ cảnh nhưng vẫn để tầng UI quyết định cách hiển thị. Giữ lỗi gốc giúp việc debug không mất thông tin chỉ vì bạn đổi thông báo.
+
+```ts
+import { catchError, throwError } from 'rxjs';
+
+class LoadProductsError extends Error {
+  constructor(readonly original: unknown) {
+    super('Không tải được danh sách sản phẩm');
+    this.name = 'LoadProductsError';
+  }
+}
+
+throwError(() => new Error('HTTP 503')).pipe(
+  catchError((error: unknown) =>
+    throwError(() => new LoadProductsError(error)),
+  ),
+).subscribe({
+  error: (error: unknown) => {
+    if (error instanceof LoadProductsError) {
+      console.error(error.message, error.original);
+    }
+  },
+});
+```
+
+Nếu không cần đổi loại lỗi, `return throwError(() => error)` là đủ. `throw error` ngay trong selector cũng phát lỗi xuống downstream, nhưng mình chọn `throwError` để mọi nhánh trả về đều thể hiện rõ một Observable.
+
+## Đặt catchError bên trong hay bên ngoài
+
+Với higher-order operator, có hai ranh giới khác nhau: outer stream phát thao tác, inner stream xử lý một thao tác. Bạn cần hỏi “mình muốn kết thúc request này hay kết thúc cả luồng thao tác?” trước khi chọn vị trí.
+
+### Bắt lỗi từng request bên trong switchMap
+
+Đây thường là lựa chọn cho tìm kiếm, click làm mới hay chọn ID: request lỗi được đổi thành state lỗi, outer stream vẫn có thể nhận thao tác tiếp theo.
+
+```ts
+import {
+  catchError, map, Observable, of, Subject, switchMap, throwError,
+} from 'rxjs';
+
+type SearchState =
+  | { status: 'success'; query: string; items: string[] }
+  | { status: 'error'; query: string; message: string };
+
+function search(query: string): Observable<string[]> {
+  return query === 'fail'
+    ? throwError(() => new Error('Request thất bại'))
+    : of([`Kết quả cho ${query}`]);
+}
+
+const queries$ = new Subject<string>();
+
+queries$.pipe(
+  switchMap((query) => search(query).pipe(
+    map((items): SearchState => ({ status: 'success', query, items })),
+    catchError((error: unknown) => of<SearchState>({
+      status: 'error',
+      query,
+      message: error instanceof Error ? error.message : 'Lỗi không xác định',
+    })),
+  )),
+).subscribe({
+  next: (state) => console.log(state.status, state.query),
+  complete: () => console.log('complete'),
+});
+
+queries$.next('rxjs'); // success rxjs
+queries$.next('fail'); // error fail (một next chứa state lỗi)
+queries$.next('mdx');  // success mdx
+queries$.complete();   // complete
+```
+
+State `{ status: 'error' }` vẫn là một value trên **next channel**, không phải thông báo `error` của Observable. Vì inner được khôi phục, `switchMap` không thấy lỗi ấy và outer subscription tiếp tục sống.
+
+Một giới hạn cần nhớ: inner `catchError` không bắt lỗi do chính outer source phát ra, cũng không bắt lỗi đồng bộ khi gọi `search(query)` trước khi hàm này trả về Observable. Nếu service có thể throw lúc tạo request, dùng `defer(() => search(query)).pipe(catchError(...))` bên trong `switchMap` để đưa lỗi ấy vào error channel của inner.
+
+### Bắt lỗi toàn pipeline bên ngoài switchMap
+
+Cùng kiểu tương tác, nhưng đặt handler ở ngoài sẽ thay thế toàn bộ kết quả của `switchMap` khi request đầu tiên lỗi.
+
+```ts
+import { catchError, of, Subject, switchMap, throwError } from 'rxjs';
+
+const queries$ = new Subject<string>();
+
+queries$.pipe(
+  switchMap((query) => query === 'fail'
+    ? throwError(() => new Error('Request thất bại'))
+    : of(`Kết quả cho ${query}`),
+  ),
+  catchError(() => of('Không tải được dữ liệu')),
+).subscribe({
+  next: (value) => console.log(value),
+  complete: () => console.log('complete'),
+});
+
+queries$.next('rxjs'); // Kết quả cho rxjs
+queries$.next('fail'); // Không tải được dữ liệu, rồi complete
+queries$.next('mdx');  // Không có output, pipeline đã unsubscribe khỏi queries$
+queries$.complete();
+```
+
+Bản thân `queries$` chưa bị complete tại lỗi; subscription của pipeline tới nó đã bị hủy. Với `mergeMap`, một lỗi inner không được xử lý sẽ làm output error và hủy cả những inner đang chạy khác, nên bắt lỗi trong từng inner càng quan trọng nếu các công việc độc lập.
+
+```text
+Bắt trong inner:
+outer ── thao tác A ── thao tác B ── thao tác C ── ...
+             │             │             │
+         thành công     fallback     thành công
+
+Bắt ngoài:
+outer ── thao tác A ── thao tác B
+             │             │
+         thành công       error ──► fallback ──► complete
+                                   (ngừng nghe outer)
+```
+
+Mình dùng handler ngoài khi muốn kết thúc toàn luồng là chủ đích, chẳng hạn một workflow một lần không thể tiếp tục sau lỗi. Không nên dùng nó để “giữ UI sống” nếu fallback chỉ là `of(...)` hoặc `EMPTY`.
+
+## Phạm vi bắt lỗi và lỗi của fallback
+
+`catchError` chỉ thấy error từ **đoạn upstream trong subscription của nó**. Lỗi từ operator đặt sau nó không quay ngược lại để được bắt.
+
+```ts
+import { catchError, map, of } from 'rxjs';
+
+of(1).pipe(
+  catchError(() => of(0)),
+  map(() => { throw new Error('Lỗi downstream'); }),
+).subscribe({
+  error: (error: unknown) => console.log(error),
+});
+// Subscriber nhận Error: Lỗi downstream; fallback 0 không được phát.
+```
+
+Fallback cũng không được tự động bắt lại bởi cùng lần xử lý `catchError`. Nếu fallback error, lỗi đi tiếp xuống downstream; một `catchError` tiếp theo mới có thể xử lý nó.
+
+```ts
+import { catchError, of, throwError } from 'rxjs';
+
+throwError(() => new Error('Nguồn chính lỗi')).pipe(
+  catchError(() => throwError(() => new Error('Fallback cũng lỗi'))),
+  catchError((error: unknown) => of(
+    error instanceof Error ? error.message : 'Lỗi không xác định',
+  )),
+).subscribe(console.log);
+// Fallback cũng lỗi
+```
+
+Điều này cũng áp dụng khi selector tự throw. Ngoài ra, lỗi throw trong callback `subscribe({ next })` không phải lỗi upstream để `catchError` xử lý. Đừng dùng `catchError` như một `try/catch` bao quanh mọi callback JavaScript; đưa phép biến đổi có thể lỗi vào `map`, `defer` hoặc Observable thích hợp.
+
+## Phối hợp với retry và finalize
+
+Nếu lỗi tạm thời có thể thử lại, đặt `retry` **trước** `catchError`: thử lại nguồn trước, chỉ dùng fallback sau khi hết lượt retry. Nếu `catchError` đã biến lỗi thành `of` hoặc `EMPTY`, `retry` phía sau không thấy error để thử lại.
+
+```ts
+import { catchError, defer, finalize, of, retry, throwError } from 'rxjs';
+
+let attempts = 0;
+
+const request$ = defer(() => {
+  attempts += 1;
+  console.log('attempt:', attempts);
+  return throwError(() => new Error('Service unavailable'));
+});
+
+request$.pipe(
+  retry({ count: 2 }),
+  catchError(() => of('Dữ liệu dự phòng')),
+  finalize(() => console.log('Dọn tài nguyên toàn pipeline')),
+).subscribe({
+  next: (value) => console.log(value),
+  complete: () => console.log('complete'),
+});
+
+// attempt: 1
+// attempt: 2
+// attempt: 3
+// Dữ liệu dự phòng
+// complete
+// Dọn tài nguyên toàn pipeline
+```
+
+`count: 2` là hai lần subscribe lại ngoài lần đầu. Ví dụ này chạy đồng bộ để dễ quan sát; request thực tế cần cân nhắc delay, phân loại lỗi và tính idempotent trước khi retry thao tác ghi dữ liệu.
+
+`finalize` chạy khi complete, error hoặc unsubscribe. Nếu đặt nó phía trước `catchError`, nó thuộc đoạn nguồn và chạy khi đoạn đó kết thúc, không chờ fallback complete. Đặt sau `catchError` nếu bạn muốn dọn tài nguyên của cả nguồn lẫn fallback. Với UI tương tác, đặt `finalize` trong inner để tắt loading của từng request; đặt ngoài chỉ dọn khi cả luồng tương tác kết thúc.
+
+<Callout type="warn" title="Không dùng caught làm retry vô hạn">
+  `catchError((error, caught) => caught)` subscribe lại đoạn upstream, nên nguồn cold có thể chạy lại request và lặp các value đã phát. Với lỗi đồng bộ lặp lại, cách này có thể tạo vòng lặp nhanh đến mức tràn stack. Dùng `retry` có giới hạn thay vì tự nối lại `caught` nếu mục tiêu chỉ là thử lại.
+</Callout>
+
+## Những lỗi dễ mắc
+
+| Cách viết hoặc lựa chọn | Vấn đề | Cách sửa |
+| --- | --- | --- |
+| `catchError(error => { console.error(error); })` | Selector không trả `ObservableInput`; TypeScript báo lỗi, JavaScript có thể phát lỗi mới vì nhận `undefined`. | Log rồi trả `EMPTY`, `of(...)` hoặc `throwError(...)` tùy chủ đích. |
+| Trả object state trực tiếp | Object thông thường không phải `ObservableInput`. | Bọc bằng `of(state)`. |
+| `return []` thay cho danh sách rỗng | Không có `next`, UI có thể không cập nhật. | Dùng `of<Product[]>([])`. |
+| Mọi lỗi đều thành `of([])` | Không phân biệt kết quả rỗng, mất mạng, lỗi quyền truy cập và lỗi lập trình. | Phân loại lỗi, phát state rõ ràng hoặc rethrow lỗi không xử lý được. |
+| `catchError(() => NEVER)` | Output có thể treo; loading không tắt nếu chờ complete/finalize. | Chọn fallback có vòng đời hữu hạn, trừ khi thật sự cần giữ stream mở. |
+| Nghĩ unsubscribe sẽ gọi selector | Cancellation không phải error. | Dọn tài nguyên bằng `finalize` hoặc teardown. |
+
+Đặc biệt với `concatMap`, fallback `NEVER` giữ inner hiện tại không complete nên các item tiếp theo cứ chờ. Với `mergeMap`, nó chiếm một slot concurrency; với `switchMap`, outer value mới có thể hủy nó, nhưng nếu không có value mới thì output vẫn có thể chờ mãi. Vì thế không chọn `NEVER` chỉ để tránh hiển thị lỗi.
+
+Nếu chỉ cần quan sát lỗi rồi giữ nguyên cách lan truyền, dùng `tap({ error: ... })` thay vì `catchError`. Handler `error` trong `subscribe` là nơi nhận lỗi cuối cùng; nó không khôi phục subscription đã kết thúc.
+
+## Kiểm thử bằng TestScheduler
+
+Kiểm thử nên xác nhận cả output và vòng đời subscription. Hai bài test dưới đây dùng test runner có globals `it` và `expect` theo kiểu Jest/Vitest; chạy trong môi trường đã có RxJS, không cần thêm test infrastructure vào trang docs này.
+
+Test thứ nhất xác nhận source bị hủy tại lỗi và output chuyển sang fallback. Ký hiệu `#` là error, `|` là complete và dấu ngoặc biểu diễn nhiều notification trong cùng một frame.
+
+```ts
+import { catchError, of, switchMap } from 'rxjs';
+import { TestScheduler } from 'rxjs/testing';
+
+it('giữ value trước lỗi rồi phát fallback và complete', () => {
+  const scheduler = new TestScheduler((actual, expected) => {
+    expect(actual).toEqual(expected);
+  });
+
+  scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+    const source = cold('-a-b-#', { a: 1, b: 2 }, new Error('fail'));
+    const output = source.pipe(catchError(() => of(0)));
+
+    expectObservable(output).toBe('-a-b-(f|)', { a: 1, b: 2, f: 0 });
+    expectSubscriptions(source.subscriptions).toBe('^----!');
+  });
+});
+
+it('bắt lỗi trong inner giữ outer sống, bắt ngoài thì kết thúc outer', () => {
+  const scheduler = new TestScheduler((actual, expected) => {
+    expect(actual).toEqual(expected);
+  });
+
+  scheduler.run(({ cold, expectObservable, expectSubscriptions }) => {
+    const insideOuter = cold('a---b---c---|');
+    const outsideOuter = cold('a---b---c---|');
+    const request = () => cold('-#', undefined, new Error('request fail'));
+
+    const inside = insideOuter.pipe(
+      switchMap(() => request().pipe(catchError(() => of('fallback')))),
+    );
+    const outside = outsideOuter.pipe(
+      switchMap(() => request()),
+      catchError(() => of('fallback')),
+    );
+
+    expectObservable(inside).toBe('-x---x---x--|', { x: 'fallback' });
+    expectObservable(outside).toBe('-(x|)', { x: 'fallback' });
+    expectSubscriptions(insideOuter.subscriptions).toBe('^-----------!');
+    expectSubscriptions(outsideOuter.subscriptions).toBe('^!');
+  });
+});
+```
+
+Sau hai test này, hãy thêm test cho tình huống fallback cũng error và tình huống hủy subscription trước khi request lỗi. Trường hợp hủy cần xác nhận selector không chạy, nhưng teardown vẫn được gọi.
+
+## Checklist trước khi dùng
+
+- Lỗi cần kết thúc cả workflow hay chỉ một request/item? Đặt handler tại ranh giới đó.
+- Fallback có thật sự hợp lệ về nghiệp vụ, hay đang che mất lỗi cần được báo lên tầng trên?
+- Output có phân biệt dữ liệu rỗng với trạng thái thất bại không?
+- Mọi nhánh selector có trả `ObservableInput` hoặc chủ đích throw lỗi không?
+- Nếu cần retry, giới hạn và thứ tự operator đã rõ chưa?
+- Fallback có thể error hoặc không complete không? Ai xử lý và dọn tài nguyên khi ấy?
+- Test có chứng minh thao tác tiếp theo vẫn chạy sau lỗi, nếu đó là yêu cầu của UI không?
+
+## Học tiếp
+
+<Cards>
+  <Card title="Error channel" href="/docs/loi-hoan-tat/error-channel" description="Hiểu vì sao error kết thúc một subscription." />
+  <Card title="retry và retryWhen" href="/docs/loi-hoan-tat/retry-retry-when" description="Subscribe lại nguồn với chính sách thử lại phù hợp." />
+  <Card title="finalize" href="/docs/loi-hoan-tat/finalize" description="Dọn tài nguyên khi complete, error hoặc unsubscribe." />
+  <Card title="switchMap" href="/docs/higher-order-observables/switch-map" description="Xử lý tương tác theo request mới nhất." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS API: catchError](https://rxjs.dev/api/operators/catchError).
+- [Mã nguồn catchError của RxJS 7.8.2](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/catchError.ts): signature, cách subscribe fallback và ví dụ dùng `caught`.
+- [RxJS API: retry](https://rxjs.dev/api/operators/retry).
+- [RxJS API: finalize](https://rxjs.dev/api/operators/finalize).
+- [RxJS: TestScheduler và marble testing](https://rxjs.dev/guide/testing/marble-testing).

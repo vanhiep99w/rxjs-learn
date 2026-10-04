@@ -3,8 +3,404 @@ title: Subscription và teardown
 description: Hủy đăng ký và giải phóng tài nguyên đúng lúc.
 ---
 
-Trang này sẽ trình bày **Subscription và teardown** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Màn hình đã đóng nhưng timer vẫn chạy, event listener vẫn giữ component cũ, hoặc request cũ vẫn tốn băng thông. Những lỗi này không nằm ở dữ liệu mà nằm ở **ownership**: ai đã bắt đầu công việc, ai có quyền dừng nó, và resource nào phải được giải phóng. `Subscription` cùng teardown giúp bạn trả lời ba câu hỏi đó ngay trong code.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phạm vi phiên bản">
+  Bài viết dùng public API của **RxJS 7.x** và TypeScript. `Subscription` trong bài là object đại diện cho một execution cụ thể, không phải bản thân Observable.
 </Callout>
+
+## Mục lục
+
+- [Mental model: Subscription là quyền sở hữu execution](#mental-model-subscription-là-quyền-sở-hữu-execution)
+  - [Ba cách một subscription đóng](#ba-cách-một-subscription-đóng)
+  - [Teardown khác complete như thế nào?](#teardown-khác-complete-như-thế-nào)
+- [Hủy một subscription đúng cách](#hủy-một-subscription-đúng-cách)
+- [Đặt teardown cạnh resource được tạo](#đặt-teardown-cạnh-resource-được-tạo)
+- [Gom nhiều teardown bằng add](#gom-nhiều-teardown-bằng-add)
+  - [remove chỉ bỏ quan hệ sở hữu](#remove-chỉ-bỏ-quan-hệ-sở-hữu)
+  - [Thêm teardown vào subscription đã đóng](#thêm-teardown-vào-subscription-đã-đóng)
+- [Ưu tiên mô tả vòng đời trong pipeline](#ưu-tiên-mô-tả-vòng-đời-trong-pipeline)
+  - [take và takeUntil](#take-và-takeuntil)
+  - [finalize cho cleanup ở cấp pipeline](#finalize-cho-cleanup-ở-cấp-pipeline)
+- [Unsubscribe không luôn hủy công việc bên dưới](#unsubscribe-không-luôn-hủy-công-việc-bên-dưới)
+- [Ownership theo loại resource](#ownership-theo-loại-resource)
+- [Những bẫy thường gặp](#những-bẫy-thường-gặp)
+- [Checklist teardown](#checklist-teardown)
+- [Học tiếp](#học-tiếp)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+
+## Mental model: Subscription là quyền sở hữu execution
+
+`Observable` mô tả cách một luồng dữ liệu hoạt động. Mỗi lần gọi `subscribe()`, bạn bắt đầu một execution và nhận lại một `Subscription` để quản lý execution đó. Nếu subscribe hai lần vào một cold Observable, bạn thường có hai execution và hai vòng đời riêng.
+
+Có thể hình dung `Subscription` như thẻ nhận đồ ở quầy: thẻ không phải món đồ, nhưng nó chứng minh bạn đang sở hữu một lượt gửi và cho bạn quyền kết thúc lượt đó. Ẩn dụ dừng ở đây, vì một subscription còn có thể sở hữu nhiều teardown con và đóng chúng theo dây chuyền.
+
+```text
+Observable template
+       │
+       │ subscribe()
+       ▼
+┌──────────────────────────┐
+│ Execution đang hoạt động │
+│ timer / listener / I/O   │
+└────────────┬─────────────┘
+             │ được đại diện bởi
+             ▼
+      ┌──────────────┐      unsubscribe()
+      │ Subscription │ ─────────────────────┐
+      └──────────────┘                      │
+                                            ▼
+                                      chạy teardown
+                                      đóng execution
+```
+
+`subscription.closed` cho biết subscription đã đóng hay chưa. Cờ này hữu ích để quan sát trạng thái hoặc bảo vệ code tích hợp, nhưng không nên trở thành cơ chế quản lý lifecycle chính. Thiết kế tốt hơn là làm rõ owner nào sẽ gọi `unsubscribe()` hoặc operator nào sẽ kết thúc pipeline.
+
+### Ba cách một subscription đóng
+
+Một subscription có ba đường kết thúc thường gặp:
+
+| Đường kết thúc | Ai khởi tạo? | Observer nhận terminal notification? | Teardown chạy? |
+| --- | --- | --- | --- |
+| `complete()` | Producer | Có, callback `complete` | Có |
+| `error(error)` | Producer | Có, callback `error` | Có |
+| `unsubscribe()` | Consumer hoặc operator | Không | Có |
+
+Cả ba đường đều đóng subscription và giải phóng teardown đã đăng ký. Điểm khác biệt nằm ở ý nghĩa: `complete` nói rằng producer đã hoàn tất bình thường, `error` nói rằng execution thất bại, còn `unsubscribe` nói rằng consumer không cần execution này nữa.
+
+### Teardown khác complete như thế nào?
+
+`complete` là một **notification** đi từ producer đến Observer. Teardown là logic cleanup chạy khi subscription đóng, bất kể nó đóng do complete, error hay explicit unsubscribe.
+
+```text
+Producer ── complete() ──► Observer.complete()
+    │
+    └────────────────────► đóng subscription ──► teardown
+
+Consumer ─ unsubscribe() ──────────────────────► teardown
+                         └─ không gọi Observer.complete()
+```
+
+Vì vậy, đừng đặt `clearInterval`, `removeEventListener` hoặc `socket.close()` chỉ trong callback `complete`. Một source dài hạn có thể không bao giờ complete, và consumer rời màn hình cũng không biến việc hủy thành một notification hoàn tất.
+
+## Hủy một subscription đúng cách
+
+Với source dài hạn, hãy giữ subscription tại nơi sở hữu lifecycle và hủy nó khi owner bị destroy:
+
+```ts
+import { interval } from 'rxjs';
+
+const heartbeatSubscription = interval(1_000).subscribe({
+  next: (tick) => console.log('heartbeat', tick),
+  error: (error: unknown) => console.error('heartbeat lỗi', error),
+  complete: () => console.log('heartbeat hoàn tất'),
+});
+
+export function destroyHeartbeat(): void {
+  heartbeatSubscription.unsubscribe();
+}
+```
+
+Sau `unsubscribe()`:
+
+- subscription có `closed === true`;
+- `interval` dọn timer nội bộ;
+- Observer không nhận thêm `next`;
+- callback `complete` không chạy.
+
+Gọi `unsubscribe()` lần nữa là an toàn: RxJS không chạy lại cùng teardown trên một subscription đã đóng. Vì thao tác này có tính idempotent, bạn thường không cần bọc nó trong `if (!subscription.closed)`.
+
+<Callout type="idea" title="Đặt owner ở nơi có lifecycle rõ nhất">
+  Component, route, dialog hoặc service bắt đầu subscription thì chính lifecycle của đối tượng đó nên kết thúc subscription. Tránh đẩy tất cả subscription vào một “túi rác” toàn cục vì lúc ấy không còn biết resource nào phải sống bao lâu.
+</Callout>
+
+Source hữu hạn như `of(...)` hoặc một request Observable hoàn tất đúng cách thường tự đóng. Không cần unsubscribe sau khi nó đã complete chỉ để “cho chắc”. Ngược lại, DOM event, `interval` và kết nối sống lâu cần một điều kiện kết thúc rõ ràng.
+
+## Đặt teardown cạnh resource được tạo
+
+Khi tự tạo Observable, code khởi tạo resource cũng phải khai báo cách thu hồi resource đó. Ví dụ dưới đây mở một timer cho mỗi subscriber và trả về teardown để đóng đúng timer ấy:
+
+```ts
+import { Observable } from 'rxjs';
+
+const clock$ = new Observable<Date>((subscriber) => {
+  console.log('mở timer');
+
+  const timerId = setInterval(() => {
+    subscriber.next(new Date());
+  }, 1_000);
+
+  return () => {
+    clearInterval(timerId);
+    console.log('đóng timer');
+  };
+});
+
+const subscription = clock$.subscribe({
+  next: (time) => console.log(time.toISOString()),
+});
+
+setTimeout(() => subscription.unsubscribe(), 2_500);
+```
+
+Kết quả xấp xỉ:
+
+```text
+mở timer
+2025-01-01T00:00:01.000Z
+2025-01-01T00:00:02.000Z
+đóng timer
+```
+
+Timestamp chỉ minh họa; điều cần quan sát là `đóng timer` xuất hiện đúng một lần khi consumer hủy. Nếu bỏ `clearInterval`, RxJS vẫn chặn notification gửi đến subscriber đã đóng, nhưng timer bên dưới vẫn thức dậy mỗi giây. “Không còn log” chưa chứng minh resource đã được giải phóng.
+
+Teardown nên đối xứng với setup:
+
+| Setup | Teardown tương ứng |
+| --- | --- |
+| `setInterval(...)` | `clearInterval(id)` |
+| `target.addEventListener(...)` | `target.removeEventListener(...)` |
+| `new WebSocket(...)` | Gỡ handler và `socket.close()` theo contract của ứng dụng |
+| `new AbortController()` cho request | `controller.abort()` |
+| Đăng ký callback với SDK | Gọi hàm dispose/unregister mà SDK trả về |
+
+Mặc định, hãy dùng creation function có sẵn như `fromEvent()` hoặc `interval()` vì RxJS đã nối teardown cho bạn. Chỉ dùng `new Observable()` khi API nguồn chưa có adapter phù hợp hoặc bạn cần kiểm soát setup và cleanup riêng.
+
+## Gom nhiều teardown bằng add
+
+Một owner thường mở nhiều resource cùng lúc: listener bàn phím, timer autosave và một subscription theo dõi trạng thái. `Subscription.add()` cho phép tạo một parent subscription; khi parent đóng, các child và cleanup function đã thêm cũng được xử lý.
+
+```ts
+import { fromEvent, interval, Subscription } from 'rxjs';
+
+const screenSubscription = new Subscription();
+
+const escapeSubscription = fromEvent<KeyboardEvent>(document, 'keydown')
+  .subscribe({
+    next: (event) => {
+      if (event.key === 'Escape') {
+        console.log('đóng dialog');
+      }
+    },
+  });
+
+const autosaveSubscription = interval(30_000).subscribe({
+  next: () => console.log('autosave'),
+});
+
+screenSubscription.add(escapeSubscription);
+screenSubscription.add(autosaveSubscription);
+screenSubscription.add(() => console.log('dọn state của màn hình'));
+
+export function destroyScreen(): void {
+  screenSubscription.unsubscribe();
+}
+```
+
+`add()` chỉ gắn quan hệ ownership; nó **không** bắt đầu child subscription. Trong ví dụ trên, `fromEvent(...).subscribe(...)` và `interval(...).subscribe(...)` đã bắt đầu execution trước khi được thêm vào parent.
+
+Cách gom này phù hợp khi các resource thật sự có cùng lifetime. Nếu timer autosave thuộc về cả ứng dụng nhưng listener chỉ thuộc về dialog, đừng đặt chúng dưới cùng một parent chỉ vì tiện tay. Parent đóng sẽ hủy toàn bộ cây con.
+
+### remove chỉ bỏ quan hệ sở hữu
+
+`remove(child)` tách child khỏi parent nhưng **không unsubscribe child**:
+
+```ts
+screenSubscription.remove(autosaveSubscription);
+
+// autosaveSubscription vẫn chạy, nên owner mới phải quản lý nó.
+autosaveSubscription.unsubscribe();
+```
+
+Hãy dùng `remove()` có chủ đích khi chuyển ownership. Nếu mục tiêu chỉ là dừng child, gọi `child.unsubscribe()`; một child `Subscription` đã tự unsubscribe cũng tự gỡ nó khỏi parent.
+
+### Thêm teardown vào subscription đã đóng
+
+RxJS chạy ngay teardown được thêm vào một subscription đã đóng. Hành vi này tránh rò rỉ resource trong tình huống setup bất đồng bộ hoàn tất sau khi owner đã bị destroy:
+
+```ts
+import { interval, Subscription } from 'rxjs';
+
+const owner = new Subscription();
+owner.unsubscribe();
+
+const lateSubscription = interval(1_000).subscribe(console.log);
+owner.add(lateSubscription);
+
+console.log(lateSubscription.closed); // true
+```
+
+Đây là hành vi hữu ích, nhưng đừng dựa vào nó để che một lifecycle lộn xộn. Nếu công việc không còn cần thiết, tốt hơn hết là ngăn setup muộn ngay từ đầu khi API cho phép.
+
+## Ưu tiên mô tả vòng đời trong pipeline
+
+Giữ một biến rồi gọi `unsubscribe()` là hợp lý khi lifecycle mang tính mệnh lệnh, chẳng hạn `destroy()` của một class. Nhưng nếu điều kiện kết thúc có thể diễn đạt bằng dữ liệu — “lấy một giá trị”, “dừng khi người dùng rời màn hình” — operator thường rõ hơn vì policy nằm ngay trong pipeline.
+
+### take và takeUntil
+
+`take(1)` nói rằng output chỉ cần giá trị đầu tiên rồi complete. Cách này cũng tránh bẫy hủy thủ công một source đồng bộ bên trong callback `next`:
+
+```ts
+import { of, take } from 'rxjs';
+
+of('first', 'second', 'third')
+  .pipe(take(1))
+  .subscribe({
+    next: (value) => console.log(value),
+    complete: () => console.log('đã đủ một giá trị'),
+  });
+```
+
+Đừng viết `const subscription = source$.subscribe({ next: () => subscription.unsubscribe() })` với source có thể phát đồng bộ. Callback `next` có thể chạy trước khi phép gán cho biến `subscription` hoàn tất. `take(1)` vừa tránh lỗi thứ tự khởi tạo vừa diễn đạt ý định tốt hơn.
+
+Khi nhiều pipeline dùng chung một tín hiệu kết thúc, `takeUntil()` là lựa chọn phổ biến:
+
+```ts
+import { Subject, fromEvent, takeUntil } from 'rxjs';
+
+const destroy$ = new Subject<void>();
+
+fromEvent(document, 'visibilitychange')
+  .pipe(takeUntil(destroy$))
+  .subscribe({
+    next: () => console.log(document.visibilityState),
+    complete: () => console.log('listener đã kết thúc'),
+  });
+
+export function destroyPage(): void {
+  destroy$.next();
+  destroy$.complete();
+}
+```
+
+`destroy$.next()` mới kích hoạt `takeUntil()` và làm output complete; chỉ gọi `destroy$.complete()` thì không. Nếu framework đã cung cấp primitive gắn với component lifecycle, hãy ưu tiên primitive đó thay vì tạo một `Subject` cho mọi nơi.
+
+### finalize cho cleanup ở cấp pipeline
+
+Teardown của custom Observable dọn resource mà **producer** tạo. `finalize()` phù hợp với side effect gắn với **toàn pipeline**, chẳng hạn tắt loading hoặc ghi log kết thúc, vì callback chạy khi complete, error và explicit unsubscribe.
+
+```ts
+import { finalize, interval } from 'rxjs';
+
+const subscription = interval(1_000)
+  .pipe(
+    finalize(() => console.log('tắt loading')),
+  )
+  .subscribe({
+    next: (value) => console.log(value),
+  });
+
+setTimeout(() => subscription.unsubscribe(), 2_500);
+```
+
+Ở đây `finalize` vẫn chạy dù Observer không nhận `complete`. Tuy nhiên, đừng dùng `finalize()` để vá một custom producer thiếu teardown. Producer mở socket thì producer vẫn phải biết cách đóng socket; `finalize` ở consumer chỉ nên quản lý side effect thuộc pipeline của consumer.
+
+## Unsubscribe không luôn hủy công việc bên dưới
+
+`unsubscribe()` chỉ chạy teardown đã được Observable đăng ký. Nếu resource bên dưới không hỗ trợ cancellation, hoặc adapter không nối cơ chế hủy vào teardown, RxJS chỉ có thể ngừng chuyển notification đến Observer.
+
+Ví dụ điển hình là `from(fetch(url))`: unsubscribe khỏi Observable không tự abort `fetch`, vì Promise đã chạy không có contract hủy. Nếu cần hủy request thật sự, hãy nối `AbortController` vào teardown:
+
+```ts
+import { Observable } from 'rxjs';
+
+function getJson$<T>(url: string): Observable<T> {
+  return new Observable<T>((subscriber) => {
+    const controller = new AbortController();
+
+    fetch(url, { signal: controller.signal })
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        return response.json() as Promise<T>;
+      })
+      .then((data) => {
+        if (!subscriber.closed) {
+          subscriber.next(data);
+          subscriber.complete();
+        }
+      })
+      .catch((error: unknown) => {
+        if (!subscriber.closed) {
+          subscriber.error(error);
+        }
+      });
+
+    return () => controller.abort();
+  });
+}
+
+const requestSubscription = getJson$<{ name: string }>('/api/profile')
+  .subscribe({
+    next: (profile) => console.log(profile.name),
+    error: (error: unknown) => console.error('request lỗi', error),
+  });
+
+// Ví dụ: route đổi trước khi request hoàn tất.
+requestSubscription.unsubscribe();
+```
+
+Khi consumer hủy, teardown gọi `abort()` và request có khả năng dừng thật. Khi request hoàn tất bình thường, teardown vẫn chạy sau `complete`; gọi `abort()` lúc ấy không thay đổi kết quả đã phát.
+
+<Callout type="warn" title="Phân biệt ngừng nhận và ngừng làm">
+  Kiểm tra cả hai lớp: Observer có ngừng nhận dữ liệu không, và producer có thật sự dừng timer, listener, socket hoặc request không. Unsubscribe chỉ giải quyết lớp thứ hai khi teardown được nối đúng.
+</Callout>
+
+## Ownership theo loại resource
+
+| Tình huống | Owner hợp lý | Cách kết thúc mặc định |
+| --- | --- | --- |
+| Stream chỉ phục vụ một component | Component | Primitive lifecycle của framework, `takeUntil(...)` hoặc cleanup gọi `unsubscribe()` |
+| Stream chỉ cần N giá trị | Chính pipeline | `take(N)` |
+| Nhiều subscription có cùng lifetime | Một parent `Subscription` cục bộ | `parent.add(child)`, rồi hủy parent |
+| Custom producer mở timer/listener/socket | Hàm tạo producer | Trả teardown function từ `new Observable(...)` |
+| UI loading gắn với toàn operation | Pipeline của consumer | `finalize(...)` |
+| Request cần hủy thật | Adapter của request | Nối teardown với `AbortController` hoặc API cancellation tương ứng |
+| Source hữu hạn tự complete | Producer | Để source complete; không cần hủy lại theo nghi thức |
+
+Mặc định, mình ưu tiên operator khi điều kiện kết thúc là một phần của luồng dữ liệu, và dùng explicit `unsubscribe()` khi owner có lifecycle mệnh lệnh rõ ràng. `Subscription.add()` là công cụ gom ownership, không phải lý do để biến mọi subscription trong ứng dụng thành một cây toàn cục.
+
+## Những bẫy thường gặp
+
+1. **Cho rằng unsubscribe sẽ gọi complete.** Nó đóng subscription và chạy teardown, nhưng không gọi `Observer.complete`. Dùng `finalize()` nếu side effect phải chạy trên mọi đường kết thúc.
+2. **Chỉ nhìn output để kết luận đã cleanup.** Subscriber đóng sẽ bỏ notification muộn, trong khi timer hoặc listener bị viết sai vẫn có thể chạy. Hãy kiểm tra resource bên dưới.
+3. **Dùng `remove()` như `unsubscribe()`.** `remove()` chỉ tách ownership; child tiếp tục chạy cho đến khi tự kết thúc hoặc được hủy bởi owner khác.
+4. **Gom các lifetime không liên quan.** Một parent subscription quá rộng dễ hủy nhầm resource sống lâu hoặc giữ resource ngắn hạn lâu hơn cần thiết.
+5. **Tạo nested subscribe.** Subscription bên trong dễ thoát khỏi ownership và error flow của subscription bên ngoài. Thường nên dùng flattening operator; xem [Nested subscribe](/docs/troubleshooting/nested-subscribe).
+6. **Để teardown ném lỗi.** RxJS cố chạy các finalizer và có thể ném `UnsubscriptionError` chứa nhiều lỗi, nhưng cleanup thất bại vẫn làm lifecycle khó dự đoán. Teardown nên ngắn, idempotent và tự xử lý lỗi có thể phục hồi.
+7. **Hủy source đồng bộ từ callback `next`.** Biến subscription có thể chưa được gán. Dùng `take`, `takeWhile` hoặc operator thể hiện điều kiện dừng.
+
+## Checklist teardown
+
+Trước khi merge một pipeline sống lâu, hãy trả lời được:
+
+- Ai gọi `subscribe()` và object nào sở hữu subscription trả về?
+- Source tự complete hay cần lifecycle bên ngoài kết thúc?
+- Mỗi timer, listener, socket, worker hoặc request được dọn bằng API nào?
+- Cleanup nằm cạnh code setup hay bị rải sang callback `complete`?
+- Unsubscribe chỉ ngừng notification hay thực sự hủy công việc bên dưới?
+- Nếu dùng parent subscription, mọi child có thật sự cùng lifetime không?
+- Nếu dùng `takeUntil`, notifier có phát `next` ở thời điểm destroy không?
+- Side effect như loading có cần `finalize()` để bao phủ complete, error và unsubscribe không?
+- Có nested subscribe nào tạo thêm owner ẩn không?
+
+Một bài test tốt nên quan sát resource chứ không chỉ quan sát output: spy `clearInterval`, `removeEventListener`, `abort()` hoặc hàm dispose của SDK, rồi xác nhận nó chạy đúng một lần khi subscription đóng.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Vòng đời của stream" href="/docs/nen-tang/vong-doi-stream" description="Phân biệt next, error, complete và unsubscribe." />
+  <Card title="Tự tạo Observable" href="/docs/observable-subscription/custom-observable" description="Đóng gói producer và teardown tùy biến." />
+  <Card title="finalize" href="/docs/loi-hoan-tat/finalize" description="Chạy cleanup ở cấp pipeline trên mọi đường kết thúc." />
+  <Card title="Nested subscribe" href="/docs/troubleshooting/nested-subscribe" description="Giữ ownership và error flow trong một pipeline." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS 7.8.2 — Subscription guide](https://github.com/ReactiveX/rxjs/blob/7.8.2/docs_app/content/guide/subscription.md): `unsubscribe()`, `add()` và `remove()`.
+- [RxJS 7.8.2 — mã nguồn `Subscription`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/Subscription.ts): trạng thái `closed`, parent-child finalizer, hành vi idempotent và cleanup khi thêm vào subscription đã đóng.
+- [RxJS 7.8.2 — mã nguồn `Observable`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/Observable.ts): cách `subscribe()` tạo execution và đăng ký teardown.
+- [RxJS 7.8.2 — mã nguồn `fromPromise`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/observable/innerFrom.ts): Promise adapter bỏ kết quả khi subscriber đã đóng nhưng không đăng ký teardown để hủy Promise.
+- [RxJS 7.8.2 — mã nguồn `finalize`](https://github.com/ReactiveX/rxjs/blob/7.8.2/src/internal/operators/finalize.ts): callback được thêm vào teardown của subscriber.
+- [MDN — AbortController](https://developer.mozilla.org/en-US/docs/Web/API/AbortController): cơ chế abort request và các tác vụ Web API hỗ trợ `AbortSignal`.

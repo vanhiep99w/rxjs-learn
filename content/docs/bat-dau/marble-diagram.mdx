@@ -3,8 +3,362 @@ title: Marble diagram
 description: Đọc timeline, emission, completion và error bằng ký hiệu marble trong RxJS.
 ---
 
-Trang này sẽ giới thiệu cách dùng **marble diagram** để hình dung dữ liệu đi qua Observable theo thời gian. Nội dung sẽ tập trung vào cách đọc diagram; phần viết marble test bằng `TestScheduler` nằm trong nhóm Testing.
+Một pipeline RxJS thường dễ đọc cho đến khi thời gian xen vào: giá trị nào đến trước, operator bỏ giá trị nào, và stream kết thúc ở đâu? Đọc từng dòng code chưa chắc trả lời nhanh được những câu hỏi đó. **Marble diagram** nén cả diễn biến thành một timeline để bạn nhìn thấy input, operator và output trên cùng một hình.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+Bài này tập trung vào cách đọc và tự phác diagram khi thiết kế hoặc debug. Phần biến chuỗi marble thành assertion tự động được tách sang nhóm Testing, vì ký pháp dùng trong `TestScheduler` chặt chẽ hơn hình minh họa trên giấy.
+
+<Callout type="info" title="Phạm vi phiên bản">
+  Các API và hành vi trong bài áp dụng cho **RxJS 7.x**. Ví dụ chỉ dùng public API import từ `rxjs`; bài không giả định API thử nghiệm của RxJS 8.
 </Callout>
+
+## Mục lục
+
+- [Mental model của marble diagram](#mental-model-của-marble-diagram)
+- [Bộ ký hiệu cần nhớ](#bộ-ký-hiệu-cần-nhớ)
+- [Quy trình đọc một diagram](#quy-trình-đọc-một-diagram)
+- [Giá trị thay đổi nhưng nhịp thời gian được giữ](#giá-trị-thay-đổi-nhưng-nhịp-thời-gian-được-giữ)
+- [Complete sớm kéo theo teardown](#complete-sớm-kéo-theo-teardown)
+- [Error dừng execution](#error-dừng-execution)
+- [Ví dụ thực tế hủy request tìm kiếm cũ](#ví-dụ-thực-tế-hủy-request-tìm-kiếm-cũ)
+- [Marble minh họa và marble testing khác nhau thế nào](#marble-minh-họa-và-marble-testing-khác-nhau-thế-nào)
+- [Khi nào nên dùng marble diagram](#khi-nào-nên-dùng-marble-diagram)
+- [Những bẫy thường gặp](#những-bẫy-thường-gặp)
+- [Bài tập tự kiểm tra](#bài-tập-tự-kiểm-tra)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
+- [Học tiếp](#học-tiếp)
+
+## Mental model của marble diagram
+
+Hãy coi marble diagram như bản ghi hành trình của **một Observable execution**. Thời gian chạy từ trái sang phải; mỗi “viên bi” là một lần `next(value)`; vạch đứng hoặc dấu lỗi đóng execution. Nếu có operator, các dòng phía trên là input và dòng phía dưới là Observable mới mà operator trả về.
+
+Repo chưa cấu hình Mermaid, nên các diagram trong bài dùng ASCII để hiển thị đúng mà không cần component hay dependency bổ sung.
+
+```text
+time ─────────────────────────────────────────►
+
+source$:  ──(A)────(B)────────(C)────│
+                    operator
+output$:  ────────(B')───────(C')────│
+```
+
+Bạn nên đọc hình theo hai lượt. Lượt đầu đi ngang trên từng dòng để hiểu lifecycle; lượt sau đi dọc tại mỗi thời điểm để hỏi “input này làm output thay đổi thế nào?”. Cách đọc này tránh lỗi phổ biến là chỉ nhìn danh sách giá trị mà bỏ qua khoảng chờ, completion hoặc cancellation.
+
+Từ “marble” là hình ảnh ẩn dụ cho value emission, không phải một loại object trong RxJS. Tương tự, khoảng cách trên hình minh họa thường chỉ biểu thị thứ tự hoặc độ trễ tương đối. Chỉ khi diagram ghi thang đo, hoặc khi nó là chuỗi dành cho `TestScheduler`, khoảng cách mới mang ý nghĩa thời gian chính xác.
+
+<Callout type="idea" title="Một diagram trả lời ba câu hỏi">
+  Giá trị nào được phát? Chúng xuất hiện theo thứ tự và thời điểm nào? Execution kết thúc bằng complete, error hay unsubscribe? Nếu hình chưa giúp trả lời cả ba, hãy thêm annotation thay vì đoán.
+</Callout>
+
+## Bộ ký hiệu cần nhớ
+
+Bài này dùng ký hiệu trực quan sau cho diagram minh họa:
+
+```text
+Ký hiệu       Ý nghĩa trong một Observable execution
+──────────    thời gian trôi qua
+(A)           next('A')
+│             complete()
+✕             error(err)
+^             thời điểm subscribe
+!             thời điểm unsubscribe
+…             nguồn còn có thể tiếp tục, chưa có terminal notification
+```
+
+Ba timeline cơ bản trông như sau:
+
+```text
+complete$:  ──(A)────(B)────│
+error$:     ──(A)───────────✕
+open$:      ──(A)────(B)────…
+```
+
+`complete` và `error` đều là **terminal notification**: sau chúng, Observer không nhận thêm `next`. Chúng loại trừ nhau trong cùng một execution. Dòng `open$` không sai; DOM event, WebSocket hoặc `interval()` có thể không tự kết thúc.
+
+`unsubscribe` lại là hành động của consumer, không phải notification do producer gửi. Vì vậy dấu `!` đóng subscription và kích hoạt teardown, nhưng callback `complete` của Observer không chạy. Chi tiết này đặc biệt quan trọng khi diagram có operator như `take`, `switchMap` hoặc `takeUntil`.
+
+```text
+source$:       ──(A)────(B)────(C)────(D)────…
+subscription:  ^───────────────!
+received:      ──(A)────(B)────(C)
+```
+
+Diagram chỉ mô tả những notification đến trong cửa sổ subscription. Giá trị `(D)` thuộc lịch phát tiềm năng của nguồn nhưng consumer trên đã rời đi trước khi nhận nó.
+
+## Quy trình đọc một diagram
+
+Khi gặp một diagram nhiều dòng, đừng cố hiểu toàn bộ trong một lần nhìn. Đi theo thứ tự này:
+
+1. **Xác định chiều thời gian.** Mặc định là trái sang phải. Tìm thang đo nếu bài đang nói về `debounceTime`, `delay`, `timeout` hoặc scheduler.
+2. **Đọc từng nguồn riêng.** Ghi lại các `next`, rồi tìm `│`, `✕` hoặc điểm mà subscription bị hủy. Với nhiều input, đừng trộn chúng thành một dòng tưởng tượng.
+3. **Tìm thời điểm operator có đủ điều kiện phát.** `map` xử lý từng value ngay khi nhận; `filter` có thể không phát; `combineLatest` phải chờ mỗi nguồn có ít nhất một value; flattening operator còn phải quản lý inner subscription.
+4. **Đọc output như một Observable độc lập.** Output có lifecycle riêng. Nó có thể complete sớm hơn nguồn, trì hoãn completion, hoặc error ngay cả khi source chưa complete.
+5. **Kiểm tra teardown.** Khi output complete, error hoặc consumer unsubscribe, subscription ngược lên upstream có còn sống không? Đây là chỗ diagram giúp phát hiện timer, event listener hoặc request bị giữ ngoài ý muốn.
+
+Hình dung operator như một trạm kiểm soát trên băng chuyền: mỗi kiện hàng đến vào một thời điểm, trạm có thể đổi nhãn, giữ lại, bỏ đi hoặc mở thêm một băng chuyền con. Phép so sánh dừng ở đây; RxJS còn có scheduler, synchronous emission và shared producer, nên đừng suy ra rằng mọi value luôn chạy trên một thread nền.
+
+## Giá trị thay đổi nhưng nhịp thời gian được giữ
+
+Ví dụ đầu tiên kết hợp `filter` và `map`. `filter` loại số lẻ; `map` nhân số chẵn với `10`.
+
+```text
+source$:  ──(1)────(2)────(3)────(4)────│
+                filter số chẵn
+filtered$:────────(2)────────────(4)────│
+                map(value => value * 10)
+output$:  ────────(20)───────────(40)───│
+```
+
+Điểm cần nhìn không chỉ là output có `20` và `40`. Khoảng thời gian nơi `1` và `3` xuất hiện vẫn trôi qua, nhưng không có output tương ứng. Khi source complete, completion đi qua cả hai operator và output cũng complete.
+
+Code TypeScript tương ứng chạy đồng bộ vì `of()` phát các đối số ngay trong lời gọi `subscribe()`:
+
+```ts
+import { filter, map, of } from 'rxjs';
+
+of(1, 2, 3, 4)
+  .pipe(
+    filter((value) => value % 2 === 0),
+    map((value) => value * 10),
+  )
+  .subscribe({
+    next: (value) => console.log('next:', value),
+    error: (error: unknown) => console.error('error:', error),
+    complete: () => console.log('complete'),
+  });
+```
+
+Kết quả:
+
+```text
+next: 20
+next: 40
+complete
+```
+
+Marble diagram không buộc Observable phải bất đồng bộ. Với nguồn đồng bộ, các viên bi vẫn có thứ tự nhưng có thể xuất hiện trong cùng một call stack. Nếu độ đồng thời là điều cần diễn đạt, hãy ghi chú “sync” hoặc dùng nhóm cùng frame trong marble testing thay vì tự kéo giãn hình.
+
+## Complete sớm kéo theo teardown
+
+`take(3)` minh họa vì sao phải đọc cả output lẫn lifecycle upstream. `interval(500)` có thể phát mãi, nhưng output chỉ lấy ba giá trị rồi complete.
+
+```text
+source interval$:  ──(0)────(1)────(2)────(3)────…
+upstream sub:      ^─────────────────!
+output$:           ──(0)────(1)────(2)│
+                                      └─ complete sau value thứ ba
+```
+
+Dấu `!` cho biết `take(3)` unsubscribe khỏi `interval` ngay khi đã chuyển tiếp value thứ ba. Teardown của `interval` dọn timer; value `(3)` không xuất hiện trong execution này. `finalize()` ở output chạy khi subscription kết thúc.
+
+```ts
+import { finalize, interval, map, take } from 'rxjs';
+
+interval(500)
+  .pipe(
+    map((index) => `tick-${index}`),
+    take(3),
+    finalize(() => console.log('teardown: timer đã được dọn')),
+  )
+  .subscribe({
+    next: (value) => console.log('next:', value),
+    complete: () => console.log('complete'),
+  });
+```
+
+Sau khoảng 1,5 giây, output là:
+
+```text
+next: tick-0
+next: tick-1
+next: tick-2
+complete
+teardown: timer đã được dọn
+```
+
+Thời gian thực có thể xê dịch theo event loop, nhưng thứ tự lifecycle trên không đổi. `complete` của output đến từ `take(3)`; nó không có nghĩa producer `interval` tự hoàn tất. Operator đã đóng output rồi hủy upstream.
+
+## Error dừng execution
+
+Dấu lỗi không phải một viên bi mang “giá trị lỗi”. Nó đại diện cho error channel và kết thúc execution ngay tại đó.
+
+```text
+source$:  ──('{"id":1}')──('{broken}')──('{"id":3}')──│
+                         map(JSON.parse)
+output$:  ──({ id: 1 })──────✕
+```
+
+Khi `JSON.parse` ném lỗi ở value thứ hai, `map` chuyển exception sang error channel. Observer nhận `error`; value thứ ba không được xử lý và callback `complete` không chạy.
+
+```ts
+import { map, of } from 'rxjs';
+
+type User = { id: number };
+
+of('{"id":1}', '{broken}', '{"id":3}')
+  .pipe(map((text) => JSON.parse(text) as User))
+  .subscribe({
+    next: (user) => console.log('next:', user.id),
+    error: (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.log('error:', message);
+    },
+    complete: () => console.log('complete'),
+  });
+```
+
+Kết quả có dạng:
+
+```text
+next: 1
+error: ...
+```
+
+Nội dung message tùy JavaScript runtime, nhưng diagram khẳng định được hai điều: không có `next: 3` và không có `complete`. Nếu dùng `catchError`, hãy vẽ Observable thay thế thành một nhánh mới; execution đã error không “sống lại”.
+
+## Ví dụ thực tế hủy request tìm kiếm cũ
+
+Hình dung ô tìm kiếm nhận `r`, rồi 100 ms sau nhận `rxjs`. Request đầu cần 400 ms, request sau cần 200 ms. Với `switchMap`, query mới hủy inner subscription cũ để kết quả cũ không ghi đè kết quả mới.
+
+```text
+time:          0 ms        100 ms          300 ms        500 ms
+queries$:      (r)─────────(rxjs)────────────────────────│
+request "r":  ^───────────!········(kết quả bị hủy)
+request "rxjs":            ^────────(kết quả)│
+output$:       ──────────────────────(kết quả)───────────│
+```
+
+Dấu `!` quan trọng hơn viên bi bị gạch bỏ: nó nói rằng inner Observable cho `r` đã teardown ở 100 ms. `switchMap` không chỉ “bỏ qua kết quả khi nó tới”; nó unsubscribe inner cũ ngay khi outer phát query mới. Producer có thực sự hủy network request hay không còn phụ thuộc Observable bọc API có teardown request hay chỉ ngừng chuyển notification.
+
+Ví dụ sau dùng `timer()` để mô phỏng độ trễ. Các con số là dữ liệu minh họa, không phải benchmark:
+
+```ts
+import { finalize, map, Subject, switchMap, timer } from 'rxjs';
+
+function searchApi(query: string) {
+  const latency = query === 'r' ? 400 : 200;
+
+  return timer(latency).pipe(
+    map(() => `Kết quả cho ${query}`),
+    finalize(() => console.log('teardown:', query)),
+  );
+}
+
+const queries$ = new Subject<string>();
+
+queries$
+  .pipe(switchMap((query) => searchApi(query)))
+  .subscribe({
+    next: (result) => console.log('next:', result),
+    complete: () => console.log('complete'),
+  });
+
+queries$.next('r');
+setTimeout(() => queries$.next('rxjs'), 100);
+setTimeout(() => queries$.complete(), 500);
+```
+
+Kết quả theo thứ tự, với mốc thời gian thực chỉ xấp xỉ:
+
+```text
+teardown: r
+next: Kết quả cho rxjs
+teardown: rxjs
+complete
+```
+
+`finalize` của `r` chạy do unsubscribe; `finalize` của `rxjs` chạy do inner complete bình thường. Output chỉ complete khi outer `queries$` complete và không còn inner đang chạy. Nếu nghiệp vụ cần mọi request hoàn tất, `switchMap` là lựa chọn sai; hãy so sánh các flattening strategy trong bài [switchMap](/docs/higher-order-observables/switch-map) và các bài cùng nhóm.
+
+## Marble minh họa và marble testing khác nhau thế nào
+
+Hai loại diagram cùng kể một câu chuyện, nhưng không có cùng mức chính xác:
+
+| Mục đích | Diagram minh họa | Chuỗi của `TestScheduler.run()` |
+| --- | --- | --- |
+| Thời gian | Có thể chỉ mang tính tương đối | Mỗi frame được parser tính chính xác; trong `run()`, một frame là một virtual millisecond |
+| Value | Thường là vòng tròn có nhãn | Ký tự chữ hoặc số, ánh xạ qua object `values` khi cần |
+| Complete | Vạch đứng `│` hoặc `|` | `|` |
+| Error | Dấu `✕` hoặc `X` | `#` |
+| Cùng thời điểm | Vẽ cùng cột | Nhóm bằng `(...)` |
+| Subscription | Chú thích hoặc `^` và `!` | `^` và `!` trong subscription diagram; `^` còn đánh dấu zero frame của hot Observable |
+
+Ví dụ chuỗi marble testing:
+
+```text
+source:    --a--b--|
+expected:  --x--y--|
+values:    a=1, b=2, x=10, y=20
+```
+
+Trong chuỗi dành cho `TestScheduler`, `-` là một frame, `|` là complete và `#` là error. Whitespace được bỏ qua trong `run()` nên có thể dùng để căn dòng. Đừng sao chép ký hiệu `✕`, vòng tròn hay mũi tên từ hình minh họa vào test rồi mong parser hiểu chúng.
+
+<Callout type="warn" title="Đừng biến mọi diagram thành đồng hồ thật">
+  Marble testing dùng virtual time của RxJS scheduler. Nó không tự kiểm soát Promise, `fetch` hoặc mọi API async của JavaScript. Nếu pipeline đi qua cơ chế không được `TestScheduler` virtualize, hãy tách dependency hoặc dùng kiểu test async phù hợp.
+</Callout>
+
+Bài [Marble testing](/docs/testing/marble-testing) đi vào syntax và assertion; bài [TestScheduler](/docs/testing/test-scheduler) giải thích virtual time. Ở giai đoạn này, mục tiêu là đọc đúng lifecycle trước khi viết test string.
+
+## Khi nào nên dùng marble diagram
+
+Marble hữu ích nhất khi **thời gian hoặc quan hệ giữa nhiều stream làm code khó suy luận**. Mình sẽ phác diagram trước khi chọn giữa `switchMap`, `concatMap`, `mergeMap` và `exhaustMap`; khi debug `debounceTime` hoặc `timeout`; và khi cần thống nhất expected behavior với đồng đội trước khi viết test.
+
+Với một pipeline đồng bộ chỉ có `map` đơn giản, diagram có thể thừa. Log trong [Playground và debug](/docs/bat-dau/playground-va-debug) sẽ nhanh hơn. Ngược lại, nếu diagram có quá nhiều payload lớn, hãy đặt ký hiệu ngắn như `a`, `b`, `c` rồi thêm bảng ánh xạ thay vì nhét cả object vào từng viên bi.
+
+Một diagram tốt nên ghi rõ:
+
+- nguồn nào cold, hot hoặc shared nếu điều đó ảnh hưởng kết quả;
+- thời điểm subscribe và unsubscribe khi không bắt đầu hoặc kết thúc cùng timeline;
+- thang đo khi khoảng cách là yêu cầu nghiệp vụ;
+- terminal event của mỗi dòng;
+- ý nghĩa của ký hiệu value nếu nhãn không tự giải thích;
+- inner Observable và cửa sổ subscription của nó với higher-order stream.
+
+## Những bẫy thường gặp
+
+1. **Chỉ đếm value mà quên terminal event.** `--a--b--|` và `--a--b--#` có cùng hai value nhưng lifecycle, cleanup và hành vi downstream khác hẳn.
+2. **Cho rằng khoảng cách luôn là milliseconds.** Trên hình minh họa, nó có thể chỉ là tương đối. Trong marble test, nó là frame hoặc time progression syntax được parser hiểu.
+3. **Vẽ output complete nhưng để upstream chạy vô hạn mà không giải thích.** Operator như `take` phải unsubscribe upstream; hãy vẽ `!` hoặc chú thích teardown.
+4. **Xem unsubscribe là complete.** Cả hai đóng subscription, nhưng unsubscribe không gọi complete handler của Observer. Dùng `finalize()` cho cleanup cần chạy ở cả complete, error và hủy.
+5. **Bỏ qua điểm subscribe của hot Observable.** Value phát trước khi subscribe thường không được nhận, trừ khi cơ chế replay lưu và phát lại nó. Đọc thêm [Cold và hot Observable](/docs/observable-subscription/cold-va-hot).
+6. **Vẽ `switchMap` như filter kết quả muộn.** Hành vi cốt lõi là unsubscribe inner trước đó khi inner mới đến. Việc producer bên dưới có abort công việc vật lý hay không phụ thuộc teardown của nguồn.
+7. **Tin rằng diagram mô tả scheduler hoặc thread dù không ghi chú.** Marble thể hiện thứ tự notification; muốn khẳng định sync, microtask, macrotask hay scheduler nào, bạn phải ghi rõ hoặc kiểm tra code.
+8. **Dùng syntax test như hình trang trí rồi chỉnh spacing tùy ý.** Một ký tự thêm vào có thể đổi frame. Khi viết test, để các hằng marble cạnh nhau và căn cột có chủ đích.
+
+## Bài tập tự kiểm tra
+
+Thử đọc diagram này trước khi xem đáp án:
+
+```text
+source$:  ──(1)────(2)────(3)────(4)────…
+                 filter(value > 1)
+after filter:──────(2)────(3)────(4)────…
+                 take(2)
+output$:  ─────────(2)────(3)│
+upstream: ^────────────────!
+```
+
+Bạn nên trả lời được:
+
+- Output phát `2`, rồi `3`.
+- `1` bị `filter` loại, nên không được tính vào quota của `take(2)`.
+- Output complete ngay sau `3` dù source có thể còn phát.
+- `take(2)` unsubscribe upstream; `4` không đi qua execution này.
+- Teardown upstream và mọi `finalize()` trong subscription chain được chạy.
+
+Nếu một trong các câu trên còn mơ hồ, hãy quay lại quy trình năm bước và đọc từng dòng riêng. Sau đó tự đổi `take(2)` thành `take(1)` hoặc cho source error trước `(3)` rồi vẽ lại output; đó là cách nhanh nhất để kiểm tra mental model.
+
+## Nguồn tham khảo
+
+- [RxJS 7.x — Operators guide](https://github.com/ReactiveX/rxjs/blob/7.x/docs_app/content/guide/operators.md): định nghĩa marble diagram, pipeable operator và quan hệ input/output Observable.
+- [RxJS 7.x — Marble testing guide](https://github.com/ReactiveX/rxjs/blob/7.x/docs_app/content/guide/testing/marble-testing.md): syntax chính thức của `TestScheduler.run()`, frame, value, complete, error và subscription marble.
+- [RxJS 7.x — mã nguồn `take`](https://github.com/ReactiveX/rxjs/blob/7.x/src/internal/operators/take.ts): complete output sau đủ số value và dừng nhận từ source.
+- [RxJS 7.x — mã nguồn `switchMap`](https://github.com/ReactiveX/rxjs/blob/7.x/src/internal/operators/switchMap.ts): unsubscribe inner cũ khi outer phát value mới.
+- [RxJS 7.x — mã nguồn `finalize`](https://github.com/ReactiveX/rxjs/blob/7.x/src/internal/operators/finalize.ts): callback chạy khi complete, error hoặc unsubscribe.
+
+## Học tiếp
+
+<Cards>
+  <Card title="Pipe và operator" href="/docs/bat-dau/pipe-va-operator" description="Ghép operator thành pipeline và đọc quan hệ input/output trong code." />
+  <Card title="Vòng đời của stream" href="/docs/nen-tang/vong-doi-stream" description="Hiểu sâu next, error, complete, unsubscribe và teardown." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Chuyển timeline thành test assertion bằng marble syntax." />
+  <Card title="TestScheduler" href="/docs/testing/test-scheduler" description="Chạy pipeline theo virtual time trong test RxJS." />
+</Cards>

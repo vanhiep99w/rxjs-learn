@@ -3,8 +3,385 @@ title: Playground và debug
 description: Thiết lập nơi thử nghiệm và quan sát dữ liệu đi qua stream.
 ---
 
-Trang này sẽ trình bày **Playground và debug** trong bối cảnh sử dụng RxJS thực tế. Nội dung chi tiết, ví dụ và lưu ý thiết kế sẽ được bổ sung ở lượt viết chuyên sâu.
+Một pipeline RxJS không trả về cả kết quả ngay lập tức để bạn đặt `console.log` ở cuối hàm. Giá trị xuất hiện theo thời gian, lỗi có thể kết thúc stream, còn `unsubscribe()` có thể dừng mọi thứ mà không phát `complete`. Vì vậy, một playground tốt cần giúp bạn nhìn thấy cả **dữ liệu** lẫn **vòng đời** của subscription.
 
-<Callout type="info">
-  Đây là trang placeholder. Hãy dùng lượt viết tài liệu chi tiết để hoàn thiện bài này.
+<Callout type="info" title="Phiên bản dùng trong bài">
+  Các ví dụ nhắm tới **RxJS 7.x ổn định** và dùng public API từ package `rxjs`. Cài bằng `npm install rxjs@7`; bài này không giả định API của RxJS 8.
 </Callout>
+
+## Mục lục
+
+- [Chọn playground phù hợp](#chọn-playground-phù-hợp)
+  - [Local TypeScript](#local-typescript)
+  - [Playground trên trình duyệt](#playground-trên-trình-duyệt)
+- [Mental model khi debug stream](#mental-model-khi-debug-stream)
+- [Dựng playground tối thiểu](#dựng-playground-tối-thiểu)
+- [Quan sát dữ liệu với tap](#quan-sát-dữ-liệu-với-tap)
+  - [Đặt probe trước và sau operator](#đặt-probe-trước-và-sau-operator)
+  - [Theo dõi error đúng vị trí](#theo-dõi-error-đúng-vị-trí)
+- [Quan sát lifecycle và teardown](#quan-sát-lifecycle-và-teardown)
+- [Ví dụ thực tế: tìm request bị hủy](#ví-dụ-thực-tế-tìm-request-bị-hủy)
+- [Quy trình debug có chủ đích](#quy-trình-debug-có-chủ-đích)
+- [Các bẫy thường gặp](#các-bẫy-thường-gặp)
+- [Khi console log không còn đủ](#khi-console-log-không-còn-đủ)
+- [Nguồn kiểm chứng](#nguồn-kiểm-chứng)
+- [Bước tiếp theo](#bước-tiếp-theo)
+
+## Chọn playground phù hợp
+
+Mình khuyên dùng một project TypeScript local làm playground mặc định. Bạn kiểm soát được phiên bản RxJS, chạy lại ví dụ bằng một lệnh và có thể đặt breakpoint trong DevTools hoặc IDE. Playground trên trình duyệt tiện hơn khi cần chia sẻ một lỗi nhỏ, nhưng URL hoặc dependency có thể thay đổi ngoài ý muốn.
+
+### Local TypeScript
+
+Chọn local khi bạn cần:
+
+- tái hiện đúng phiên bản dependency của ứng dụng;
+- xem source map và đặt breakpoint;
+- kiểm tra hành vi cleanup của timer, event listener hoặc request;
+- biến ví dụ đã ổn định thành test.
+
+Nếu chưa cài môi trường, xem [Cài đặt RxJS](/docs/bat-dau/cai-dat). Phần dưới dùng `tsx` để chạy trực tiếp file TypeScript, tránh thêm bước compile thủ công.
+
+### Playground trên trình duyệt
+
+StackBlitz hoặc CodeSandbox phù hợp để gửi một reproduction tối thiểu cho đồng đội. Hãy khóa dependency ở major `rxjs@7`, xóa code không liên quan và ghi rõ cách kích hoạt lỗi. Với bug phụ thuộc DOM, Network panel hoặc timing thật của browser, đây thường là lựa chọn nhanh nhất.
+
+<Callout type="warn" title="Đừng debug trên một reproduction quá lớn">
+  Nếu playground vẫn chứa framework, state management, HTTP client và hàng chục component, bạn chưa cô lập được lỗi. Hãy thay input thật bằng `of`, `Subject` hoặc `timer`, rồi thêm từng phần trở lại.
+</Callout>
+
+## Mental model khi debug stream
+
+Hãy xem mỗi `tap` như một đầu dò đặt trên đường ống. Đầu dò chỉ thấy notification đi qua **đúng vị trí đó**; nó không nhìn xuyên qua operator ở phía sau. Còn `subscribe()` là điểm bắt đầu execution của cold Observable và `unsubscribe()` gửi tín hiệu dừng ngược về source để teardown tài nguyên.
+
+```text
+Dữ liệu và terminal notification:
+
+Source ──► tap("trước") ──► operator ──► tap("sau") ──► Subscriber
+
+Yêu cầu dừng:
+
+Source cleanup ◄──────────── unsubscribe ◄──────────── Subscription
+```
+
+Ba kênh notification cần phân biệt:
+
+- `next(value)` mang giá trị và có thể xảy ra nhiều lần;
+- `error(error)` kết thúc stream do lỗi;
+- `complete()` kết thúc stream bình thường.
+
+`unsubscribe()` cũng dừng execution, nhưng **không phải** một `complete` notification. Vì thế callback `complete` trong `tap` hoặc Observer không chạy khi bạn chủ động hủy; `finalize` mới là nơi quan sát cả complete, error lẫn unsubscribe.
+
+## Dựng playground tối thiểu
+
+Tạo một thư mục riêng thay vì thử trực tiếp trong ứng dụng đang có nhiều side effect:
+
+```bash
+mkdir rxjs-playground
+cd rxjs-playground
+npm init -y
+npm install rxjs@7
+npm install --save-dev typescript tsx
+```
+
+Tạo file `playground.ts`:
+
+```ts
+import { map, of } from 'rxjs';
+
+const result$ = of(1, 2, 3).pipe(
+  map((value) => value * 10),
+);
+
+result$.subscribe({
+  next: (value) => console.log('next:', value),
+  error: (error: unknown) => console.error('error:', error),
+  complete: () => console.log('complete'),
+});
+```
+
+Chạy file:
+
+```bash
+npx tsx playground.ts
+```
+
+Kết quả:
+
+```text
+next: 10
+next: 20
+next: 30
+complete
+```
+
+`of` phát đồng bộ ba giá trị rồi complete, nên process kết thúc ngay. Nếu đổi source sang `interval`, process còn sống cho tới khi stream complete hoặc subscription được hủy. Khác biệt này là dấu hiệu đầu tiên để kiểm tra khi playground “chạy mãi không dừng”.
+
+## Quan sát dữ liệu với tap
+
+`tap` quan sát notification mà không biến đổi giá trị đi tiếp. Đây là operator phù hợp để log, đặt breakpoint hoặc ghi metric tạm thời; còn biến đổi dữ liệu vẫn nên nằm trong `map`, `filter` và các operator tương ứng.
+
+### Đặt probe trước và sau operator
+
+Ví dụ sau tạo một helper để mọi log đều có nhãn:
+
+```ts
+import { type MonoTypeOperatorFunction, map, of, tap } from 'rxjs';
+
+function debug<T>(label: string): MonoTypeOperatorFunction<T> {
+  return tap<T>({
+    next: (value) => console.log(`[${label}] next:`, value),
+    error: (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`[${label}] error:`, message);
+    },
+    complete: () => console.log(`[${label}] complete`),
+  });
+}
+
+of(1, 2).pipe(
+  debug('source'),
+  map((value) => value * 10),
+  debug('after map'),
+).subscribe({
+  next: (value) => console.log('[observer] next:', value),
+  complete: () => console.log('[observer] complete'),
+});
+```
+
+Kết quả:
+
+```text
+[source] next: 1
+[after map] next: 10
+[observer] next: 10
+[source] next: 2
+[after map] next: 20
+[observer] next: 20
+[source] complete
+[after map] complete
+[observer] complete
+```
+
+Thứ tự log cho thấy notification đi từ source qua từng operator tới Observer. Nếu giá trị đúng ở `source` nhưng sai ở `after map`, vùng cần đọc chỉ còn operator nằm giữa hai probe.
+
+`tap` không tự kích hoạt pipeline. Nếu bỏ `subscribe()`, ví dụ trên không in gì vì cold Observable chưa có consumer. Xem thêm [Subscribe và Observer](/docs/bat-dau/subscribe-observer) và [Pipe và operator](/docs/bat-dau/pipe-va-operator).
+
+### Theo dõi error đúng vị trí
+
+Vị trí của probe đặc biệt quan trọng với error. Trong ví dụ này, `map` ném lỗi khi gặp dữ liệu không hợp lệ:
+
+```ts
+import { finalize, map, of, tap } from 'rxjs';
+
+of('10', 'không-phải-số', '20').pipe(
+  tap((raw) => console.log('[raw]', raw)),
+  map((raw) => {
+    const value = Number(raw);
+
+    if (Number.isNaN(value)) {
+      throw new Error(`Không thể đổi "${raw}" thành số`);
+    }
+
+    return value;
+  }),
+  tap({
+    next: (value) => console.log('[parsed]', value),
+    error: (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('[parse error]', message);
+    },
+  }),
+  finalize(() => console.log('[pipeline] finalized')),
+).subscribe({
+  next: (value) => console.log('[observer]', value),
+  error: (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error('[observer error]', message);
+  },
+});
+```
+
+Kết quả:
+
+```text
+[raw] 10
+[parsed] 10
+[observer] 10
+[raw] không-phải-số
+[parse error] Không thể đổi "không-phải-số" thành số
+[observer error] Không thể đổi "không-phải-số" thành số
+[pipeline] finalized
+```
+
+Giá trị `'20'` không bao giờ được xử lý vì error là terminal notification. Probe trước `map` thấy input gây lỗi, còn probe sau `map` thấy error do chính `map` tạo ra. Đây là lý do đặt hai probe quanh operator thường hữu ích hơn rải log ngẫu nhiên.
+
+<Callout type="warn" title="tap không hoàn toàn vô hại nếu callback ném lỗi">
+  `tap` không sửa giá trị, nhưng exception đồng bộ ném ra trong callback của `tap` sẽ trở thành error của Observable trả về. Chỉ log hoặc quan sát trong `tap`; đừng đặt business logic có thể thất bại vào đó.
+</Callout>
+
+## Quan sát lifecycle và teardown
+
+Log giá trị chưa đủ để tìm timer hoặc event listener bị rò rỉ. Bạn cần biết lúc source bắt đầu, lúc subscription bị hủy và teardown có thực sự chạy hay không.
+
+```ts
+import { Observable, finalize, tap } from 'rxjs';
+
+const counter$ = new Observable<number>((subscriber) => {
+  console.log('[source] start');
+  let value = 0;
+
+  const timerId = setInterval(() => {
+    subscriber.next(value);
+    value += 1;
+  }, 500);
+
+  return () => {
+    clearInterval(timerId);
+    console.log('[source] teardown');
+  };
+});
+
+const subscription = counter$.pipe(
+  tap({
+    next: (value) => console.log('[tap] next:', value),
+    complete: () => console.log('[tap] complete'),
+  }),
+  finalize(() => console.log('[pipeline] finalize')),
+).subscribe({
+  next: (value) => console.log('[observer] next:', value),
+  complete: () => console.log('[observer] complete'),
+});
+
+setTimeout(() => {
+  console.log('[app] unsubscribe');
+  subscription.unsubscribe();
+}, 1_200);
+```
+
+Kết quả điển hình:
+
+```text
+[source] start
+[tap] next: 0
+[observer] next: 0
+[tap] next: 1
+[observer] next: 1
+[app] unsubscribe
+[source] teardown
+[pipeline] finalize
+```
+
+Không có dòng `complete`: source này không gọi `subscriber.complete()`, và `unsubscribe()` không giả lập complete. Tuy vậy, teardown của source vẫn xóa timer và `finalize` vẫn chạy. Nếu bỏ `clearInterval(timerId)`, timer tiếp tục giữ tài nguyên dù subscriber đã đóng; đó là bug ở implementation của custom Observable, không phải bug của `unsubscribe()`.
+
+Trong code ứng dụng, dùng `finalize` cho cleanup hoặc để xác nhận cleanup đã xảy ra. Nếu cần biết stream kết thúc theo nhánh nào, log `error` và `complete` bằng `tap`, rồi dùng `finalize` cho phần luôn phải chạy. Phần chuyên sâu nằm ở [Subscription và teardown](/docs/observable-subscription/subscription-teardown) và [`finalize`](/docs/loi-hoan-tat/finalize).
+
+## Ví dụ thực tế: tìm request bị hủy
+
+Giả sử ô tìm kiếm phát query mới trước khi request cũ trả về. `switchMap` hủy inner subscription cũ; nếu chỉ log kết quả, bạn chỉ thấy một request “biến mất”. Đặt `finalize` bên trong inner Observable sẽ làm lần hủy đó lộ ra.
+
+Ví dụ dùng `Subject` thay cho UI và `timer` thay cho HTTP để timing có thể tái hiện mà không cần server:
+
+```ts
+import {
+  Subject,
+  debounceTime,
+  distinctUntilChanged,
+  finalize,
+  map,
+  switchMap,
+  tap,
+  timer,
+} from 'rxjs';
+
+const query$ = new Subject<string>();
+
+query$.pipe(
+  tap((query) => console.log(`[input] ${query}`)),
+  debounceTime(300),
+  distinctUntilChanged(),
+  tap((query) => console.log(`[request] bắt đầu: ${query}`)),
+  switchMap((query) =>
+    timer(500).pipe(
+      map(() => `Kết quả cho "${query}"`),
+      finalize(() => console.log(`[request] kết thúc hoặc bị hủy: ${query}`)),
+    ),
+  ),
+).subscribe((result) => console.log(`[view] ${result}`));
+
+query$.next('rxjs');
+setTimeout(() => query$.next('rxjs 7'), 400);
+```
+
+Timeline xấp xỉ:
+
+```text
+0 ms    [input] rxjs
+300 ms  [request] bắt đầu: rxjs
+400 ms  [input] rxjs 7
+700 ms  [request] bắt đầu: rxjs 7
+700 ms  [request] kết thúc hoặc bị hủy: rxjs
+1200 ms [view] Kết quả cho "rxjs 7"
+1200 ms [request] kết thúc hoặc bị hủy: rxjs 7
+```
+
+Request đầu đã bắt đầu ở khoảng 300 ms. Khi query thứ hai qua `debounceTime` ở khoảng 700 ms, `switchMap` unsubscribe inner stream đầu trước khi timer của nó kịp phát ở khoảng 800 ms. `finalize` chạy cho cả lần bị hủy lẫn lần complete bình thường, nên nhãn cố ý viết “kết thúc hoặc bị hủy”.
+
+Với HTTP thật, hãy kiểm tra thêm Network panel: log cho biết RxJS đã unsubscribe, còn Network panel cho biết client có thực sự abort request hay chỉ bỏ qua response. Khả năng abort phụ thuộc Observable/HTTP client tạo request và teardown mà nó cung cấp.
+
+## Quy trình debug có chủ đích
+
+Khi một stream không phát giá trị mong đợi, đi theo thứ tự này sẽ nhanh hơn thêm `console.log` khắp nơi:
+
+1. **Rút gọn source.** Thay DOM, WebSocket hoặc API bằng `of`, `Subject`, `timer` hay một custom Observable nhỏ.
+2. **Xác nhận có subscription.** Đặt log ở lúc source khởi tạo hoặc ngay trước `subscribe()`; không có subscription thì cold pipeline không chạy.
+3. **Đặt probe tại ranh giới.** Thêm `tap` trước và sau operator bị nghi ngờ, mỗi probe có nhãn riêng.
+4. **Theo dõi đủ ba kênh.** Log `next`, `error`, `complete`; thêm `finalize` nếu cancellation hoặc cleanup liên quan.
+5. **Kiểm tra số lần subscribe.** Hai subscription vào cold Observable thường chạy source hai lần, nên request hoặc log cũng lặp lại.
+6. **Cố định thời gian.** Với `debounceTime`, `delay`, retry hoặc race condition, chuyển reproduction thành marble test thay vì dựa vào timer thật.
+7. **Xóa instrumentation tạm.** Giữ helper debug ở development hoặc sau feature flag; đừng để dữ liệu nhạy cảm lọt vào log production.
+
+<Callout type="idea" title="Mặc định nên làm gì?">
+  Dùng `tap` có nhãn ở hai phía của vùng đáng ngờ, cộng một `finalize` ở ranh giới cần theo dõi. Khi bug phụ thuộc timing, dừng thêm log và chuyển sang virtual time hoặc marble test.
+</Callout>
+
+## Các bẫy thường gặp
+
+| Bẫy | Điều thực sự xảy ra | Cách kiểm tra |
+|---|---|---|
+| Không thấy log trong `tap` | Pipeline chưa được subscribe, hoặc operator trước đó đã lọc/chặn giá trị | Log lúc subscribe và đặt probe gần source hơn |
+| Log xuất hiện hai lần | Cold source có nhiều subscription, hoặc môi trường development chạy lifecycle nhiều lần | Gắn ID cho từng subscription và đếm nơi gọi `subscribe()` |
+| Có `finalize` nhưng không có `complete` | Stream bị error hoặc bị unsubscribe | Thêm handler `error` và `complete` để phân biệt terminal notification |
+| Object trong console trông như bị đổi “về sau” | DevTools có thể hiển thị reference ở trạng thái mới nhất | Với plain data, log một snapshot như `structuredClone(value)` trong lúc debug |
+| Thêm `tap` làm stream lỗi | Callback trong `tap` đã ném exception | Bọc hoặc loại bỏ logic có thể throw khỏi callback debug |
+| Process Node không thoát | Timer, socket hoặc listener chưa được teardown | Log lúc source start, teardown và `finalize`; kiểm tra resource còn mở |
+| Log từ nhiều stream xen nhau | Các source bất đồng bộ chạy đồng thời | Thêm nhãn request/subscription và timestamp thay vì chỉ log value |
+
+Đừng dùng `tap` để âm thầm sửa object, cập nhật state cốt lõi hoặc điều khiển flow. Side effect như vậy khiến output phụ thuộc thứ tự subscription và làm reproduction khó tin cậy. Nếu thao tác thay đổi dữ liệu, hãy biểu diễn nó bằng operator rõ ràng; nếu thao tác là UI effect, log hay metric, hãy cô lập và đặt tên cho nó.
+
+## Khi console log không còn đủ
+
+Console phù hợp để định vị vùng lỗi, nhưng không phải công cụ chứng minh hành vi theo thời gian:
+
+- Dùng **breakpoint** hoặc câu lệnh `debugger` tạm trong callback `tap` khi cần xem call stack và closure.
+- Dùng **Network panel** để xác nhận request có bị abort, bị gửi lặp hoặc trả lỗi hay không.
+- Dùng **Performance/Memory tools** khi nghi timer, listener hoặc subscription giữ object lâu hơn dự kiến.
+- Dùng **marble test với virtual time** khi cần khẳng định chính xác emission, completion và unsubscription.
+- Dùng instrumentation có cấu trúc cho production; xem [Observability](/docs/patterns-production/observability) thay vì để `console.log` rải rác.
+
+Một reproduction bằng timer thật có thể đủ để hiểu bug, nhưng test timing bằng thời gian thật thường chậm và dễ flaky. Khi đã tìm ra giả thuyết, hãy chuyển nó thành [Marble testing](/docs/testing/marble-testing) để khóa hành vi.
+
+## Nguồn kiểm chứng
+
+- [RxJS API: `tap`](https://rxjs.dev/api/index/function/tap)
+- [RxJS API: `finalize`](https://rxjs.dev/api/index/function/finalize)
+- [RxJS Guide: Subscription](https://rxjs.dev/guide/subscription)
+- [RxJS package trên npm](https://www.npmjs.com/package/rxjs)
+
+## Bước tiếp theo
+
+<Cards>
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Hiểu cách hủy execution và giải phóng tài nguyên." />
+  <Card title="Marble testing" href="/docs/testing/marble-testing" description="Kiểm tra pipeline theo virtual time thay vì chờ timer thật." />
+  <Card title="Memory leak" href="/docs/troubleshooting/memory-leak" description="Tìm subscription hoặc resource không được giải phóng." />
+</Cards>

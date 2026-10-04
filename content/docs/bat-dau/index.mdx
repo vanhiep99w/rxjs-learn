@@ -3,21 +3,171 @@ title: Bắt đầu
 description: Cài đặt RxJS và xây dựng những stream đầu tiên.
 ---
 
-Đây là trang khung cho nhóm **Bắt đầu** trong lộ trình học RxJS.
+Bạn đã hiểu RxJS dùng để mô tả dữ liệu thay đổi theo thời gian, nhưng từ mental model đến một pipeline chạy được vẫn còn vài mảnh ghép: cài package thế nào, `subscribe` ở đâu, đọc timeline ra sao và nhìn vào đâu khi output không đúng.
+
+Nhóm **Bắt đầu** nối các mảnh đó bằng một vòng học ngắn: thiết lập môi trường, đọc stream, chạy stream rồi quan sát lifecycle của nó. Đích đến không phải là thuộc nhiều operator; bạn cần tự viết và giải thích được một pipeline nhỏ trước khi sang phần chuyên sâu.
+
+<Callout type="info" title="Phạm vi phiên bản">
+  Nội dung trong nhóm này dùng public API ổn định của **RxJS 7.8.x** và TypeScript. Các ví dụ import trực tiếp từ `rxjs`, không dựa vào API thử nghiệm của RxJS 8.
+</Callout>
 
 ## Mục lục
 
-- [Phạm vi dự kiến](#phạm-vi-dự-kiến)
-- [Các bài trong nhóm](#các-bài-trong-nhóm)
+- [Sau nhóm này bạn làm được gì](#sau-nhóm-này-bạn-làm-được-gì)
+- [Nhìn trước một pipeline hoàn chỉnh](#nhìn-trước-một-pipeline-hoàn-chỉnh)
+  - [Code TypeScript](#code-typescript)
+  - [Đọc pipeline theo luồng dữ liệu](#đọc-pipeline-theo-luồng-dữ-liệu)
+- [Bản đồ năm bài bắt đầu](#bản-đồ-năm-bài-bắt-đầu)
+- [Cách học nhóm này](#cách-học-nhóm-này)
+  - [Nếu đây là pipeline đầu tiên của bạn](#nếu-đây-là-pipeline-đầu-tiên-của-bạn)
+  - [Nếu bạn đã từng dùng RxJS](#nếu-bạn-đã-từng-dùng-rxjs)
+- [Checklist hoàn thành](#checklist-hoàn-thành)
+- [Những bẫy nên tránh ngay từ đầu](#những-bẫy-nên-tránh-ngay-từ-đầu)
+- [Đi tiếp sau nhóm Bắt đầu](#đi-tiếp-sau-nhóm-bắt-đầu)
+- [Nguồn tham khảo](#nguồn-tham-khảo)
 
-## Phạm vi dự kiến
+## Sau nhóm này bạn làm được gì
 
-Nhóm này đưa bạn từ cài đặt đến chạy, quan sát và debug một pipeline RxJS nhỏ.
+Kết thúc năm bài, bạn nên có thể tự làm những việc sau mà không cần sao chép nguyên một snippet có sẵn:
 
-## Các bài trong nhóm
+- cài `rxjs` vào project TypeScript và kiểm tra import hoạt động;
+- nhận ra source, operator, Observable đầu ra và Observer trong một pipeline;
+- đọc được `next`, `error`, `complete` cùng chiều thời gian trên marble diagram;
+- dùng `pipe()` để ghép các phép biến đổi mà không sửa source Observable;
+- subscribe bằng một Observer có chủ đích, rồi xác định khi nào execution kết thúc;
+- dùng log hoặc `tap` để quan sát pipeline mà không biến debug thành logic nghiệp vụ.
 
-- **[Cài đặt RxJS](/docs/bat-dau/cai-dat)** — Thiết lập RxJS với npm, TypeScript và môi trường thực hành.
-- **[Marble diagram](/docs/bat-dau/marble-diagram)** — Đọc timeline, emission, completion và error bằng ký hiệu marble.
-- **[Subscribe và Observer](/docs/bat-dau/subscribe-observer)** — Nhận giá trị, lỗi và tín hiệu hoàn tất từ stream.
-- **[Pipe và operator](/docs/bat-dau/pipe-va-operator)** — Ghép các operator thành pipeline có thể đọc và tái sử dụng.
-- **[Playground và debug](/docs/bat-dau/playground-va-debug)** — Thiết lập nơi thử nghiệm và quan sát dữ liệu đi qua stream.
+Đây là chuẩn đầu ra thực dụng hơn việc nhớ tên operator. Khi một stream cho kết quả sai, sáu kỹ năng trên giúp bạn khoanh vùng vấn đề trước khi thêm operator mới.
+
+## Nhìn trước một pipeline hoàn chỉnh
+
+Ví dụ dưới đây là hình dạng bạn sẽ gặp xuyên suốt nhóm này. Source phát bốn số, `filter` giữ số chẵn, `map` đổi chúng thành nhãn, còn Observer nhận các notification cuối pipeline.
+
+### Code TypeScript
+
+```ts
+import { filter, map, of } from 'rxjs';
+
+const source$ = of(1, 2, 3, 4);
+
+const labels$ = source$.pipe(
+  filter((value) => value % 2 === 0),
+  map((value) => `item-${value}`),
+);
+
+labels$.subscribe({
+  next: (value) => console.log('next:', value),
+  error: (error: unknown) => console.error('error:', error),
+  complete: () => console.log('complete'),
+});
+```
+
+Kết quả:
+
+```text
+next: item-2
+next: item-4
+complete
+```
+
+`of()` phát các giá trị này đồng bộ rồi complete. Observable không mặc định là “tác vụ chạy nền”; timing phụ thuộc source và scheduler được dùng.
+
+### Đọc pipeline theo luồng dữ liệu
+
+```text
+source$       (1) ── (2) ── (3) ── (4) ── complete
+                       │               │
+filter số chẵn         (2)             (4)
+                       │               │
+map thành nhãn     "item-2"        "item-4"
+                       │               │
+Observer          next(value)      next(value) ── complete
+```
+
+Có thể đọc ví dụ theo bốn bước:
+
+1. `of(1, 2, 3, 4)` tạo source Observable. Chưa có execution nào chạy ở thời điểm khai báo.
+2. `pipe(...)` trả về `labels$`, một Observable mới; nó không sửa `source$`.
+3. `subscribe(...)` bắt đầu execution, nên source mới phát dữ liệu qua từng operator.
+4. Source complete sau `4`; completion đi qua pipeline và gọi callback `complete` của Observer.
+
+Hãy tách **định nghĩa pipeline** khỏi **thời điểm chạy pipeline**. Đây là khác biệt nhỏ trên code nhưng rất quan trọng khi bạn gặp nhiều subscription, HTTP request hoặc event stream sống lâu.
+
+<Callout type="idea" title="Cách đọc code RxJS">
+  Đi từ source đến `pipe()` để theo dõi dữ liệu đi xuôi, rồi tìm `subscribe()` để biết ai khởi động và sở hữu execution. Cuối cùng, kiểm tra đường kết thúc: complete, error hay unsubscribe.
+</Callout>
+
+## Bản đồ năm bài bắt đầu
+
+Mỗi bài thêm một kỹ năng vào cùng pipeline, nên thứ tự dưới đây có chủ đích:
+
+| Bài | Câu hỏi bài giải quyết | Kết quả bạn cần đạt |
+| --- | --- | --- |
+| [Cài đặt RxJS](/docs/bat-dau/cai-dat) | Package, TypeScript và script chạy ví dụ được thiết lập thế nào? | Chạy được một file import public API từ `rxjs`. |
+| [Marble diagram](/docs/bat-dau/marble-diagram) | Giá trị, thời gian, complete, error và unsubscribe được biểu diễn ra sao? | Đọc được lifecycle của một stream trước khi nhìn code. |
+| [Subscribe và Observer](/docs/bat-dau/subscribe-observer) | Ai nhận notification và điều gì xảy ra khi subscribe? | Viết Observer rõ ba channel `next`, `error`, `complete`. |
+| [Pipe và operator](/docs/bat-dau/pipe-va-operator) | Làm sao ghép nhiều phép biến đổi mà pipeline vẫn đọc được? | Tách source, transformation và side effect đúng vai trò. |
+| [Playground và debug](/docs/bat-dau/playground-va-debug) | Khi output sai hoặc stream không kết thúc, quan sát ở đâu? | Dùng log, `tap` và teardown signal để lần theo execution. |
+
+Nếu một bài chi tiết vẫn đang được bổ sung, bạn có thể dùng ví dụ trên làm bài thực hành tối thiểu: chạy nó, dự đoán output trước, rồi thay đổi từng phần và giải thích kết quả.
+
+## Cách học nhóm này
+
+### Nếu đây là pipeline đầu tiên của bạn
+
+Đi theo thứ tự trong bảng. Sau bài cài đặt, giữ một file playground duy nhất và sửa nó qua từng bài; như vậy bạn quan sát được kiến thức mới thay đổi cùng một execution ra sao, thay vì mỗi lần lại bắt đầu bằng một ví dụ không liên quan.
+
+Sau mỗi thay đổi, làm ba việc: viết output dự đoán, chạy code, rồi giải thích điểm khác nhau. Nếu chỉ chạy đến khi “thấy đúng”, bạn dễ bỏ qua lý do stream complete, error hoặc còn mở.
+
+### Nếu bạn đã từng dùng RxJS
+
+Hãy bắt đầu ở chỗ thường làm bạn phải đoán. Nếu code chạy nhưng timeline khó hiểu, đọc [Marble diagram](/docs/bat-dau/marble-diagram). Nếu bạn hay viết `subscribe(value => ...)` rồi quên error và cleanup, chuyển thẳng đến [Subscribe và Observer](/docs/bat-dau/subscribe-observer). Nếu pipeline chỉ khó khi debug, dùng bài playground như checklist quan sát.
+
+Dù đã có kinh nghiệm, hãy chạy lại ví dụ tối thiểu một lần trong chính môi trường của project. Nó tách lỗi setup khỏi lỗi tư duy pipeline, nên bạn không phải debug hai vấn đề cùng lúc.
+
+## Checklist hoàn thành
+
+Đừng đánh dấu nhóm này là xong chỉ vì code đã in ra hai dòng. Hãy tự kiểm tra:
+
+- [ ] Tôi chỉ ra được source, từng operator, output Observable và Observer trong ví dụ.
+- [ ] Tôi giải thích được vì sao `1` và `3` không tới Observer.
+- [ ] Tôi biết chính xác lời gọi nào bắt đầu execution.
+- [ ] Tôi phân biệt được `complete`, `error` và consumer gọi `unsubscribe()`.
+- [ ] Tôi có thể vẽ timeline của ví dụ bằng ký hiệu marble đơn giản.
+- [ ] Tôi biết chèn `tap` ở đâu để quan sát trước và sau một operator.
+- [ ] Tôi chạy được ví dụ trong playground mà không cần sửa import theo kiểu nội bộ của package.
+
+Nếu còn vướng một mục, quay lại bài tương ứng trong bảng. Không cần học thêm operator cho đến khi vòng đời của pipeline nhỏ này đã rõ.
+
+## Những bẫy nên tránh ngay từ đầu
+
+- **Cho rằng tạo Observable là chạy ngay.** Nhiều Observable là lazy; ví dụ trên chỉ thực thi khi có `subscribe()`.
+- **Cho rằng mọi Observable đều bất đồng bộ.** `of()` có thể phát và complete ngay trong cùng call stack. Đừng suy timing chỉ từ kiểu `Observable`.
+- **Nhét business logic vào `subscribe`.** Subscriber nên là boundary nhận kết quả hoặc tạo side effect. Phép biến đổi dữ liệu thường dễ đọc, tái sử dụng và test hơn khi nằm trong `pipe()`.
+- **Dùng `tap` để thay đổi dữ liệu.** `tap` phù hợp để log hoặc quan sát side effect; dùng `map` khi output cần giá trị mới.
+- **Chỉ viết callback `next` rồi quên đường kết thúc.** Một demo ngắn có thể ổn, nhưng code thật cần quyết định rõ error đi đâu và tài nguyên được dọn lúc nào.
+- **Subscribe lồng nhau để nối hai tác vụ.** Cách này sớm làm error handling và teardown bị chia đôi. Khi sang higher-order Observable, hãy chọn flattening operator theo concurrency policy thay vì nested subscribe.
+
+<Callout type="warn" title="Log không chứng minh được cleanup">
+  Không còn output chưa chắc execution đã kết thúc. Với timer, DOM event hoặc WebSocket, hãy kiểm tra complete, error, unsubscribe và teardown thay vì chỉ nhìn các dòng `next`.
+</Callout>
+
+## Đi tiếp sau nhóm Bắt đầu
+
+Sau khi hoàn thành checklist, bước hợp lý nhất là đi sâu vào cách Observable tạo execution và cách Subscription dọn tài nguyên. Nếu mental model về lifecycle vẫn chưa chắc, ôn phần nền tảng trước khi học thêm operator.
+
+<Cards>
+  <Card title="Cài đặt RxJS" href="/docs/bat-dau/cai-dat" description="Thiết lập môi trường TypeScript và chạy ví dụ đầu tiên." />
+  <Card title="Marble diagram" href="/docs/bat-dau/marble-diagram" description="Nhìn value, thời gian và terminal signal trên cùng timeline." />
+  <Card title="Observable & Subscription" href="/docs/observable-subscription" description="Đi sâu vào execution, producer và teardown tài nguyên." />
+  <Card title="Vòng đời của stream" href="/docs/nen-tang/vong-doi-stream" description="Ôn lại contract của next, error, complete và unsubscribe." />
+</Cards>
+
+## Nguồn tham khảo
+
+- [RxJS — Introduction](https://rxjs.dev/guide/overview) — vai trò của Observable, Observer, Subscription và operators trong thư viện.
+- [RxJS — Observable](https://rxjs.dev/guide/observable) — tính lazy của execution, notification contract và teardown.
+- [RxJS — Operators](https://rxjs.dev/guide/operators) — cách pipeable operator nhận một Observable và trả về Observable mới mà không sửa source.
+- [RxJS — Observer](https://rxjs.dev/guide/observer) — ba callback `next`, `error`, `complete` và partial Observer.
+- [RxJS — Subscription](https://rxjs.dev/guide/subscription) — `unsubscribe()` và việc giải phóng tài nguyên của execution.
+- [RxJS 7.x — tài liệu trong repository](https://github.com/ReactiveX/rxjs/tree/7.x/docs_app/content/guide) — nguồn versioned cho các guide và ví dụ chính thức.
