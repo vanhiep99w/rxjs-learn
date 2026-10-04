@@ -1,0 +1,12 @@
+{
+  "title": "Patterns & Production",
+  "pages": [
+    "index",
+    "state-management",
+    "cache-data",
+    "request-orchestration",
+    "polling-realtime",
+    "performance-memory",
+    "observability"
+  ]
+}

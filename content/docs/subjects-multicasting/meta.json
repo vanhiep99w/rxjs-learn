@@ -1,0 +1,12 @@
+{
+  "title": "Subjects & Multicasting",
+  "pages": [
+    "index",
+    "subject",
+    "behavior-subject",
+    "replay-subject",
+    "async-subject",
+    "share",
+    "share-replay"
+  ]
+}

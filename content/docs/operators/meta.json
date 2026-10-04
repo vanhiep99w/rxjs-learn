@@ -1,0 +1,12 @@
+{
+  "title": "Operators",
+  "pages": [
+    "index",
+    "creation-operators",
+    "transformation-operators",
+    "filtering-operators",
+    "combination-operators",
+    "utility-operators",
+    "conditional-boolean-operators"
+  ]
+}

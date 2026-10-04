@@ -1,0 +1,27 @@
+@import 'tailwindcss';
+@import 'fumadocs-ui/css/neutral.css';
+@import 'fumadocs-ui/css/preset.css';
+
+:root {
+  /* Dùng gần toàn bộ chiều rộng viewport trên màn hình lớn. */
+  --fd-layout-width: 100%;
+  /* Fallback nếu phiên bản Fumadocs đang dùng xử lý 100% không đúng: */
+  /* --fd-layout-width: 140rem; */
+}
+
+#nd-docs-layout {
+  padding-inline: 0.5rem;
+}
+
+@media (min-width: 768px) {
+  #nd-docs-layout {
+    padding-inline: 1rem;
+  }
+}
+
+/*
+ * Khoảng đệm ngoài đã được thu gọn tại DocsLayout. Nếu typings của phiên bản
+ * Fumadocs đã cài hỗ trợ article/container slots, có thể tiếp tục đặt
+ * `max-w-none px-4 md:px-6` trên DocsPage. Nếu không, chạy local:
+ * `pnpm fumadocs add layouts/docs` rồi chỉnh trực tiếp container đã eject.
+ */

@@ -1,0 +1,12 @@
+{
+  "title": "Higher-order Observables",
+  "pages": [
+    "index",
+    "higher-order-stream",
+    "concat-map",
+    "merge-map",
+    "switch-map",
+    "exhaust-map",
+    "race-condition"
+  ]
+}
