@@ -23,6 +23,15 @@ Mở [http://localhost:3000/docs](http://localhost:3000/docs).
 
 > Project được scaffold trong môi trường không có network nên dependency chưa được cài và build chưa được chạy.
 
+## Deploy Cloudflare Pages
+
+Project dùng Next.js static export và sinh website vào thư mục `out/`.
+
+- Build command: `npm run build`
+- Build output directory: `out`
+
+`wrangler.toml` đã khai báo `pages_build_output_dir = "./out"` để cấu hình trong repository là source of truth cho Cloudflare Pages.
+
 ## Nội dung
 
 Tài liệu đi từ reactive programming, Observable, operators và Subjects đến higher-order streams, testing, integration, production patterns và troubleshooting. Các bài hiện là placeholder để được viết chi tiết từng trang trong bước tiếp theo.
