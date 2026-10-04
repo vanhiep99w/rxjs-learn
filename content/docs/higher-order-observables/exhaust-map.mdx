@@ -109,15 +109,25 @@ Overload `resultSelector` của RxJS 7 đã deprecated; mình chọn inner `map`
 
 Giả sử outer phát `a`, `b`, `c`, `d`. Mỗi inner được nhận phát `x` sau hai frame và complete sau năm frame. Đây là thời gian minh họa, không phải thời lượng request thực tế.
 
-```text
-Frame       0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
-Outer       a     b     c                 d           |
-Inner a     S     x        |
-Inner d                                   S     x        |
-Output            x                             x        |
-```
+<MarbleDiagram
+  title="exhaustMap bỏ trigger đến trong lúc đang bận"
+  rows={[
+    { label: 'outer', marble: 'a-b-c-----d---|', kind: 'source' },
+    { label: 'inner a', marble: '^-x--|', kind: 'inner' },
+    { label: 'inner d', marble: '----------^-x--|', kind: 'inner' },
+    { label: 'output', marble: '--x---------x--|', kind: 'output' },
+  ]}
+  values={{
+    a: 'được nhận',
+    b: 'bị bỏ qua',
+    c: 'bị bỏ qua',
+    d: 'được nhận',
+    x: 'kết quả của inner',
+  }}
+  caption="Không có dòng inner b hoặc inner c vì projection không được gọi cho hai trigger này."
+/>
 
-`S` là thời điểm subscribe; `|` là complete. Diễn biến:
+Dấu subscribe trong sơ đồ là thời điểm operator bắt đầu theo dõi inner; dấu complete kết thúc timeline của stream tương ứng. Diễn biến:
 
 1. Frame `0`: nhận `a`, gọi projection và subscribe inner `a`.
 2. Frame `2`: inner `a` phát `x`; outer `b` bị bỏ qua vì inner chưa complete.
@@ -126,14 +136,6 @@ Output            x                             x        |
 5. Frame `10`: nhận `d` và subscribe inner `d`.
 6. Frame `14`: outer complete nhưng output chưa complete, vì inner `d` còn active.
 7. Frame `15`: inner `d` complete; lúc này output mới complete.
-
-Trong marble notation, cùng tình huống đó là:
-
-```text
-outer:  a-b-c-----d---|
-inner:  --x--|          (relative cho mỗi lần subscribe)
-output: --x---------x--|
-```
 
 Ở ví dụ này không có outer emission trùng thời điểm inner complete. Nếu hai notification trùng frame, thứ tự xử lý thực tế quyết định emission có được nhận hay không; đừng dựa vào một mốc thời gian bằng nhau để thiết kế nghiệp vụ.
 

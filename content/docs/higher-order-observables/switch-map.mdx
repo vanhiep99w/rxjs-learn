@@ -54,13 +54,24 @@ Trong RxJS 7.8.2, mỗi lần outer phát value, `switchMap` thực hiện theo 
 
 Nó **không đợi inner mới phát response rồi mới bỏ inner cũ**. Vì inner cũ bị unsubscribe trước khi projection mới chạy, nếu projection mới ném lỗi thì inner cũ cũng không được giữ lại như một phương án dự phòng.
 
-```text
-outer phát A  → subscribe inner A → chuyển tiếp các value của A
-outer phát B  → unsubscribe A    → subscribe inner B
-outer phát C  → unsubscribe B    → subscribe inner C
-```
+<MarbleDiagram
+  title="switchMap chuyển subscription sang input mới nhất"
+  rows={[
+    { label: 'outer', marble: '-a---b----|', kind: 'source' },
+    { label: 'inner A', marble: '-^-x-!', kind: 'inner' },
+    { label: 'inner B', marble: '-----^-x---y|', kind: 'inner' },
+    { label: 'output', marble: '---x---x---y|', kind: 'output' },
+  ]}
+  values={{
+    a: 'input A',
+    b: 'input B mới hơn',
+    x: 'emission đầu của inner',
+    y: 'emission tiếp theo',
+  }}
+  caption="B đến ở frame 5 nên inner A bị unsubscribe ngay; emission y về sau của A không thể đi xuống output."
+/>
 
-Đây là sơ đồ text để đọc trực tiếp, không cần cấu hình Mermaid. Không có hàng đợi cho input bị thay thế, cũng không có bước chạy lại inner cũ khi inner mới complete.
+Không có hàng đợi cho input bị thay thế, cũng không có bước chạy lại inner cũ khi inner mới complete. Dòng `inner A` dừng tại unsubscribe, còn `inner B` tiếp tục ngay cả khi outer đã complete.
 
 ### Không thu hồi value đã phát
 

@@ -71,17 +71,27 @@ Một inner cũng có thể phát nhiều giá trị hoặc không phát giá tr
 
 ### Đọc timeline
 
-Đây là marble dạng text, không cần renderer Mermaid. Mỗi dấu `-` là một đơn vị thời gian; `|` là complete. Timeline inner đã được đặt vào thời điểm thực tế nó được subscribe.
+Sơ đồ dưới đây đặt mỗi inner vào đúng frame mà `concatMap` thực sự subscribe. Bạn có thể đọc theo cột dọc để thấy tại một thời điểm chỉ có một inner hoạt động.
 
-```text
-outer:          -a-b-c-|
-inner của a:    -^--x|
-inner của b:    -----^--x|
-inner của c:    ---------^--x|
-output:         ----x---x---x|
-```
+<MarbleDiagram
+  title="concatMap xếp các inner nối đuôi nhau"
+  rows={[
+    { label: 'outer', marble: '-a-b-c-|', kind: 'source' },
+    { label: 'inner của a', marble: '-^--x|', kind: 'inner' },
+    { label: 'inner của b', marble: '-----^--x|', kind: 'inner' },
+    { label: 'inner của c', marble: '---------^--x|', kind: 'inner' },
+    { label: 'output', marble: '----x---x---x|', kind: 'output' },
+  ]}
+  values={{
+    a: 'job A',
+    b: 'job B',
+    c: 'job C',
+    x: 'kết quả của inner',
+  }}
+  caption="B và C đã đến nhưng chỉ được subscribe sau khi inner đứng trước complete."
+/>
 
-Ký hiệu `^` trên các dòng inner đánh dấu lúc subscribe, không phải một giá trị output. Mỗi inner mất bốn đơn vị thời gian từ lúc subscribe đến complete và phát `x` sau ba đơn vị. Outer complete ở thời điểm 7, nhưng `c` chỉ bắt đầu ở thời điểm 9; output complete ở thời điểm 13.
+Ký hiệu subscribe trên các dòng inner đánh dấu lúc bắt đầu theo dõi inner, không phải một giá trị output. Mỗi inner mất bốn frame từ lúc subscribe đến complete và phát `x` sau ba frame. Outer complete ở frame 7, nhưng `c` chỉ bắt đầu ở frame 9; output complete ở frame 13.
 
 Bạn không phải đợi tất cả công việc xong mới nhận output. Kết quả của `a` được phát ở thời điểm 4, rồi `b` ở 8 và `c` ở 12. Operator giữ thứ tự bằng cách tuần tự hóa subscription, không phải chạy song song rồi sắp xếp lại kết quả.
 
