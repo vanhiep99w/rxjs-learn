@@ -55,6 +55,7 @@
 }
 
 .scroller {
+  width: 100%;
   max-width: 100%;
   overflow-x: auto;
   overscroll-behavior-inline: contain;
@@ -69,7 +70,6 @@
 
 .diagram {
   display: block;
-  width: 100%;
   max-width: none;
   background: var(--marble-surface);
 }

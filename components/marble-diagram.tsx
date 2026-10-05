@@ -1,3 +1,7 @@
+'use client';
+
+import { useEffect, useRef, useState } from 'react';
+
 import styles from './marble-diagram.module.css';
 
 type MarbleTokenType =
@@ -41,40 +45,18 @@ const OPERATOR_HEIGHT = 74;
 const RIGHT_PADDING = 58;
 const AXIS_RIGHT = 22;
 
-type SvgPosition = {
-  attribute: string;
-  percentage: string;
-  pixels: number;
-};
-
-function svgPosition(percent: number, pixels: number): SvgPosition {
-  const roundedPercent = Number(percent.toFixed(4));
-  const roundedPixels = Number(pixels.toFixed(4));
-  const operator = roundedPixels < 0 ? '-' : '+';
-
-  return {
-    attribute: `calc(${roundedPercent}% ${operator} ${Math.abs(roundedPixels)}px)`,
-    percentage: `${roundedPercent}%`,
-    pixels: roundedPixels,
-  };
-}
-
 function positionForFrame(
   frame: number,
   frameCount: number,
+  diagramWidth: number,
   offset = 0,
 ) {
-  if (frameCount <= 1) return svgPosition(0, LABEL_WIDTH + offset);
+  if (frameCount <= 1) return LABEL_WIDTH + offset;
 
   const progress = frame / (frameCount - 1);
-  const pixels =
-    LABEL_WIDTH * (1 - progress) - RIGHT_PADDING * progress + offset;
+  const timelineWidth = diagramWidth - LABEL_WIDTH - RIGHT_PADDING;
 
-  return svgPosition(progress * 100, pixels);
-}
-
-function positionFromRight(offset: number) {
-  return svgPosition(100, -offset);
+  return LABEL_WIDTH + progress * timelineWidth + offset;
 }
 
 const tokenTypeByCharacter: Record<string, MarbleTokenType> = {
@@ -157,7 +139,7 @@ function parseMarble(row: MarbleRow): ParsedRow {
 
 function markerForToken(
   token: MarbleToken,
-  xAt: (offset?: number) => SvgPosition,
+  xAt: (offset?: number) => number,
   y: number,
   colorClass: string,
   description?: string,
@@ -171,7 +153,7 @@ function markerForToken(
         <title>{accessibleLabel}</title>
         <circle
           className={`${styles.eventCircle} ${colorClass}`}
-          cx={x.attribute}
+          cx={x}
           cy={y}
           r="15"
         />
@@ -179,8 +161,7 @@ function markerForToken(
           className={styles.eventText}
           dominantBaseline="central"
           textAnchor="middle"
-          x={x.percentage}
-          dx={x.pixels}
+          x={x}
           y={y}
         >
           {token.value}
@@ -193,12 +174,7 @@ function markerForToken(
     return (
       <g className={styles.terminalMarker}>
         <title>{accessibleLabel}</title>
-        <line
-          x1={x.attribute}
-          x2={x.attribute}
-          y1={y - 16}
-          y2={y + 16}
-        />
+        <line x1={x} x2={x} y1={y - 16} y2={y + 16} />
       </g>
     );
   }
@@ -207,19 +183,9 @@ function markerForToken(
     return (
       <g className={styles.errorMarker}>
         <title>{accessibleLabel}</title>
-        <circle cx={x.attribute} cy={y} r="14" />
-        <line
-          x1={xAt(-6).attribute}
-          x2={xAt(6).attribute}
-          y1={y - 6}
-          y2={y + 6}
-        />
-        <line
-          x1={xAt(6).attribute}
-          x2={xAt(-6).attribute}
-          y1={y - 6}
-          y2={y + 6}
-        />
+        <circle cx={x} cy={y} r="14" />
+        <line x1={xAt(-6)} x2={xAt(6)} y1={y - 6} y2={y + 6} />
+        <line x1={xAt(6)} x2={xAt(-6)} y1={y - 6} y2={y + 6} />
       </g>
     );
   }
@@ -228,24 +194,9 @@ function markerForToken(
     return (
       <g className={styles.lifecycleMarker}>
         <title>{accessibleLabel}</title>
-        <line
-          x1={x.attribute}
-          x2={x.attribute}
-          y1={y - 15}
-          y2={y + 15}
-        />
-        <line
-          x1={xAt(-6).attribute}
-          x2={x.attribute}
-          y1={y - 8}
-          y2={y - 15}
-        />
-        <line
-          x1={x.attribute}
-          x2={xAt(6).attribute}
-          y1={y - 15}
-          y2={y - 8}
-        />
+        <line x1={x} x2={x} y1={y - 15} y2={y + 15} />
+        <line x1={xAt(-6)} x2={x} y1={y - 8} y2={y - 15} />
+        <line x1={x} x2={xAt(6)} y1={y - 15} y2={y - 8} />
       </g>
     );
   }
@@ -253,24 +204,9 @@ function markerForToken(
   return (
     <g className={styles.unsubscribeMarker}>
       <title>{accessibleLabel}</title>
-      <line
-        x1={x.attribute}
-        x2={x.attribute}
-        y1={y - 15}
-        y2={y + 15}
-      />
-      <line
-        x1={xAt(-6).attribute}
-        x2={xAt(6).attribute}
-        y1={y - 15}
-        y2={y - 3}
-      />
-      <line
-        x1={xAt(6).attribute}
-        x2={xAt(-6).attribute}
-        y1={y - 15}
-        y2={y - 3}
-      />
+      <line x1={x} x2={x} y1={y - 15} y2={y + 15} />
+      <line x1={xAt(-6)} x2={xAt(6)} y1={y - 15} y2={y - 3} />
+      <line x1={xAt(6)} x2={xAt(-6)} y1={y - 15} y2={y - 3} />
     </g>
   );
 }
@@ -316,9 +252,36 @@ export function MarbleDiagram({
   const operatorOffset = hasOperatorBand ? OPERATOR_HEIGHT : 0;
   const minimumWidth =
     LABEL_WIDTH + (frameCount - 1) * FRAME_WIDTH + RIGHT_PADDING;
+  const scrollerRef = useRef<HTMLDivElement>(null);
+  const [containerWidth, setContainerWidth] = useState(0);
+  const diagramWidth = Math.max(minimumWidth, containerWidth);
   const height =
     TOP_RULER_HEIGHT + parsedRows.length * ROW_HEIGHT + operatorOffset + 18;
   const operatorY = TOP_RULER_HEIGHT + outputRowIndex * ROW_HEIGHT;
+
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+
+    const updateWidth = () => {
+      const nextWidth = Math.floor(scroller.getBoundingClientRect().width);
+      setContainerWidth((currentWidth) =>
+        currentWidth === nextWidth ? currentWidth : nextWidth,
+      );
+    };
+
+    updateWidth();
+
+    if (typeof ResizeObserver === 'undefined') {
+      window.addEventListener('resize', updateWidth);
+      return () => window.removeEventListener('resize', updateWidth);
+    }
+
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(scroller);
+
+    return () => observer.disconnect();
+  }, []);
   const usedTokenTypes = new Set(
     parsedRows.flatMap((row) => row.tokens.map((token) => token.type)),
   );
@@ -362,6 +325,11 @@ export function MarbleDiagram({
   const accessibleRows = parsedRows
     .map((row) => `${row.label}: ${row.marble}`)
     .join('. ');
+  const estimatedFrameLabelWidth = Math.min(
+    260,
+    Math.max(120, frameLabel.length * 5.5),
+  );
+  const frameLabelStart = diagramWidth - 16 - estimatedFrameLabelWidth;
 
   return (
     <figure className={styles.figure}>
@@ -373,32 +341,37 @@ export function MarbleDiagram({
         Vuốt ngang để xem tiếp →
       </div>
 
-      <div className={styles.scroller} tabIndex={0} aria-label={`Cuộn sơ đồ: ${title}`}>
+      <div
+        ref={scrollerRef}
+        className={styles.scroller}
+        tabIndex={0}
+        aria-label={`Cuộn sơ đồ: ${title}`}
+      >
         <svg
           aria-hidden="true"
           className={styles.diagram}
           height={height}
-          style={{ minWidth: `${minimumWidth}px` }}
-          width="100%"
+          width={diagramWidth}
         >
           {Array.from({ length: frameCount }, (_, frame) => {
-            const x = positionForFrame(frame, frameCount);
-            const showNumber = frame === 0 || frame % 5 === 0;
+            const x = positionForFrame(frame, frameCount, diagramWidth);
+            const isNumberedFrame = frame === 0 || frame % 5 === 0;
+            const showNumber =
+              isNumberedFrame && (frame === 0 || x < frameLabelStart - 12);
 
             return showNumber ? (
               <g key={`frame-${frame}`}>
                 <line
                   className={styles.rulerTick}
-                  x1={x.attribute}
-                  x2={x.attribute}
+                  x1={x}
+                  x2={x}
                   y1="20"
                   y2="26"
                 />
                 <text
                   className={styles.axisText}
                   textAnchor="middle"
-                  x={x.percentage}
-                  dx={x.pixels}
+                  x={x}
                   y="14"
                 >
                   {frame}
@@ -410,8 +383,7 @@ export function MarbleDiagram({
           <text
             className={styles.frameText}
             textAnchor="end"
-            x="100%"
-            dx="-16"
+            x={diagramWidth - 16}
             y="15"
           >
             {frameLabel}
@@ -422,7 +394,7 @@ export function MarbleDiagram({
               <rect
                 className={styles.operatorBand}
                 height={OPERATOR_HEIGHT}
-                width="100%"
+                width={diagramWidth}
                 x="0"
                 y={operatorY}
               />
@@ -430,7 +402,7 @@ export function MarbleDiagram({
                 className={styles.operatorTitle}
                 dominantBaseline="central"
                 textAnchor="middle"
-                x="50%"
+                x={diagramWidth / 2}
                 y={operatorY + OPERATOR_HEIGHT / 2}
               >
                 {title}
@@ -467,28 +439,33 @@ export function MarbleDiagram({
                 <line
                   className={styles.baseline}
                   x1={LABEL_WIDTH}
-                  x2={positionFromRight(32).attribute}
+                  x2={diagramWidth - 32}
                   y1={y}
                   y2={y}
                 />
                 <line
                   className={styles.axisArrow}
-                  x1={positionFromRight(33).attribute}
-                  x2={positionFromRight(AXIS_RIGHT).attribute}
+                  x1={diagramWidth - 33}
+                  x2={diagramWidth - AXIS_RIGHT}
                   y1={y - 7}
                   y2={y}
                 />
                 <line
                   className={styles.axisArrow}
-                  x1={positionFromRight(33).attribute}
-                  x2={positionFromRight(AXIS_RIGHT).attribute}
+                  x1={diagramWidth - 33}
+                  x2={diagramWidth - AXIS_RIGHT}
                   y1={y + 7}
                   y2={y}
                 />
 
                 {row.tokens.map((token, tokenIndex) => {
                   const xAt = (offset = 0) =>
-                    positionForFrame(token.frame, frameCount, offset);
+                    positionForFrame(
+                      token.frame,
+                      frameCount,
+                      diagramWidth,
+                      offset,
+                    );
                   const description = token.value
                     ? values?.[token.value]
                     : undefined;
