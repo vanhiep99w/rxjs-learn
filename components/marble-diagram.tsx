@@ -39,6 +39,43 @@ const TOP_RULER_HEIGHT = 32;
 const ROW_HEIGHT = 70;
 const OPERATOR_HEIGHT = 74;
 const RIGHT_PADDING = 58;
+const AXIS_RIGHT = 22;
+
+type SvgPosition = {
+  attribute: string;
+  percentage: string;
+  pixels: number;
+};
+
+function svgPosition(percent: number, pixels: number): SvgPosition {
+  const roundedPercent = Number(percent.toFixed(4));
+  const roundedPixels = Number(pixels.toFixed(4));
+  const operator = roundedPixels < 0 ? '-' : '+';
+
+  return {
+    attribute: `calc(${roundedPercent}% ${operator} ${Math.abs(roundedPixels)}px)`,
+    percentage: `${roundedPercent}%`,
+    pixels: roundedPixels,
+  };
+}
+
+function positionForFrame(
+  frame: number,
+  frameCount: number,
+  offset = 0,
+) {
+  if (frameCount <= 1) return svgPosition(0, LABEL_WIDTH + offset);
+
+  const progress = frame / (frameCount - 1);
+  const pixels =
+    LABEL_WIDTH * (1 - progress) - RIGHT_PADDING * progress + offset;
+
+  return svgPosition(progress * 100, pixels);
+}
+
+function positionFromRight(offset: number) {
+  return svgPosition(100, -offset);
+}
 
 const tokenTypeByCharacter: Record<string, MarbleTokenType> = {
   '|': 'complete',
@@ -120,11 +157,12 @@ function parseMarble(row: MarbleRow): ParsedRow {
 
 function markerForToken(
   token: MarbleToken,
-  x: number,
+  xAt: (offset?: number) => SvgPosition,
   y: number,
   colorClass: string,
   description?: string,
 ) {
+  const x = xAt();
   const accessibleLabel = `${description ?? token.value ?? syntaxLabels[token.type]}, frame ${token.frame}`;
 
   if (token.type === 'next') {
@@ -133,7 +171,7 @@ function markerForToken(
         <title>{accessibleLabel}</title>
         <circle
           className={`${styles.eventCircle} ${colorClass}`}
-          cx={x}
+          cx={x.attribute}
           cy={y}
           r="15"
         />
@@ -141,7 +179,8 @@ function markerForToken(
           className={styles.eventText}
           dominantBaseline="central"
           textAnchor="middle"
-          x={x}
+          x={x.percentage}
+          dx={x.pixels}
           y={y}
         >
           {token.value}
@@ -154,7 +193,12 @@ function markerForToken(
     return (
       <g className={styles.terminalMarker}>
         <title>{accessibleLabel}</title>
-        <line x1={x} x2={x} y1={y - 16} y2={y + 16} />
+        <line
+          x1={x.attribute}
+          x2={x.attribute}
+          y1={y - 16}
+          y2={y + 16}
+        />
       </g>
     );
   }
@@ -163,9 +207,19 @@ function markerForToken(
     return (
       <g className={styles.errorMarker}>
         <title>{accessibleLabel}</title>
-        <circle cx={x} cy={y} r="14" />
-        <line x1={x - 6} x2={x + 6} y1={y - 6} y2={y + 6} />
-        <line x1={x + 6} x2={x - 6} y1={y - 6} y2={y + 6} />
+        <circle cx={x.attribute} cy={y} r="14" />
+        <line
+          x1={xAt(-6).attribute}
+          x2={xAt(6).attribute}
+          y1={y - 6}
+          y2={y + 6}
+        />
+        <line
+          x1={xAt(6).attribute}
+          x2={xAt(-6).attribute}
+          y1={y - 6}
+          y2={y + 6}
+        />
       </g>
     );
   }
@@ -174,8 +228,24 @@ function markerForToken(
     return (
       <g className={styles.lifecycleMarker}>
         <title>{accessibleLabel}</title>
-        <line x1={x} x2={x} y1={y - 15} y2={y + 15} />
-        <path d={`M ${x - 6} ${y - 8} L ${x} ${y - 15} L ${x + 6} ${y - 8}`} />
+        <line
+          x1={x.attribute}
+          x2={x.attribute}
+          y1={y - 15}
+          y2={y + 15}
+        />
+        <line
+          x1={xAt(-6).attribute}
+          x2={x.attribute}
+          y1={y - 8}
+          y2={y - 15}
+        />
+        <line
+          x1={x.attribute}
+          x2={xAt(6).attribute}
+          y1={y - 15}
+          y2={y - 8}
+        />
       </g>
     );
   }
@@ -183,9 +253,24 @@ function markerForToken(
   return (
     <g className={styles.unsubscribeMarker}>
       <title>{accessibleLabel}</title>
-      <line x1={x} x2={x} y1={y - 15} y2={y + 15} />
-      <line x1={x - 6} x2={x + 6} y1={y - 15} y2={y - 3} />
-      <line x1={x + 6} x2={x - 6} y1={y - 15} y2={y - 3} />
+      <line
+        x1={x.attribute}
+        x2={x.attribute}
+        y1={y - 15}
+        y2={y + 15}
+      />
+      <line
+        x1={xAt(-6).attribute}
+        x2={xAt(6).attribute}
+        y1={y - 15}
+        y2={y - 3}
+      />
+      <line
+        x1={xAt(6).attribute}
+        x2={xAt(-6).attribute}
+        y1={y - 15}
+        y2={y - 3}
+      />
     </g>
   );
 }
@@ -229,10 +314,10 @@ export function MarbleDiagram({
   const outputRowIndex = parsedRows.findIndex((row) => row.kind === 'output');
   const hasOperatorBand = outputRowIndex > 0;
   const operatorOffset = hasOperatorBand ? OPERATOR_HEIGHT : 0;
-  const width = LABEL_WIDTH + (frameCount - 1) * FRAME_WIDTH + RIGHT_PADDING;
+  const minimumWidth =
+    LABEL_WIDTH + (frameCount - 1) * FRAME_WIDTH + RIGHT_PADDING;
   const height =
     TOP_RULER_HEIGHT + parsedRows.length * ROW_HEIGHT + operatorOffset + 18;
-  const axisEnd = width - 22;
   const operatorY = TOP_RULER_HEIGHT + outputRowIndex * ROW_HEIGHT;
   const usedTokenTypes = new Set(
     parsedRows.flatMap((row) => row.tokens.map((token) => token.type)),
@@ -293,26 +378,27 @@ export function MarbleDiagram({
           aria-hidden="true"
           className={styles.diagram}
           height={height}
-          viewBox={`0 0 ${width} ${height}`}
-          width={width}
+          style={{ minWidth: `${minimumWidth}px` }}
+          width="100%"
         >
           {Array.from({ length: frameCount }, (_, frame) => {
-            const x = LABEL_WIDTH + frame * FRAME_WIDTH;
+            const x = positionForFrame(frame, frameCount);
             const showNumber = frame === 0 || frame % 5 === 0;
 
             return showNumber ? (
               <g key={`frame-${frame}`}>
                 <line
                   className={styles.rulerTick}
-                  x1={x}
-                  x2={x}
+                  x1={x.attribute}
+                  x2={x.attribute}
                   y1="20"
                   y2="26"
                 />
                 <text
                   className={styles.axisText}
                   textAnchor="middle"
-                  x={x}
+                  x={x.percentage}
+                  dx={x.pixels}
                   y="14"
                 >
                   {frame}
@@ -324,7 +410,8 @@ export function MarbleDiagram({
           <text
             className={styles.frameText}
             textAnchor="end"
-            x={width - 16}
+            x="100%"
+            dx="-16"
             y="15"
           >
             {frameLabel}
@@ -335,7 +422,7 @@ export function MarbleDiagram({
               <rect
                 className={styles.operatorBand}
                 height={OPERATOR_HEIGHT}
-                width={width}
+                width="100%"
                 x="0"
                 y={operatorY}
               />
@@ -343,7 +430,7 @@ export function MarbleDiagram({
                 className={styles.operatorTitle}
                 dominantBaseline="central"
                 textAnchor="middle"
-                x={width / 2}
+                x="50%"
                 y={operatorY + OPERATOR_HEIGHT / 2}
               >
                 {title}
@@ -380,17 +467,28 @@ export function MarbleDiagram({
                 <line
                   className={styles.baseline}
                   x1={LABEL_WIDTH}
-                  x2={axisEnd - 10}
+                  x2={positionFromRight(32).attribute}
                   y1={y}
                   y2={y}
                 />
-                <path
+                <line
                   className={styles.axisArrow}
-                  d={`M ${axisEnd - 11} ${y - 7} L ${axisEnd} ${y} L ${axisEnd - 11} ${y + 7} Z`}
+                  x1={positionFromRight(33).attribute}
+                  x2={positionFromRight(AXIS_RIGHT).attribute}
+                  y1={y - 7}
+                  y2={y}
+                />
+                <line
+                  className={styles.axisArrow}
+                  x1={positionFromRight(33).attribute}
+                  x2={positionFromRight(AXIS_RIGHT).attribute}
+                  y1={y + 7}
+                  y2={y}
                 />
 
                 {row.tokens.map((token, tokenIndex) => {
-                  const x = LABEL_WIDTH + token.frame * FRAME_WIDTH;
+                  const xAt = (offset = 0) =>
+                    positionForFrame(token.frame, frameCount, offset);
                   const description = token.value
                     ? values?.[token.value]
                     : undefined;
@@ -399,7 +497,7 @@ export function MarbleDiagram({
                     <g key={`${token.frame}-${token.type}-${token.value ?? ''}-${tokenIndex}`}>
                       {markerForToken(
                         token,
-                        x,
+                        xAt,
                         y,
                         colorClassFor(token.value),
                         description,

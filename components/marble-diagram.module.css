@@ -69,6 +69,7 @@
 
 .diagram {
   display: block;
+  width: 100%;
   max-width: none;
   background: var(--marble-surface);
 }
@@ -93,6 +94,7 @@
 
 .rulerTick,
 .baseline,
+.axisArrow,
 .terminalMarker line,
 .errorMarker circle,
 .errorMarker line,
@@ -126,7 +128,10 @@
 }
 
 .axisArrow {
-  fill: var(--marble-rule);
+  fill: none;
+  stroke: var(--marble-rule);
+  stroke-linecap: square;
+  stroke-width: 1.8;
 }
 
 .eventCircle {
