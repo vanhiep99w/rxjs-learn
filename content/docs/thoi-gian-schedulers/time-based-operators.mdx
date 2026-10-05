@@ -100,11 +100,25 @@ timer(0, 1_000)
 
 Timeline mong đợi:
 
-```text
-time:          0 ms          1.000 ms       1.500 ms       2.000 ms
-periodic$:     (0)───────────(1)───────────────────────────(2)│
-oneShot$:      ─────────────────────────────(0)│
-```
+Đọc theo cột với mỗi khoảng bằng 500 ms. Hai dòng `next` và `end` được tách để các marker cùng frame không chồng lên nhau:
+
+<MarbleDiagram
+  title="timer(due, period?)"
+  rows={[
+    { label: 'periodic next', marble: '0-1-2', kind: 'source' },
+    { label: 'periodic end', marble: '----|', kind: 'source' },
+    { label: 'oneShot next', marble: '---x', kind: 'source' },
+    { label: 'oneShot end', marble: '---|', kind: 'source' },
+  ]}
+  values={{
+    '0': 'periodic tick 0',
+    '1': 'periodic tick 1',
+    '2': 'periodic tick 2',
+    x: 'one-shot tick 0',
+  }}
+  frameLabel="1 khoảng = 500 ms"
+  caption="Periodic phát ở 0, 1000 và 2000 ms rồi complete do take(3). One-shot phát và complete ở 1500 ms."
+/>
 
 `due` cũng có thể là một `Date`. Cách này hợp với deadline gần như “đến đầu phút tiếp theo”, nhưng không nên dùng một timer rất dài như lịch công việc bền vững. Process restart, sleep hoặc giới hạn của `setTimeout` có thể phá giả định đó; job quan trọng nên được lưu trong scheduler hoặc queue phù hợp.
 
@@ -120,10 +134,25 @@ interval(1_000)
   .subscribe(console.log);
 ```
 
-```text
-time:       0 ms          1.000 ms       2.000 ms       3.000 ms
-interval$:  ──────────────(0)────────────(1)────────────(2)│
-```
+Timeline cũng cần thể hiện rằng `take(3)` hủy nguồn periodic sau value thứ ba:
+
+<MarbleDiagram
+  title="interval(1000), take(3)"
+  rows={[
+    { label: 'lịch interval', marble: '-0123', kind: 'source' },
+    { label: 'upstream sub', marble: '^--!', kind: 'subscription' },
+    { label: 'output next', marble: '-012', kind: 'output' },
+    { label: 'output end', marble: '---|', kind: 'output' },
+  ]}
+  values={{
+    '0': 'tick 0',
+    '1': 'tick 1',
+    '2': 'tick 2',
+    '3': 'tick 3 — chỉ phát nếu subscription còn mở',
+  }}
+  frameLabel="1 khoảng = 1 giây"
+  caption="Tick 0 chỉ đến sau một giây. Ở giây thứ ba, take(3) chuyển tiếp tick 2, complete output và hủy interval nên tick 3 không xảy ra."
+/>
 
 Nếu polling phải chạy ngay khi màn hình mở, mình dùng `timer(0, period)`. Nếu yêu cầu nói rõ “chờ một chu kỳ rồi mới chạy”, `interval(period)` diễn đạt ý đó gọn hơn. Phần [Creation functions](/docs/observable-subscription/creation-functions) so sánh chi tiết hai nguồn này với các cách tạo Observable khác.
 
@@ -215,10 +244,26 @@ Mảng `notices` được khai báo là `Notice[]`, nên `of(...notices)` suy lu
 
 Kết quả theo thời gian:
 
-```text
-... khoảng 100 ms ... fast
-... khoảng 500 ms nữa ... slow
-```
+Đọc theo cột để thấy `delayWhen` cho phép inner nhanh vượt inner chậm, dù `slow` đứng trước trong source đồng bộ:
+
+<MarbleDiagram
+  title="delayWhen(notice => timer(notice.waitMs))"
+  rows={[
+    { label: 'source next', marble: 'o', kind: 'source' },
+    { label: 'source end', marble: '|', kind: 'source' },
+    { label: 'slow inner', marble: '^-----s', kind: 'inner' },
+    { label: 'fast inner', marble: '^f', kind: 'inner' },
+    { label: 'output next', marble: '-f----s', kind: 'output' },
+    { label: 'output end', marble: '------|', kind: 'output' },
+  ]}
+  values={{
+    o: 'slow, fast rồi complete đồng bộ',
+    s: 'slow',
+    f: 'fast',
+  }}
+  frameLabel="1 khoảng = 100 ms"
+  caption="fast phát ở khoảng 100 ms; slow phát ở khoảng 600 ms, tức khoảng 500 ms sau fast. Output complete khi cả hai duration đã phát."
+/>
 
 Đây là hành vi đúng nếu mỗi item có availability time riêng. Nếu thứ tự nguồn phải được giữ nguyên, `delayWhen` một mình chưa đủ; bạn cần mô hình tuần tự, chẳng hạn `concatMap` với `timer(...).pipe(map(() => value))`, và phải chấp nhận rằng thời gian chờ lúc đó cộng dồn.
 

@@ -54,18 +54,17 @@ Từ “marble” là hình ảnh ẩn dụ cho value emission, không phải m�
 
 ## Bộ ký hiệu cần nhớ
 
-Bài này dùng ký hiệu trực quan sau cho diagram minh họa:
+Diagram được render bằng marker trực quan, còn chuỗi marble phía sau dùng ký tự ngắn. Hai cách biểu diễn tương ứng như sau:
 
-```text
-Ký hiệu       Ý nghĩa trong một Observable execution
-──────────    thời gian trôi qua
-(A)           next('A')
-│             complete()
-✕             error(err)
-^             thời điểm subscribe
-!             thời điểm unsubscribe
-…             nguồn còn có thể tiếp tục, chưa có terminal notification
-```
+| Trên diagram | Trong chuỗi marble | Ý nghĩa trong một Observable execution |
+| --- | --- | --- |
+| Đường thời gian | `-` | Tiến thêm một frame |
+| Viên bi `A` | `a` | Gọi `next('A')`; object `values` giải thích payload |
+| Vạch đứng `│` | `|` | Gọi `complete()` |
+| Dấu lỗi `✕` | `#` | Gọi `error(err)` |
+| Marker subscribe | `^` | Mở subscription tại frame này |
+| Marker unsubscribe | `!` | Đóng subscription và chạy teardown |
+| Trục tiếp tục sang phải | Không có terminal marker | Nguồn vẫn mở trong cửa sổ đang vẽ |
 
 Ba timeline cơ bản trông như sau. Đây là ba execution độc lập, không phải ba bước của một pipeline:
 
@@ -88,7 +87,7 @@ Ba timeline cơ bản trông như sau. Đây là ba execution độc lập, khô
 Đọc cửa sổ subscription bên dưới: consumer nhận `A`, `B`, `C` rồi chủ động rời đi trước `D`.
 
 <MarbleDiagram
-  title="Consumer unsubscribe"
+  title="unsubscribe()"
   rows={[
     { label: 'lịch nguồn', marble: '--a--b--c--d---', kind: 'source' },
     { label: 'subscription', marble: '^--------!', kind: 'subscription' },
@@ -328,15 +327,20 @@ Hai loại diagram cùng kể một câu chuyện, nhưng không có cùng mức
 | Cùng thời điểm | Vẽ cùng cột | Nhóm bằng `(...)` |
 | Subscription | Chú thích hoặc `^` và `!` | `^` và `!` trong subscription diagram; `^` còn đánh dấu zero frame của hot Observable |
 
-Ví dụ chuỗi marble testing:
+Đọc theo cột để thấy `map` đổi value nhưng giữ nguyên frame phát và frame complete:
 
-```text
-source:    --a--b--|
-expected:  --x--y--|
-values:    a=1, b=2, x=10, y=20
-```
+<MarbleDiagram
+  title="map(value => value * 10)"
+  rows={[
+    { label: 'source', marble: '--a--b--|', kind: 'source' },
+    { label: 'expected', marble: '--x--y--|', kind: 'output' },
+  ]}
+  values={{ a: '1', b: '2', x: '10', y: '20' }}
+  frameLabel="1 khoảng = 1 virtual frame"
+  caption="a và x cùng ở frame 2; b và y cùng ở frame 5; cả source lẫn expected complete ở frame 8."
+/>
 
-Trong chuỗi dành cho `TestScheduler`, `-` là một frame, `|` là complete và `#` là error. Whitespace được bỏ qua trong `run()` nên có thể dùng để căn dòng. Đừng sao chép ký hiệu `✕`, vòng tròn hay mũi tên từ hình minh họa vào test rồi mong parser hiểu chúng.
+Chuỗi truyền vào test lần lượt là `--a--b--|` cho `source` và `--x--y--|` cho `expected`; object `values` ánh xạ `a = 1`, `b = 2`, `x = 10`, `y = 20`. Trong `TestScheduler`, `-` là một frame, `|` là complete và `#` là error. Whitespace được bỏ qua trong `run()` nên có thể dùng để căn dòng. Đừng sao chép ký hiệu `✕`, vòng tròn hay mũi tên từ hình minh họa vào test rồi mong parser hiểu chúng.
 
 <Callout type="warn" title="Đừng biến mọi diagram thành đồng hồ thật">
   Marble testing dùng virtual time của RxJS scheduler. Nó không tự kiểm soát Promise, `fetch` hoặc mọi API async của JavaScript. Nếu pipeline đi qua cơ chế không được `TestScheduler` virtualize, hãy tách dependency hoặc dùng kiểu test async phù hợp.
@@ -379,15 +383,15 @@ Dòng `output next` và `output end` mô tả cùng một output. Đọc theo c�
 <MarbleDiagram
   title="filter(value => value > 1), take(2)"
   rows={[
-    { label: 'source$', marble: '-1-2-3', kind: 'source' },
+    { label: 'lịch nguồn', marble: '-1-2-3-4', kind: 'source' },
     { label: 'after filter', marble: '---2-3', kind: 'inner' },
     { label: 'upstream sub', marble: '^----!', kind: 'subscription' },
     { label: 'output next', marble: '---2-3', kind: 'output' },
     { label: 'output end', marble: '-----|', kind: 'output' },
   ]}
-  values={{ '1': '1', '2': '2', '3': '3' }}
+  values={{ '1': '1', '2': '2', '3': '3', '4': '4 — chỉ phát nếu subscription còn mở' }}
   frameLabel="Cột minh họa, không phải ms"
-  caption="Nguồn có thể phát tiếp nếu không bị hủy; hình chỉ vẽ những value thực sự đi qua execution này. Completion và unsubscribe được tách dòng để đối chiếu với value cuối."
+  caption="Lịch nguồn có 4 ở cột 7, nhưng take(2) complete output và hủy upstream ngay sau 3 ở cột 5. Vì vậy 4 không đi vào execution thực tế."
 />
 
 Bạn nên trả lời được:

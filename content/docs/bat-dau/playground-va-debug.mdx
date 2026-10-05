@@ -315,15 +315,26 @@ setTimeout(() => query$.next('rxjs 7'), 400);
 
 Timeline xấp xỉ:
 
-```text
-0 ms    [input] rxjs
-300 ms  [request] bắt đầu: rxjs
-400 ms  [input] rxjs 7
-700 ms  [request] bắt đầu: rxjs 7
-700 ms  [request] kết thúc hoặc bị hủy: rxjs
-1200 ms [view] Kết quả cho "rxjs 7"
-1200 ms [request] kết thúc hoặc bị hủy: rxjs 7
-```
+Đọc theo cột với một frame bằng 100 ms để phân biệt lần request bị hủy với lần complete bình thường:
+
+<MarbleDiagram
+  title="debounceTime(300), switchMap(request)"
+  rows={[
+    { label: 'input', marble: 'a---b', kind: 'source' },
+    { label: 'sau debounce', marble: '---a---b', kind: 'inner' },
+    { label: 'request rxjs', marble: '---^---!', kind: 'inner' },
+    { label: 'request rxjs 7', marble: '-------^----x', kind: 'inner' },
+    { label: 'request end', marble: '------------|', kind: 'inner' },
+    { label: 'view', marble: '------------x', kind: 'output' },
+  ]}
+  values={{
+    a: 'rxjs',
+    b: 'rxjs 7',
+    x: 'Kết quả cho rxjs 7',
+  }}
+  frameLabel="1 khoảng = 100 ms"
+  caption="Request rxjs bắt đầu ở 300 ms và bị hủy ở 700 ms khi query mới qua debounce. Request rxjs 7 phát rồi complete ở 1200 ms; finalize chạy ở cả marker ! lẫn completion."
+/>
 
 Request đầu đã bắt đầu ở khoảng 300 ms. Khi query thứ hai qua `debounceTime` ở khoảng 700 ms, `switchMap` unsubscribe inner stream đầu trước khi timer của nó kịp phát ở khoảng 800 ms. `finalize` chạy cho cả lần bị hủy lẫn lần complete bình thường, nên nhãn cố ý viết “kết thúc hoặc bị hủy”.
 

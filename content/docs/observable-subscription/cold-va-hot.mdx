@@ -285,10 +285,24 @@ Chỉ có một dòng `producer: tạo timer`, vì B đến khi execution của 
 
 `share()` trong RxJS 7.8.2 theo dõi số downstream subscriber đang active:
 
-```text
-số subscriber     0 ──► 1 ──► 2 ──► 1 ──► 0
-kết nối source    tắt   mở     giữ    giữ    đóng
-```
+Đọc theo cột để thấy connection upstream sống từ subscriber đầu tiên đến lúc người cuối cùng rời đi:
+
+<MarbleDiagram
+  title="share() reference count"
+  rows={[
+    { label: 'refCount', marble: 'a-b-c-d-e', kind: 'source' },
+    { label: 'source sub', marble: '--^-----!', kind: 'subscription' },
+  ]}
+  values={{
+    a: '0 subscriber',
+    b: 'A subscribe → 1',
+    c: 'B subscribe → 2',
+    d: 'A unsubscribe → 1',
+    e: 'B unsubscribe → 0',
+  }}
+  frameLabel="Cột sự kiện, không phải ms"
+  caption="share kết nối source khi refCount đổi 0 → 1 và giữ connection khi còn ít nhất một subscriber; refCount về 0 thì source bị unsubscribe và state được reset."
+/>
 
 Theo cấu hình mặc định:
 

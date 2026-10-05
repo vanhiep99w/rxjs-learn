@@ -174,15 +174,27 @@ Giả sử trang có một input `#product-search`, một danh sách `#results`,
 
 ### Luồng xử lý
 
-```text
-input event:  r ── rx ───── rxj ───────── rxjs ─────────────►
-                         chờ 300 ms     chờ 300 ms
-query sau debounce:         rxj             rxjs
-                              │               │
-request:                 start rxj ──X    start rxjs ──► kết quả
-                                      query mới
-                                      abort request cũ
-```
+Đọc theo cột để thấy debounce chỉ chuyển tiếp query sau một khoảng yên, còn `switchMap` hủy request đang chạy khi query có hiệu lực tiếp theo xuất hiện:
+
+<MarbleDiagram
+  title="debounceTime(300), switchMap(search)"
+  rows={[
+    { label: 'input', marble: 'a-b--c----d', kind: 'source' },
+    { label: 'sau debounce', marble: '--------c----d', kind: 'inner' },
+    { label: 'request rxj', marble: '--------^----!', kind: 'inner' },
+    { label: 'request rxjs', marble: '-------------^--x|', kind: 'inner' },
+    { label: 'output', marble: '----------------x', kind: 'output' },
+  ]}
+  values={{
+    a: 'r',
+    b: 'rx',
+    c: 'rxj',
+    d: 'rxjs',
+    x: 'kết quả rxjs',
+  }}
+  frameLabel="Khoảng minh họa; debounce = 300 ms"
+  caption="r và rx không sống qua khoảng yên. rxj tạo request đầu, nhưng query rxjs sau debounce hủy request đó; output chỉ nhận kết quả rxjs."
+/>
 
 ### Code TypeScript
 

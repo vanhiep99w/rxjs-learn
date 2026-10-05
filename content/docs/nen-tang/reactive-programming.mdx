@@ -56,13 +56,26 @@ Bạn có thể hình dung pipeline như một băng chuyền: mỗi trạm ch�
 
 Thay vì coi một biến là một ô chứa giá trị hiện tại, hãy coi dữ liệu thay đổi là một chuỗi emission:
 
-```text
-searchQuery$:  ──"r"──"rx"──"rxjs"────────────────────► thời gian
-                  │     │       │
-filter >= 2 ký tự ─────"rx"──"rxjs"────────────────────►
-debounce 300 ms   ─────────────"rxjs"───────────────────►
-request$:         ──────────────[kết quả cho "rxjs"]────►
-```
+Đọc theo cột để thấy mỗi operator giữ hoặc dời emission nào trước khi request trả kết quả:
+
+<MarbleDiagram
+  title="filter(...), debounceTime(300), switchMap(...)"
+  rows={[
+    { label: 'searchQuery$', marble: 'a-b--c', kind: 'source' },
+    { label: 'sau filter', marble: '--b--c', kind: 'inner' },
+    { label: 'sau debounce', marble: '--------c', kind: 'inner' },
+    { label: 'request$', marble: '--------^-x|', kind: 'inner' },
+    { label: 'output$', marble: '----------x', kind: 'output' },
+  ]}
+  values={{
+    a: 'r',
+    b: 'rx',
+    c: 'rxjs',
+    x: 'kết quả cho rxjs',
+  }}
+  frameLabel="Khoảng minh họa; debounce = 300 ms"
+  caption="r bị filter loại. rx bị query mới thay thế trước khi hết khoảng yên; chỉ rxjs tạo request và đi xuống output."
+/>
 
 Dấu `$` chỉ là convention phổ biến để báo rằng biến chứa Observable, không phải cú pháp bắt buộc của RxJS. Giá trị không bị “đẩy vào biến `$`”; Observable mô tả cách các giá trị sẽ được tạo và chuyển tiếp khi có subscriber.
 
@@ -229,12 +242,29 @@ function destroySearch(): void {
 
 Một chuỗi thao tác minh họa có thể là:
 
-```text
-Người dùng gõ:  r  →  rx  →  rxj  →  rxjs
-Request:                    rxj (bị thay thế) → rxjs
-UI nhận:                                      [kết quả rxjs]
-Hủy màn hình:                                 complete → finalize
-```
+Timeline đầy đủ còn phải thể hiện thời điểm màn hình hủy subscription:
+
+<MarbleDiagram
+  title="debounceTime(300), switchMap(search), takeUntil(destroy$)"
+  rows={[
+    { label: 'input', marble: 'a-b--c----d', kind: 'source' },
+    { label: 'sau debounce', marble: '--------c----d', kind: 'inner' },
+    { label: 'request rxj', marble: '--------^----!', kind: 'inner' },
+    { label: 'request rxjs', marble: '-------------^--x|', kind: 'inner' },
+    { label: 'upstream sub', marble: '^-----------------!', kind: 'subscription' },
+    { label: 'output next', marble: '----------------x', kind: 'output' },
+    { label: 'output end', marble: '------------------|', kind: 'output' },
+  ]}
+  values={{
+    a: 'r',
+    b: 'rx',
+    c: 'rxj',
+    d: 'rxjs',
+    x: 'kết quả rxjs',
+  }}
+  frameLabel="Khoảng minh họa; debounce = 300 ms"
+  caption="Request rxj bị thay thế; request rxjs phát kết quả rồi complete. Khi destroy$ phát ở cột 18, takeUntil complete output, hủy upstream và làm finalize chạy."
+/>
 
 ### Đọc pipeline từ trên xuống
 

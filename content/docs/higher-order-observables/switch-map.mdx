@@ -77,17 +77,25 @@ Không có hàng đợi cho input bị thay thế, cũng không có bước ch�
 
 Giả sử A đã phát `A1`, sau đó outer mới phát B. `A1` vẫn là một value hợp lệ mà downstream đã nhận; operator chỉ ngăn **emission tiếp theo của A** đi qua subscription cũ. Nó không xóa state, thu hồi side effect hay sửa lại output trong quá khứ.
 
-```text
-Sự kiện minh họa:
+Đọc theo cột để thấy `A1` đã phát trước lúc B đến nên vẫn thuộc output; chỉ emission tương lai của A bị chặn:
 
-0 ms     outer A → subscribe A
-100 ms   A phát A1 → output A1
-150 ms   outer B → unsubscribe A → subscribe B
-200 ms   A định phát A2 → không được chuyển tiếp qua subscription đã đóng
-250 ms   B phát B1 → output B1
-
-Output: A1, B1
-```
+<MarbleDiagram
+  title="switchMap(project)"
+  rows={[
+    { label: 'outer', marble: 'a--b', kind: 'source' },
+    { label: 'inner A', marble: '^-x!', kind: 'inner' },
+    { label: 'inner B', marble: '---^-y', kind: 'inner' },
+    { label: 'output', marble: '--x--y', kind: 'output' },
+  ]}
+  values={{
+    a: 'input A',
+    b: 'input B',
+    x: 'A1',
+    y: 'B1',
+  }}
+  frameLabel="1 khoảng = 50 ms"
+  caption="A1 phát ở 100 ms. B đến ở 150 ms và hủy A, nên A2 dự kiến ở 200 ms không đi xuống output; B1 phát ở 250 ms."
+/>
 
 Nếu UI cần xóa danh sách cũ ngay lúc đổi query, hãy phát trạng thái `waiting` hoặc `loading` từ inner mới. `switchMap` tự nó không làm UI trống đi trong thời gian chờ response.
 

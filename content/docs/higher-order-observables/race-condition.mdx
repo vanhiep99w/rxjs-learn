@@ -35,13 +35,29 @@ Bạn gõ `rx`, rồi đổi thành `rxjs`. Kết quả cho `rxjs` đã hiện l
 
 Giả sử request A tìm `rx` bắt đầu trước request B tìm `rxjs`, nhưng A mất nhiều thời gian hơn. Nếu cả hai callback đều ghi vào cùng một vùng kết quả, thứ tự response quyết định UI cuối cùng:
 
-```text
-Thời gian minh họa
-0 ms     Gõ rx     → bắt đầu A
-50 ms    Gõ rxjs   → bắt đầu B
-150 ms   B trả về  → UI hiển thị kết quả rxjs
-300 ms   A trả về  → UI bị ghi đè thành kết quả rx
-```
+Đọc theo cột để thấy request B bắt đầu sau nhưng hoàn tất trước; `mergeMap` vẫn giữ A nên kết quả cũ đến muộn và ghi đè UI:
+
+<MarbleDiagram
+  title="mergeMap(search)"
+  rows={[
+    { label: 'queries next', marble: 'ab', kind: 'source' },
+    { label: 'queries end', marble: '-|', kind: 'source' },
+    { label: 'request A next', marble: '^-----x', kind: 'inner' },
+    { label: 'request A end', marble: '------|', kind: 'inner' },
+    { label: 'request B next', marble: '-^-y', kind: 'inner' },
+    { label: 'request B end', marble: '---|', kind: 'inner' },
+    { label: 'output next', marble: '---y--x', kind: 'output' },
+    { label: 'output end', marble: '------|', kind: 'output' },
+  ]}
+  values={{
+    a: 'query rx',
+    b: 'query rxjs',
+    x: 'kết quả rx — đã cũ',
+    y: 'kết quả rxjs',
+  }}
+  frameLabel="1 khoảng = 50 ms"
+  caption="B trả về ở 150 ms, nhưng A vẫn active và trả về ở 300 ms. Nếu cả hai cùng ghi một state, kết quả rx cũ sẽ thắng chỉ vì đến sau."
+/>
 
 Race condition xuất hiện khi tính đúng đắn phụ thuộc vào thứ tự hoàn tất bất đồng bộ mà ứng dụng không kiểm soát. Trong tình huống này, lỗi không nằm ở việc A chậm; lỗi nằm ở việc A vẫn được phép cập nhật vùng UI đã thuộc về B.
 
@@ -111,12 +127,27 @@ queries$.pipe(
 
 Khi `queries$` phát `rxjs`, `switchMap` unsubscribe inner của `rx` trước khi tạo và subscribe inner mới. Timer cũ được dọn, nên nó không phát response cũ xuống observer.
 
-```text
-0 ms     nhận rx    → subscribe A
-50 ms    nhận rxjs  → unsubscribe A → subscribe B
-150 ms   B phát     → downstream nhận kết quả rxjs
-300 ms   A         → không còn subscription để cập nhật UI
-```
+Cùng input đó, `switchMap` đóng inner A ngay khi query mới xuất hiện:
+
+<MarbleDiagram
+  title="switchMap(search)"
+  rows={[
+    { label: 'queries next', marble: 'ab', kind: 'source' },
+    { label: 'queries end', marble: '-|', kind: 'source' },
+    { label: 'request A', marble: '^!', kind: 'inner' },
+    { label: 'request B next', marble: '-^-y', kind: 'inner' },
+    { label: 'request B end', marble: '---|', kind: 'inner' },
+    { label: 'output next', marble: '---y', kind: 'output' },
+    { label: 'output end', marble: '---|', kind: 'output' },
+  ]}
+  values={{
+    a: 'query rx',
+    b: 'query rxjs',
+    y: 'kết quả rxjs',
+  }}
+  frameLabel="1 khoảng = 50 ms"
+  caption="A bị unsubscribe ở 50 ms. B phát ở 150 ms rồi output complete; không còn subscription để kết quả A dự kiến ở 300 ms cập nhật UI."
+/>
 
 Mình chọn `switchMap` mặc định cho read request mà input mới thay thế hoàn toàn input cũ: search, xem chi tiết theo ID đang chọn, hoặc tải dữ liệu theo bộ lọc hiện tại. Nó bảo vệ output từ các inner cũ **sau khi input mới đã đến chính operator đó**; ranh giới này rất quan trọng khi đặt debounce phía trước.
 

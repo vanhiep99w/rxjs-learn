@@ -309,12 +309,20 @@ Với code mới, nếu API đã hỗ trợ Promise tốt và tác vụ chỉ tr
 
 `interval(period)` và `timer(due, period?)` đều phát số tăng dần, nhưng khác thời điểm emission đầu tiên:
 
-```text
-interval(1000):       ──1s── 0 ──1s── 1 ──1s── 2 ──►
-timer(0, 1000):       0 ──1s── 1 ──1s── 2 ─────────►
-timer(1000):          ──1s── 0 │ complete
-time ───────────────────────────────────────────────►
-```
+Đọc theo cột để so sánh emission đầu tiên; các nguồn periodic trong hình vẫn mở vì bản thân chúng không tự complete:
+
+<MarbleDiagram
+  title="interval(period) và timer(due, period?)"
+  rows={[
+    { label: 'interval(1s)', marble: '-012---', kind: 'source' },
+    { label: 'timer(0, 1s)', marble: '012----', kind: 'source' },
+    { label: 'timer(1s) next', marble: '-0', kind: 'source' },
+    { label: 'timer(1s) end', marble: '-|', kind: 'source' },
+  ]}
+  values={{ '0': 'tick 0', '1': 'tick 1', '2': 'tick 2' }}
+  frameLabel="1 khoảng = 1 giây"
+  caption="interval chờ một period trước tick 0; timer(0, 1s) phát tick 0 ngay; timer(1s) phát một lần sau một giây rồi complete."
+/>
 
 ```ts
 import { interval, take, timer } from 'rxjs';

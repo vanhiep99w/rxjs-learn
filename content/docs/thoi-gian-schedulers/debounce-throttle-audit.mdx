@@ -47,26 +47,26 @@ Với scheduler mặc định, tham số thời gian của ba operator `*Time` �
 
 Giả sử nguồn phát năm giá trị và ta dùng cửa sổ `300 ms`:
 
-```text
-Nguồn: A@0 ─ B@100 ─ C@180 ───────── D@700 ─ E@760
+Đọc theo cột với một frame bằng 20 ms để đối chiếu chính xác các deadline của cửa sổ 300 ms:
 
-Debounce:
-A đặt hạn @300
-B dời hạn @400
-C dời hạn @480 ───────────────► C@480
-D đặt hạn @1000
-E dời hạn @1060 ──────────────► E@1060
-
-Throttle mặc định:
-A@0 ─► phát A, khóa đến @300
-B và C bị bỏ
-D@700 ─► phát D, khóa đến @1000
-E bị bỏ
-
-Audit:
-A mở cửa sổ 0..300, giữ giá trị mới nhất ─► C@300
-D mở cửa sổ 700..1000, giữ mới nhất ─────► E@1000
-```
+<MarbleDiagram
+  title="debounceTime / throttleTime / auditTime (300)"
+  rows={[
+    { label: 'source', marble: 'a----b---c-------------------------d--e', kind: 'source' },
+    { label: 'debounceTime', marble: '------------------------c----------------------------e', kind: 'output' },
+    { label: 'throttleTime', marble: 'a----------------------------------d', kind: 'output' },
+    { label: 'auditTime', marble: '---------------c----------------------------------e', kind: 'output' },
+  ]}
+  values={{
+    a: 'A',
+    b: 'B',
+    c: 'C',
+    d: 'D',
+    e: 'E',
+  }}
+  frameLabel="1 khoảng = 20 ms"
+  caption="Source phát A@0, B@100, C@180, D@700, E@760. Debounce phát C@480 và E@1060; throttle phát A@0 và D@700; audit phát C@300 và E@1000."
+/>
 
 | Operator | Output trong ví dụ | Điều làm cửa sổ thay đổi |
 | --- | --- | --- |

@@ -232,12 +232,23 @@ B bỏ lỡ `0` và `1`; đây là hành vi đúng của live multicast. Nếu B
 
 Mỗi lần subscribe vào kết quả của `share()`, reference count tăng. Khi một subscriber unsubscribe, chỉ subscription của nó đóng; các subscriber còn lại vẫn nhận dữ liệu. Nếu source chưa complete hay error và người cuối cùng rời đi, mặc định `share()` unsubscribe connection đến source rồi reset state.
 
-```text
-refCount: 0 ── A subscribe ──► 1  (connect source)
-refCount: 1 ── B subscribe ──► 2  (dùng connection cũ)
-refCount: 2 ── A unsubscribe ► 1  (source vẫn chạy)
-refCount: 1 ── B unsubscribe ► 0  (disconnect và reset)
-```
+Đọc theo cột để tách lifecycle của từng consumer khỏi connection upstream dùng chung:
+
+<MarbleDiagram
+  title="share() reference count"
+  rows={[
+    { label: 'subscriber event', marble: 'a-b-c-d', kind: 'source' },
+    { label: 'source sub', marble: '^-----!', kind: 'subscription' },
+  ]}
+  values={{
+    a: 'A subscribe: refCount 0 → 1',
+    b: 'B subscribe: refCount 1 → 2',
+    c: 'A unsubscribe: refCount 2 → 1',
+    d: 'B unsubscribe: refCount 1 → 0',
+  }}
+  frameLabel="Cột sự kiện, không phải ms"
+  caption="A mở connection ở cột 0. A rời đi không dừng source vì B vẫn còn; B rời ở cột 6 mới disconnect và reset connection."
+/>
 
 Điều này đặc biệt quan trọng với timer, DOM listener và socket: chia sẻ không xóa nhu cầu quản lý lifecycle. Nó chỉ chuyển ownership của connection sang nhóm subscriber.
 

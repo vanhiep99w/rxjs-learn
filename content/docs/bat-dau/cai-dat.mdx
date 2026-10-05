@@ -226,21 +226,28 @@ sau khi kết thúc: true
 
 Khi khai báo `orderStatus$`, bạn mới tạo một công thức. Timer bắt đầu khi `subscribe()` nối Observer vào pipeline.
 
-```text
-subscribe
-    │
-    ▼
-interval: 0 ─────► 1 ─────► 2 ─────► ...
-    │              │         │
-    └──────────────┴─────────┴──► take(3)
-                                  │
-                                  ├──► map: trạng thái
-                                  ├──► Observer.complete()
-                                  └──► unsubscribe upstream
-                                             │
-                                             ▼
-                                          finalize
-```
+Đọc theo cột để thấy value thứ ba vừa được chuyển tiếp vừa làm `take(3)` đóng output và hủy timer upstream:
+
+<MarbleDiagram
+  title="take(3), map(toStatus)"
+  rows={[
+    { label: 'lịch interval', marble: '-0123', kind: 'source' },
+    { label: 'upstream sub', marble: '^--!', kind: 'subscription' },
+    { label: 'output next', marble: '-abc', kind: 'output' },
+    { label: 'output end', marble: '---|', kind: 'output' },
+  ]}
+  values={{
+    '0': '0',
+    '1': '1',
+    '2': '2',
+    '3': '3 — chỉ phát nếu subscription còn mở',
+    a: 'đã nhận',
+    b: 'đang xử lý',
+    c: 'hoàn tất',
+  }}
+  frameLabel="1 khoảng = 200 ms"
+  caption="Ở 600 ms, output phát “hoàn tất”, complete và hủy interval trong cùng lượt xử lý. finalize chạy khi subscription đóng; tick 3 ở 800 ms không xảy ra."
+/>
 
 Lifecycle cụ thể là:
 

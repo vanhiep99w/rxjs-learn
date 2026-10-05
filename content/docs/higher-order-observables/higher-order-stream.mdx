@@ -228,17 +228,28 @@ of(1, 2).pipe(
 
 `mergeMap` subscribe cả hai inner mà không chờ request `1` xong. Vì inner `2` phát trước, output cũng nhận `2` trước. Outer `of(1, 2)` đã complete đồng bộ, nhưng output vẫn đợi các inner đang chạy.
 
-```text
-Sự kiện mô phỏng với mergeMap:
+Đọc theo cột để thấy hai inner cùng bắt đầu ở mốc 0, nhưng inner `2` hoàn tất trước vì có latency ngắn hơn:
 
-t = 0 ms    outer phát 1 → subscribe inner 1
-            outer phát 2 → subscribe inner 2
-            outer complete
-
-t ≈ 20 ms   inner 2 phát user 2 rồi complete → output nhận user 2
-t ≈ 80 ms   inner 1 phát user 1 rồi complete → output nhận user 1
-            không còn inner đang chạy → output complete
-```
+<MarbleDiagram
+  title="mergeMap(loadUser$)"
+  rows={[
+    { label: 'outer next', marble: 'o', kind: 'source' },
+    { label: 'outer end', marble: '|', kind: 'source' },
+    { label: 'inner 1 next', marble: '^-------a', kind: 'inner' },
+    { label: 'inner 1 end', marble: '--------|', kind: 'inner' },
+    { label: 'inner 2 next', marble: '^-b', kind: 'inner' },
+    { label: 'inner 2 end', marble: '--|', kind: 'inner' },
+    { label: 'output next', marble: '--b-----a', kind: 'output' },
+    { label: 'output end', marble: '--------|', kind: 'output' },
+  ]}
+  values={{
+    o: '1, 2 rồi complete đồng bộ',
+    a: 'user 1',
+    b: 'user 2',
+  }}
+  frameLabel="1 khoảng = 10 ms"
+  caption="Inner 2 phát ở khoảng 20 ms, inner 1 phát ở khoảng 80 ms. Outer đã complete từ mốc 0, nhưng output đợi cả hai inner kết thúc."
+/>
 
 Nếu output được dùng để ghi vào một ô “user đang chọn”, kết quả cũ có thể ghi đè kết quả mới. Nhưng nếu đó là danh sách hai user cần tải độc lập, nhận kết quả theo thứ tự hoàn tất có thể hoàn toàn đúng.
 

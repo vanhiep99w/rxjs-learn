@@ -281,10 +281,17 @@ DOM event không tự complete chỉ vì người dùng ngừng tương tác. Li
 
 Mỗi lần subscribe vào Observable do `fromEvent()` trả về, RxJS đăng ký một handler. Khi subscription bị hủy, RxJS gỡ đúng handler đó.
 
-```text
-subscribe A ──► add handler A ──► unsubscribe A ──► remove handler A
-subscribe B ──► add handler B ──► unsubscribe B ──► remove handler B
-```
+Mỗi hàng dưới đây là một subscription riêng; marker `^` là lúc `fromEvent` thêm handler và `!` là lúc teardown gỡ đúng handler đó:
+
+<MarbleDiagram
+  title="fromEvent(target, eventName)"
+  rows={[
+    { label: 'handler A', marble: '^---!', kind: 'subscription' },
+    { label: 'handler B', marble: '--^---!', kind: 'subscription' },
+  ]}
+  frameLabel="Cột lifecycle, không phải ms"
+  caption="Hai subscription chồng lấp tạo hai handler độc lập. Unsubscribe A chỉ gỡ handler A; handler B tiếp tục sống đến marker ! của chính nó."
+/>
 
 Vì vậy, subscribe ba lần có thể tạo ba listener trên cùng target. Nếu nhiều consumer cần dùng chung một listener, đó là bài toán multicasting; hãy quyết định rõ bằng `share()` thay vì vô tình tạo subscription trùng lặp.
 

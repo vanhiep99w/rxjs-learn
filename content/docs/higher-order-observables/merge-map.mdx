@@ -94,14 +94,31 @@ from(jobs).pipe(
 
 `from(jobs)` phát cả ba input đồng bộ. Vì không đặt giới hạn, ba timer được subscribe gần như cùng lúc; B phát trước vì timer của B ngắn nhất. Outer đã complete từ lúc phát xong array, nhưng output còn chờ cả ba inner.
 
-```text
-Mốc minh họa (ms)     0        100        200        300
-outer                A,B,C,complete
-inner A              subscribe ───────────────────► A,complete
-inner B              subscribe ─► B,complete
-inner C              subscribe ──────────► C,complete
-output                         B          C          A,complete
-```
+Đọc theo cột để thấy ba inner cùng được subscribe ở mốc 0, rồi output nhận value theo thời điểm từng timer hoàn tất:
+
+<MarbleDiagram
+  title="mergeMap(project)"
+  rows={[
+    { label: 'outer next', marble: 'o', kind: 'source' },
+    { label: 'outer end', marble: '|', kind: 'source' },
+    { label: 'inner A next', marble: '^--a', kind: 'inner' },
+    { label: 'inner A end', marble: '---|', kind: 'inner' },
+    { label: 'inner B next', marble: '^b', kind: 'inner' },
+    { label: 'inner B end', marble: '-|', kind: 'inner' },
+    { label: 'inner C next', marble: '^-c', kind: 'inner' },
+    { label: 'inner C end', marble: '--|', kind: 'inner' },
+    { label: 'output next', marble: '-bca', kind: 'output' },
+    { label: 'output end', marble: '---|', kind: 'output' },
+  ]}
+  values={{
+    o: 'A, B, C rồi complete đồng bộ',
+    a: 'kết quả A',
+    b: 'kết quả B',
+    c: 'kết quả C',
+  }}
+  frameLabel="1 khoảng = 100 ms"
+  caption="B phát ở 100 ms, C ở 200 ms và A ở 300 ms. Outer complete từ mốc 0, nhưng output chỉ complete khi inner A cuối cùng kết thúc ở 300 ms."
+/>
 
 Với inner nhiều emission, output có thể xen kẽ, chẳng hạn `A1, B1, B2, A2`. Vì vậy, “kết quả nào xong trước về trước” chỉ là cách nói ngắn cho request phát một kết quả; quy tắc tổng quát là **inner nào phát value thì value ấy đi xuống ngay**.
 
@@ -170,11 +187,33 @@ from(jobs).pipe(
 
 Ngay lúc subscribe, A và B bắt đầu; C chờ trong buffer. Khoảng 100 ms, B phát kết quả rồi complete, giải phóng một slot để C bắt đầu. A và C đều dự kiến phát gần mốc 300 ms, nên không nên dựa vào thứ tự tương đối của hai kết quả cùng mốc trong ví dụ timer thực.
 
-```text
-0 ms      active: A, B       buffer: C
-100 ms    B complete        C bắt đầu; active: A, C
-~300 ms   A và C complete   buffer rỗng; output complete
-```
+Đọc theo cột với giới hạn hai inner active. C chỉ được subscribe sau khi B trả slot ở 100 ms:
+
+<MarbleDiagram
+  title="mergeMap(project, 2)"
+  rows={[
+    { label: 'outer next', marble: 'o', kind: 'source' },
+    { label: 'outer end', marble: '|', kind: 'source' },
+    { label: 'inner A next', marble: '^--a', kind: 'inner' },
+    { label: 'inner A end', marble: '---|', kind: 'inner' },
+    { label: 'inner B next', marble: '^b', kind: 'inner' },
+    { label: 'inner B end', marble: '-|', kind: 'inner' },
+    { label: 'inner C next', marble: '-^-c', kind: 'inner' },
+    { label: 'inner C end', marble: '---|', kind: 'inner' },
+    { label: 'output B', marble: '-b', kind: 'output' },
+    { label: 'output A', marble: '---a', kind: 'output' },
+    { label: 'output C', marble: '---c', kind: 'output' },
+    { label: 'output end', marble: '---|', kind: 'output' },
+  ]}
+  values={{
+    o: 'A, B, C rồi complete đồng bộ',
+    a: 'kết quả A',
+    b: 'kết quả B',
+    c: 'kết quả C',
+  }}
+  frameLabel="1 khoảng = 100 ms"
+  caption="A và B chiếm hai slot ở mốc 0; C nằm trong buffer. B complete ở 100 ms nên C bắt đầu. A và C cùng dự kiến kết thúc gần 300 ms; thứ tự tương đối của hai timer cùng mốc không được đảm bảo."
+/>
 
 Buffer giữ **outer value**, và projection cho value đang chờ chưa được gọi. Trong RxJS 7.8.2, các value chờ được lấy theo FIFO khi có slot. Thứ tự bắt đầu này không đảm bảo thứ tự phát kết quả.
 

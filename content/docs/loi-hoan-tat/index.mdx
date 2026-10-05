@@ -45,16 +45,21 @@ Bảng mô tả subscription ở boundary bạn đang quan sát. Operator có th
 
 ### Contract của một execution
 
-```text
-Một execution: next* (error | complete)?
+Đọc từng hàng như một execution độc lập. Với nhánh bị hủy, dòng `received` dừng mà không có terminal notification:
 
-Dữ liệu rồi hoàn tất:  --a--b--|
-Dữ liệu rồi lỗi:       --a--b--X
-Consumer hủy sớm:      --a--b--!    (không phải notification)
-Nguồn còn sống:        --a--b--c--...
-
-| = complete, X = error, ! = unsubscribe
-```
+<MarbleDiagram
+  title="complete, error và unsubscribe"
+  rows={[
+    { label: 'complete$', marble: '--a--b--|', kind: 'source' },
+    { label: 'error$', marble: '--a--b--#', kind: 'source' },
+    { label: 'cancel sub', marble: '^------!', kind: 'subscription' },
+    { label: 'received', marble: '--a--b', kind: 'source' },
+    { label: 'open$', marble: '--a--b--c---', kind: 'source' },
+  ]}
+  values={{ a: 'A', b: 'B', c: 'C' }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Complete và error là terminal notification. Unsubscribe ở cột 7 chỉ đóng subscription và chạy teardown; nó không gọi complete. open$ vẫn sống trong cửa sổ đang vẽ."
+/>
 
 Một execution có thể không phát giá trị nào, và cũng có thể không tự kết thúc. Nhưng khi đã gửi `error` hoặc `complete`, nó không gửi thêm `next` và không gửi terminal notification thứ hai.
 
@@ -98,12 +103,26 @@ Một request độc lập có thể kết thúc khi lỗi. Một stream click h
 
 Sơ đồ dưới đây mô tả recovery cục bộ trong một higher-order pipeline:
 
-```text
-Sự kiện A ──► request A ──error──► catchError ──► kết quả failed
-Sự kiện B ──► request B ──next───► kết quả ok
-     ▲
-     └── outer stream vẫn còn được subscribe
-```
+Đọc theo cột để thấy lỗi của request A được đổi thành fallback ngay trong inner; vì vậy outer vẫn nhận được sự kiện B:
+
+<MarbleDiagram
+  title="switchMap(id => request$.pipe(catchError(...)))"
+  rows={[
+    { label: 'outer', marble: 'a---b---', kind: 'source' },
+    { label: 'request A', marble: '^-#', kind: 'inner' },
+    { label: 'fallback A', marble: '--f|', kind: 'inner' },
+    { label: 'request B', marble: '----^-y|', kind: 'inner' },
+    { label: 'output', marble: '--f---y', kind: 'output' },
+  ]}
+  values={{
+    a: 'sự kiện A',
+    b: 'sự kiện B',
+    f: 'kết quả failed cho A',
+    y: 'kết quả ok cho B',
+  }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Fallback của A hoàn tất trước khi B đến. Error được chặn trong inner nên không đóng outer subscription; output tiếp tục nhận kết quả của B."
+/>
 
 Ví dụ độc lập này mô phỏng hai lần chọn mã hàng. Request đầu lỗi, nhưng lần chọn sau vẫn được xử lý:
 

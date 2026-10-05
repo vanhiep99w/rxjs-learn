@@ -36,13 +36,19 @@ Khi source phát `error`, subscription đó đã kết thúc. `retry` giữ lỗ
 
 Hình dung bạn gọi lại một cuộc điện thoại bị ngắt: đó là cuộc gọi mới, không phải nối lại đúng câu vừa mất. Nhưng khác với cuộc gọi, RxJS không xóa những value mà subscriber đã nhận ở lần trước.
 
-```text
-Lần đầu:        A ── B ── error
-                           │ retry: subscribe lại source
-Lần thứ hai:               A ── B ── C ── complete
+Đọc theo cột để thấy error của lần đầu bị `retry` giữ lại, sau đó một subscription mới chạy source từ đầu:
 
-Output:         A ── B ─── A ── B ── C ── complete
-```
+<MarbleDiagram
+  title="retry(1)"
+  rows={[
+    { label: 'attempt 1', marble: '-a-b-#', kind: 'source' },
+    { label: 'attempt 2', marble: '-----^-a-b-c-|', kind: 'inner' },
+    { label: 'output', marble: '-a-b---a-b-c-|', kind: 'output' },
+  ]}
+  values={{ a: 'A', b: 'B', c: 'C' }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Attempt 1 error ở cột 5; retry subscribe lại tại cột đó. A và B đã nhận trước lỗi không bị thu hồi nên xuất hiện lần nữa ở output."
+/>
 
 Ví dụ sau cố tình phát một value trước khi lỗi để bạn thấy dữ liệu có thể lặp:
 

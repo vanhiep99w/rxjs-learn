@@ -214,16 +214,31 @@ Bốn subscription độc lập nên log giữa các chiến lược có thể x
 
 Đây là thời gian lý tưởng để suy luận, không phải cam kết chính xác của wall clock. Callback timer có thể chạy muộn khi runtime bận. Muốn kiểm tra timing có tính quyết định, dùng [TestScheduler](/docs/testing/test-scheduler).
 
-```text
-Outer tại t≈0: A → B → C → complete
+Đọc theo cột để so sánh output của bốn subscription độc lập. Outer phát A, B, C rồi complete đồng bộ ở mốc 0:
 
-concatMap:     [ A 300 ms ][ B 100 ms ][ C 200 ms ] → complete
-mergeMap:      [ A 300 ms ]                         → complete
-               [ B 100 ms ]
-               [ C 200 ms ]
-switchMap:     hủy A, hủy B, [ C 200 ms ]            → complete
-exhaustMap:    [ A 300 ms ], bỏ B và C                → complete
-```
+<MarbleDiagram
+  title="flattening policies"
+  rows={[
+    { label: 'outer next', marble: 'o', kind: 'source' },
+    { label: 'outer end', marble: '|', kind: 'source' },
+    { label: 'concatMap', marble: '---ab-c', kind: 'output' },
+    { label: 'concat end', marble: '------|', kind: 'output' },
+    { label: 'mergeMap', marble: '-bca', kind: 'output' },
+    { label: 'merge end', marble: '---|', kind: 'output' },
+    { label: 'switchMap', marble: '--c', kind: 'output' },
+    { label: 'switch end', marble: '--|', kind: 'output' },
+    { label: 'exhaustMap', marble: '---a', kind: 'output' },
+    { label: 'exhaust end', marble: '---|', kind: 'output' },
+  ]}
+  values={{
+    o: 'A, B, C rồi complete đồng bộ',
+    a: 'kết quả A',
+    b: 'kết quả B',
+    c: 'kết quả C',
+  }}
+  frameLabel="1 khoảng = 100 ms"
+  caption="concatMap phát A@300, B@400, C@600; mergeMap phát B@100, C@200, A@300; switchMap chỉ giữ C@200; exhaustMap chỉ nhận A@300."
+/>
 
 Vì inner là timer async nên chúng vẫn active khi B và C đến. Nếu đổi `work` thành `of(job)` phát và complete ngay, cả bốn đều có thể cho A → B → C: lúc event tiếp theo đến, inner trước đã xong. Đó là lý do ví dụ thuần đồng bộ thường không thể hiện khác biệt giữa các flattening policy.
 

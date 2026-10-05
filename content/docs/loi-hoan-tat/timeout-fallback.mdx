@@ -37,12 +37,26 @@ Trong thời gian cho phép, output chuyển tiếp các value của source. N�
 - Không có `with`: phát `TimeoutError` xuống error channel.
 - Có `with`: subscribe vào nguồn fallback do factory trả về, không tự phát `TimeoutError`.
 
-```text
-source ── chờ value ── hết hạn
-                         │ unsubscribe source
-                         ├── không có with ──► TimeoutError
-                         └── có with ────────► fallback ──► output
-```
+Đọc theo cột để so sánh hai subscription độc lập: một nhánh dùng hành vi mặc định, nhánh còn lại cấu hình `with`:
+
+<MarbleDiagram
+  title="timeout({ first, with? })"
+  rows={[
+    { label: 'lịch source', marble: '------x|', kind: 'source' },
+    { label: 'source sub', marble: '^--!', kind: 'subscription' },
+    { label: 'fallback next', marble: '---^f', kind: 'inner' },
+    { label: 'fallback end', marble: '----|', kind: 'inner' },
+    { label: 'không with', marble: '---#', kind: 'output' },
+    { label: 'có with next', marble: '----f', kind: 'output' },
+    { label: 'có with end', marble: '----|', kind: 'output' },
+  ]}
+  values={{
+    x: 'value muộn của source',
+    f: 'giá trị fallback',
+  }}
+  frameLabel="1 khoảng = 1 frame minh họa"
+  caption="Timeout xảy ra ở frame 3 và hủy source trước value x ở frame 6. Không có with thì output error; có with thì fallback được subscribe và quyết định notification tiếp theo."
+/>
 
 Các value đã phát trước timeout không bị thu hồi. Sau khi chuyển sang fallback, subscription này không quay lại source cũ dù source có dữ liệu muộn hơn.
 
@@ -81,12 +95,20 @@ Không có log response: timer nguồn bị unsubscribe trước mốc ba giây.
 
 Ví dụ giả sử `each: 1_000`, source phát `A` ở 400 ms, phát `B` ở 900 ms rồi không phát gì nữa và chưa complete:
 
-```text
-Mốc từ subscribe      0 ms       400 ms       900 ms       1.900 ms
-source                subscribe  A            B            im lặng
-hạn chờ đang áp dụng  1.000 ms    1.400 ms     1.900 ms     timeout
-output                           A            B            TimeoutError
-```
+Đọc theo cột với một frame bằng 100 ms. Mỗi `next` đặt lại deadline thêm 1.000 ms:
+
+<MarbleDiagram
+  title="timeout({ each: 1000 })"
+  rows={[
+    { label: 'source', marble: '----a----b----------', kind: 'source' },
+    { label: 'source sub', marble: '^------------------!', kind: 'subscription' },
+    { label: 'output next', marble: '----a----b', kind: 'output' },
+    { label: 'output end', marble: '-------------------#', kind: 'output' },
+  ]}
+  values={{ a: 'A', b: 'B' }}
+  frameLabel="1 khoảng = 100 ms"
+  caption="A@400 dời hạn tới 1400 ms; B@900 dời hạn tới 1900 ms. Source im lặng sau B nên timeout error ở 1900 ms và hủy upstream."
+/>
 
 Tổng thời gian đã vượt một giây nhưng chưa timeout ở mốc 1.000 ms, vì `B` đã reset timer. `each` không giới hạn tổng thời lượng stream. Nếu nguồn phát đều trước mỗi hạn, stream có thể sống vô hạn.
 

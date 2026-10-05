@@ -34,17 +34,25 @@ Một Observable đã phát `error` thì không phát thêm `next` hay `complete
 
 Hình dung một chuyến giao hàng bị hủy và bạn đặt chuyến khác. Người nhận có thể vẫn nhận được hàng, nhưng chuyến cũ không tiếp tục chạy. Điểm khác với ví dụ đời thường là fallback trong RxJS không nhất thiết có dữ liệu: nó có thể complete ngay, phát lỗi mới hoặc không kết thúc.
 
-```text
-source       ── A ── B ── error
-                            │
-                            ▼
-                       catchError
-                            │ subscribe fallback
-                            ▼
-fallback                    F ── complete
+Đọc theo cột để thấy error đóng source cũ, còn fallback bắt đầu một execution mới tại đúng boundary của `catchError`:
 
-output       ── A ── B ── F ── complete
-```
+<MarbleDiagram
+  title="catchError(() => fallback$)"
+  rows={[
+    { label: 'source', marble: '-a-b-#', kind: 'source' },
+    { label: 'fallback next', marble: '-----f', kind: 'inner' },
+    { label: 'fallback end', marble: '-----|', kind: 'inner' },
+    { label: 'output next', marble: '-a-b-f', kind: 'output' },
+    { label: 'output end', marble: '-----|', kind: 'output' },
+  ]}
+  values={{
+    a: 'A',
+    b: 'B',
+    f: 'giá trị fallback',
+  }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="A và B đã phát vẫn được giữ. Khi source error ở cột 5, fallback phát F rồi complete; output nhận completion từ fallback chứ source cũ không sống lại."
+/>
 
 Các value đã phát trước lỗi được giữ nguyên; không có rollback. Output complete hay error tiếp theo phụ thuộc fallback, không phụ thuộc kết thúc lỗi của source cũ nữa.
 
@@ -267,18 +275,55 @@ queries$.complete();
 
 Bản thân `queries$` chưa bị complete tại lỗi; subscription của pipeline tới nó đã bị hủy. Với `mergeMap`, một lỗi inner không được xử lý sẽ làm output error và hủy cả những inner đang chạy khác, nên bắt lỗi trong từng inner càng quan trọng nếu các công việc độc lập.
 
-```text
-Bắt trong inner:
-outer ── thao tác A ── thao tác B ── thao tác C ── ...
-             │             │             │
-         thành công     fallback     thành công
+Khi bắt lỗi trong inner, mỗi operation có boundary riêng nên outer vẫn nhận trigger tiếp theo:
 
-Bắt ngoài:
-outer ── thao tác A ── thao tác B
-             │             │
-         thành công       error ──► fallback ──► complete
-                                   (ngừng nghe outer)
-```
+<MarbleDiagram
+  title="switchMap(value => inner$.pipe(catchError(...)))"
+  rows={[
+    { label: 'outer', marble: 'a---b---c---', kind: 'source' },
+    { label: 'request A', marble: '^-x|', kind: 'inner' },
+    { label: 'request B', marble: '----^-#', kind: 'inner' },
+    { label: 'fallback B', marble: '------f', kind: 'inner' },
+    { label: 'fallback B end', marble: '------|', kind: 'inner' },
+    { label: 'request C', marble: '--------^-z|', kind: 'inner' },
+    { label: 'output', marble: '--x---f---z', kind: 'output' },
+  ]}
+  values={{
+    a: 'thao tác A',
+    b: 'thao tác B',
+    c: 'thao tác C',
+    x: 'kết quả A',
+    f: 'fallback cho B',
+    z: 'kết quả C',
+  }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Request B error và được đổi thành fallback tại cột 6. Outer vẫn active nên thao tác C ở cột 8 tiếp tục tạo request mới."
+/>
+
+Khi `catchError` nằm ngoài flattening operator, lỗi của B đóng subscription tới outer trước khi chuyển sang fallback:
+
+<MarbleDiagram
+  title="switchMap(value => inner$), catchError(...)"
+  rows={[
+    { label: 'lịch outer', marble: 'a---b---c---', kind: 'source' },
+    { label: 'outer sub', marble: '^-----!', kind: 'subscription' },
+    { label: 'request A', marble: '^-x|', kind: 'inner' },
+    { label: 'request B', marble: '----^-#', kind: 'inner' },
+    { label: 'fallback', marble: '------f', kind: 'inner' },
+    { label: 'fallback end', marble: '------|', kind: 'inner' },
+    { label: 'output next', marble: '--x---f', kind: 'output' },
+    { label: 'output end', marble: '------|', kind: 'output' },
+  ]}
+  values={{
+    a: 'thao tác A',
+    b: 'thao tác B',
+    c: 'thao tác C — không được nhận',
+    x: 'kết quả A',
+    f: 'fallback cho toàn pipeline',
+  }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Lỗi B ở cột 6 hủy subscription outer, rồi fallback phát và complete output. Trigger C theo lịch ở cột 8 không còn consumer."
+/>
 
 Mình dùng handler ngoài khi muốn kết thúc toàn luồng là chủ đích, chẳng hạn một workflow một lần không thể tiếp tục sau lỗi. Không nên dùng nó để “giữ UI sống” nếu fallback chỉ là `of(...)` hoặc `EMPTY`.
 

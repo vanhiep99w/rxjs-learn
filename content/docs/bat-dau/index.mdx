@@ -74,15 +74,26 @@ complete
 
 ### Đọc pipeline theo luồng dữ liệu
 
-```text
-source$       (1) ── (2) ── (3) ── (4) ── complete
-                       │               │
-filter số chẵn         (2)             (4)
-                       │               │
-map thành nhãn     "item-2"        "item-4"
-                       │               │
-Observer          next(value)      next(value) ── complete
-```
+Đọc theo cột để thấy `filter` bỏ số lẻ, còn `map` đổi nhãn mà không thay đổi thứ tự notification:
+
+<MarbleDiagram
+  title="filter(even), map(toLabel)"
+  rows={[
+    { label: 'source$', marble: '-1-2-3-4-|', kind: 'source' },
+    { label: 'sau filter', marble: '---2---4-|', kind: 'inner' },
+    { label: 'output$', marble: '---a---b-|', kind: 'output' },
+  ]}
+  values={{
+    '1': '1',
+    '2': '2',
+    '3': '3',
+    '4': '4',
+    a: 'item-2',
+    b: 'item-4',
+  }}
+  frameLabel="Sync: cột chỉ minh họa thứ tự"
+  caption="1 và 3 bị loại; 2 thành item-2, 4 thành item-4. Completion đi qua toàn bộ pipeline ở cột 9."
+/>
 
 Có thể đọc ví dụ theo bốn bước:
 

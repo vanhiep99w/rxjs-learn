@@ -40,13 +40,19 @@ Bạn gọi API lấy trạng thái một job, request hoàn tất nhưng job v�
 
 Hình dung bạn gọi lại quán để hỏi tình trạng món ăn: mỗi cuộc gọi là một lần hỏi mới, không phải nghe lại bản ghi cuộc gọi trước. Ví von này chỉ đúng nếu source thực sự tạo công việc mới khi được subscribe; một Promise đã tạo sẵn thì không làm điều đó.
 
-```text
-Lượt source 1:  A ── B ── complete
-                              │ subscribe lại
-Lượt source 2:                A ── B ── complete
+Đọc theo cột để thấy completion của lượt đầu kích hoạt subscription thứ hai thay vì đi ngay xuống Observer:
 
-Output:        A ── B ─────── A ── B ── complete
-```
+<MarbleDiagram
+  title="repeat(2)"
+  rows={[
+    { label: 'lượt 1', marble: '-a-b-|', kind: 'source' },
+    { label: 'lượt 2', marble: '-----^-a-b-|', kind: 'inner' },
+    { label: 'output', marble: '-a-b---a-b-|', kind: 'output' },
+  ]}
+  values={{ a: 'A', b: 'B' }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Lượt 1 complete ở cột 5; repeat subscribe lại tại cột đó. Observer chỉ nhận complete cuối cùng sau lượt 2 ở cột 11."
+/>
 
 Sơ đồ trên minh họa `repeat(2)`, không phải thời gian chính xác. Complete của lượt đầu bị `repeat` giữ lại để bắt đầu lượt tiếp; Observer phía sau chỉ nhận complete khi hết số lượt hoặc khi notifier yêu cầu kết thúc. Các value đã phát không bị xóa giữa các lượt.
 

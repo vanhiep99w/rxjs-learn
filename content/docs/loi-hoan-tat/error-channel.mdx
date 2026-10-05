@@ -43,15 +43,19 @@ Một Observer nhận ba loại notification: `next(value)` để nhận dữ li
 
 Contract có thể viết gọn như sau:
 
-```text
-next* (error | complete)?
+Ba execution độc lập dưới đây dùng cùng trục frame để làm rõ ba khả năng kết thúc:
 
-Dữ liệu rồi lỗi:       --a--b--X
-Dữ liệu rồi hoàn tất:  --a--b--|
-Không kết thúc:       --a--b--c--...
-
-X = error, | = complete
-```
+<MarbleDiagram
+  title="Observable execution contract"
+  rows={[
+    { label: 'complete$', marble: '--a--b--|', kind: 'source' },
+    { label: 'error$', marble: '--a--b--#', kind: 'source' },
+    { label: 'open$', marble: '--a--b--c---', kind: 'source' },
+  ]}
+  values={{ a: 'A', b: 'B', c: 'C' }}
+  frameLabel="Cột minh họa, không phải ms"
+  caption="Mỗi execution có thể có nhiều next nhưng tối đa một terminal notification: complete hoặc error. open$ chưa có terminal notification trong cửa sổ đang vẽ."
+/>
 
 Một execution có thể gửi nhiều `next`, nhưng chỉ có tối đa một terminal notification: **hoặc `error`, hoặc `complete`**. Sau `error`, Observer không nhận thêm `next` hay `complete` từ execution đó. Không có terminal notification cũng hợp lệ, chẳng hạn một stream DOM event còn đang được lắng nghe.
 
@@ -270,10 +274,27 @@ complete
 
 Sơ đồ chuyển nguồn rất ngắn:
 
-```text
-source:    --2--0(X)     [execution nguồn kết thúc]
-output:    --5-----(-1)--|   [giá trị sau lỗi đến từ fallback]
-```
+Đọc theo cột để thấy input `0` làm `map` error; fallback `-1` thay execution đã lỗi ngay tại cùng boundary:
+
+<MarbleDiagram
+  title="map(10 / divisor), catchError(...)"
+  rows={[
+    { label: 'source input', marble: '--a--b', kind: 'source' },
+    { label: 'map output', marble: '--x--#', kind: 'inner' },
+    { label: 'fallback next', marble: '-----f', kind: 'inner' },
+    { label: 'fallback end', marble: '-----|', kind: 'inner' },
+    { label: 'output next', marble: '--x--f', kind: 'output' },
+    { label: 'output end', marble: '-----|', kind: 'output' },
+  ]}
+  values={{
+    a: 'divisor 2',
+    b: 'divisor 0',
+    x: '5',
+    f: '-1 từ fallback',
+  }}
+  frameLabel="Sync: cột chỉ minh họa thứ tự"
+  caption="Sau divisor 0, execution nguồn đóng nên phần tử 5 tiếp theo của of(2, 0, 5) không được xử lý. Output phát -1 rồi complete theo fallback."
+/>
 
 Ở đây `-1` chỉ là giá trị minh họa, không phải khuyến nghị giấu lỗi trong một con số đặc biệt. Với ứng dụng thật, dùng fallback có nghĩa rõ ràng hoặc một kiểu trạng thái để UI phân biệt dữ liệu thật với thất bại.
 
