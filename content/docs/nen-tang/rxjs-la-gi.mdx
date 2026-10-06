@@ -63,15 +63,56 @@ Mỗi mũi tên biểu diễn giá trị đi theo hướng producer đến consu
 
 ### Năm mảnh ghép cốt lõi
 
-| Mảnh ghép | Câu hỏi nó trả lời | Vai trò |
-| --- | --- | --- |
-| **Observable** | Dữ liệu đến từ đâu và được tạo thế nào? | Mô tả nguồn cùng cách nối producer với consumer. |
-| **Observer** | Làm gì khi có giá trị, lỗi hoặc hoàn tất? | Consumer gồm các callback `next`, `error`, `complete`; có thể chỉ cung cấp callback cần dùng. |
-| **Subscription** | Execution này còn hoạt động không, dừng bằng cách nào? | Đại diện cho một execution và có phương thức `unsubscribe()`. |
-| **Operator** | Biến đổi luồng ra sao? | Nhận một Observable, trả về Observable mới để lọc, ánh xạ, kết hợp hoặc điều khiển thời gian. |
-| **Notification** | Producer đang báo điều gì? | `next` mang giá trị; `error` và `complete` là hai tín hiệu kết thúc loại trừ nhau. |
+Năm khái niệm này dễ rối vì chúng **không phải năm bước ngang hàng**. Hãy đặt chúng vào cùng một ví dụ trước, rồi mới gọi tên từng phần:
 
-Tên biến Observable thường có hậu tố `$`, chẳng hạn `searchTerm$`. Đây là convention phổ biến chứ không phải cú pháp bắt buộc; mục đích là giúp người đọc nhận ra biến đó cần được `subscribe` hoặc tiếp tục đưa qua `pipe`.
+```ts
+import { filter, fromEvent, map } from 'rxjs';
+
+const button = document.querySelector<HTMLButtonElement>('#save');
+
+if (!button) {
+  throw new Error('Không tìm thấy #save');
+}
+
+// Observable + operators: mô tả luồng click cần nhận.
+const clickX$ = fromEvent<MouseEvent>(button, 'click').pipe(
+  map((event) => event.clientX),
+  filter((x) => x >= 100),
+);
+
+// Observer: mô tả cách phản ứng với từng tín hiệu của luồng.
+const observer = {
+  next: (x: number) => console.log('Tọa độ x:', x),
+  error: (error: unknown) => console.error('Lỗi:', error),
+  complete: () => console.log('Hoàn tất'),
+};
+
+// subscribe tạo một lần chạy và trả về Subscription.
+const subscription = clickX$.subscribe(observer);
+
+// Khi rời trang, dừng lần chạy này.
+window.addEventListener(
+  'pagehide',
+  () => subscription.unsubscribe(),
+  { once: true },
+);
+```
+
+Đọc ví dụ theo thứ tự sau:
+
+1. **Observable** — `clickX$` là mô tả của luồng: nghe click ở đâu và dữ liệu phải đi qua những bước nào. Bản thân biến này không phải là “giá trị click hiện tại”.
+2. **Operator** — `map` và `filter` là các trạm xử lý. `map` đổi `MouseEvent` thành tọa độ `x`; `filter` chỉ cho tọa độ từ `100` trở lên đi tiếp.
+3. **Observer** — object `observer` là phía nhận kết quả. Nó định nghĩa cách phản ứng khi có giá trị (`next`), có lỗi (`error`) hoặc nguồn hoàn tất (`complete`).
+4. **Subscription** — `subscription` đại diện cho đúng lần kết nối được tạo bởi `subscribe`. Khi trang đóng, `unsubscribe()` tháo DOM listener và dừng lần chạy đó.
+5. **Notification** — là từng tín hiệu chạy trong pipeline. Một click hợp lệ tạo notification `next(x)`; `error` và `complete` là hai notification kết thúc, sau đó luồng không phát thêm giá trị. Bạn thường không cần tự tạo object notification.
+
+<Callout type="idea" title="Gói cả năm khái niệm trong một câu">
+  Bạn `subscribe` một **Observer** vào một **Observable**. Lần subscribe đó tạo ra một **Subscription**. Trong khi subscription còn mở, các **Notification** đi qua chuỗi **Operator** tới observer.
+</Callout>
+
+`fromEvent` thường không tự `complete`: gọi `unsubscribe()` chỉ dừng subscription, không gọi callback `complete`. Chi tiết này sẽ quan trọng khi bạn học về lifecycle và teardown.
+
+Tên biến Observable thường có hậu tố `$`, chẳng hạn `clickX$` hoặc `searchTerm$`. Đây chỉ là convention để người đọc nhận ra “đây là một Observable”, không phải cú pháp bắt buộc của RxJS.
 
 ### Observable là công thức chứ không phải hộp dữ liệu
 
