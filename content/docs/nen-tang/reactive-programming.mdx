@@ -122,7 +122,7 @@ type Temperature = {
   fahrenheit: number;
 };
 
-const hotDays$ = from([18, 21, 27, 31]).pipe(
+const highTemperatures$ = from([18, 21, 27, 31]).pipe(
   map(
     (celsius): Temperature => ({
       celsius,
@@ -133,7 +133,7 @@ const hotDays$ = from([18, 21, 27, 31]).pipe(
   finalize(() => console.log('pipeline đã được dọn')),
 );
 
-const subscription = hotDays$.subscribe({
+const subscription = highTemperatures$.subscribe({
   next: ({ celsius, fahrenheit }) =>
     console.log(`${celsius}°C = ${fahrenheit}°F`),
   error: (error: unknown) => console.error('Lỗi:', error),
@@ -157,13 +157,19 @@ closed: true
 
 ### Điều gì thực sự xảy ra khi subscribe?
 
-Pipeline phía trên chỉ là mô tả cho đến khi có subscriber. Có thể đọc execution theo chuỗi sau:
+Với `from(array)` trong ví dụ trên, bạn có thể nhớ ngắn gọn thế này:
+
+<Callout type="idea" title="Cách nhớ">
+  Không có `subscribe()` thì pipeline chưa chạy. **Mỗi lần** gọi `subscribe()` sẽ bắt đầu một lần chạy riêng.
+</Callout>
+
+Khi chưa được subscribe, `highTemperatures$` mới chỉ là công thức: lấy dữ liệu từ `from`, đổi dữ liệu bằng `map`, rồi lọc bằng `filter`. Đến dòng `highTemperatures$.subscribe(...)`, RxJS mới đi ngược về source và bắt đầu đẩy giá trị qua pipeline:
 
 ```text
 subscribe()
     │
     ▼
-from tạo emission ─► map ─► filter ─► observer.next
+from phát giá trị ─► map ─► filter ─► observer.next
     │
     └── hết mảng ───────────────────► observer.complete
                                            │
@@ -171,7 +177,35 @@ from tạo emission ─► map ─► filter ─► observer.next
                                       teardown / finalize
 ```
 
-Với Observable mặc định dạng cold, mỗi lần `subscribe()` thường tạo một execution riêng. Đây là lý do subscribe hai lần có thể chạy producer hai lần, chẳng hạn gửi hai HTTP request. Phân biệt cold/hot và chia sẻ execution là chủ đề riêng; đừng thêm `share` chỉ để “cho chắc” khi chưa xác định producer nào cần dùng chung.
+Từ **“mỗi lần”** rất quan trọng. Cold Observable không bật một pipeline dùng chung ngay khi “có ít nhất một subscriber”. Thay vào đó, mỗi subscriber nhận một execution độc lập:
+
+```ts
+import { from } from 'rxjs';
+
+const numbers$ = from([1, 2, 3]);
+
+numbers$.subscribe((value) => console.log('A:', value));
+numbers$.subscribe((value) => console.log('B:', value));
+```
+
+Kết quả:
+
+```text
+A: 1
+A: 2
+A: 3
+B: 1
+B: 2
+B: 3
+```
+
+Không gọi `subscribe()` thì không có dòng nào được in. Gọi hai lần thì mảng được đọc lại hai lần; với Observable gọi HTTP, điều đó có thể đồng nghĩa với hai request.
+
+<Callout type="info" title="Ngoại lệ: hot Observable">
+  Quy tắc trên áp dụng cho **cold Observable**. Một nguồn hot có thể đã hoạt động và phát giá trị dù chưa có subscriber; subscriber chỉ nhận các giá trị phát ra sau khi tham gia. Xem [Cold và hot Observable](/docs/observable-subscription/cold-va-hot) để phân biệt hai trường hợp.
+</Callout>
+
+Chỉ dùng các operator chia sẻ như `share` khi nhiều subscriber thật sự cần dùng chung một execution, không phải chỉ để “cho chắc”.
 
 ## Ví dụ thực tế: tìm kiếm khi người dùng nhập
 
