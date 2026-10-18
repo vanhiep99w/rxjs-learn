@@ -1,0 +1,1302 @@
+---
+title: Tự implement RxJS từ callback
+description: Xây Observable, Observer, Subscriber, teardown, pipe và map từng bước để hiểu chính xác ai gọi ai bên trong một stream.
+---
+
+Bạn đã biết viết `source$.pipe(map(...)).subscribe(...)`, nhưng vẫn chưa hình dung được ai gọi ai? Bài này không bắt đầu bằng cách sử dụng thư viện. Mình sẽ **tự viết cơ chế bên trong**, từ một callback bình thường đến một chuỗi operator có cleanup.
+
+Những câu hỏi như “sau complete thì next bị chặn ở đâu?”, “hàm add ở đâu ra?” và “upstream, downstream là ai?” đều được trả lời ngay tại đoạn code tạo ra hành vi đó. Mình dùng tên biến dễ đọc trước, rồi mới đối chiếu với thuật ngữ RxJS.
+
+<Callout type="info" title="Đây là implementation để học">
+  Code dùng TypeScript, không import RxJS. Nó mô phỏng một phần cơ chế của RxJS, không sao chép đầy đủ mã nguồn hoặc cam kết tương thích với mọi hành vi của thư viện. Bạn chỉ cần biết function, callback, object, class và `setInterval`.
+</Callout>
+
+## Mục lục
+
+- [Cách đọc bài này](#cách-đọc-bài-này)
+- [Bắt đầu từ một callback](#bắt-đầu-từ-một-callback)
+- [Observable chỉ giữ hàm tạo dữ liệu](#observable-chỉ-giữ-hàm-tạo-dữ-liệu)
+  - [Constructor chưa chạy producer](#constructor-chưa-chạy-producer)
+  - [Subscribe mới chạy producer](#subscribe-mới-chạy-producer)
+- [Observer là object chứa ba callback](#observer-là-object-chứa-ba-callback)
+  - [Interface không làm gì ở runtime](#interface-không-làm-gì-ở-runtime)
+  - [Ai gọi next và complete](#ai-gọi-next-và-complete)
+- [Subscriber chặn notification sau khi kết thúc](#subscriber-chặn-notification-sau-khi-kết-thúc)
+  - [Đặt trạng thái dừng ở đâu](#đặt-trạng-thái-dừng-ở-đâu)
+  - [Observable phải bọc Observer bằng Subscriber](#observable-phải-bọc-observer-bằng-subscriber)
+  - [Chặn notification chưa phải dừng công việc](#chặn-notification-chưa-phải-dừng-công-việc)
+- [Subscription và teardown dọn tài nguyên](#subscription-và-teardown-dọn-tài-nguyên)
+  - [Producer trả về cách dọn dẹp](#producer-trả-về-cách-dọn-dẹp)
+  - [Hàm add ở đâu ra](#hàm-add-ở-đâu-ra)
+  - [Subscriber kế thừa Subscription](#subscriber-kế-thừa-subscription)
+  - [Complete đồng bộ trước khi nhận teardown](#complete-đồng-bộ-trước-khi-nhận-teardown)
+- [Ghép thành Observable có lifecycle](#ghép-thành-observable-có-lifecycle)
+  - [Subscribe nhận cả Subscriber đã tạo sẵn](#subscribe-nhận-cả-subscriber-đã-tạo-sẵn)
+  - [Phân biệt lỗi producer và lỗi callback](#phân-biệt-lỗi-producer-và-lỗi-callback)
+- [Tự viết source of và interval](#tự-viết-source-of-và-interval)
+- [Operator là hàm bọc Observable](#operator-là-hàm-bọc-observable)
+  - [Upstream và downstream bằng tên dễ hiểu](#upstream-và-downstream-bằng-tên-dễ-hiểu)
+- [Implement map không giấu trong helper](#implement-map-không-giấu-trong-helper)
+  - [Code của map](#code-của-map)
+  - [Ba thời điểm khác nhau](#ba-thời-điểm-khác-nhau)
+  - [Theo dõi một giá trị đi qua map](#theo-dõi-một-giá-trị-đi-qua-map)
+  - [Map chuyển tiếp kết thúc và liên kết cleanup](#map-chuyển-tiếp-kết-thúc-và-liên-kết-cleanup)
+- [Pipe chỉ ghép các operator](#pipe-chỉ-ghép-các-operator)
+- [Viết tiếp filter và take](#viết-tiếp-filter-và-take)
+  - [Tách phần nối Subscriber thành connect](#tách-phần-nối-subscriber-thành-connect)
+  - [Filter chỉ quyết định có chuyển tiếp không](#filter-chỉ-quyết-định-có-chuyển-tiếp-không)
+  - [Take đếm rồi đóng cả chuỗi](#take-đếm-rồi-đóng-cả-chuỗi)
+- [Lần theo một pipeline hoàn chỉnh](#lần-theo-một-pipeline-hoàn-chỉnh)
+- [Toàn bộ implementation trong một khối code](#toàn-bộ-implementation-trong-một-khối-code)
+- [Tự kiểm tra các quy tắc](#tự-kiểm-tra-các-quy-tắc)
+- [Giới hạn và bước tiếp theo](#giới-hạn-và-bước-tiếp-theo)
+
+## Cách đọc bài này
+
+Đọc lần lượt đến `map` trước, chưa cần nhớ hết `filter` và `take`. Mỗi phần bổ sung một khả năng còn thiếu của phần trước:
+
+| Bước | Vấn đề cần giải quyết | Thành phần mình viết |
+| --- | --- | --- |
+| 1 | Đưa dữ liệu từ nơi tạo sang nơi nhận | Callback |
+| 2 | Giữ công thức và chỉ chạy khi có người nghe | Observable |
+| 3 | Báo dữ liệu, lỗi và kết thúc | Observer |
+| 4 | Không nhận thêm notification sau kết thúc | Subscriber |
+| 5 | Dừng timer và giải phóng tài nguyên | Subscription, teardown |
+| 6 | Biến đổi dữ liệu mà không sửa source | Map và các operator |
+| 7 | Ghép nhiều bước biến đổi | Pipe |
+
+Các bản có tên `SimpleObservable`, `ObserverObservable` và `StoppingSubscriber` là **bước minh họa**, không phải những class bạn cần giữ trong bản cuối. Phần [toàn bộ implementation](#toàn-bộ-implementation-trong-một-khối-code) có một khối TypeScript hoàn chỉnh, thống nhất các phần lại với nhau.
+
+## Bắt đầu từ một callback
+
+Chưa có Observable, mình chỉ viết một hàm tạo dữ liệu:
+
+```ts
+function produce(send: (value: number) => void) {
+  send(1);
+  send(2);
+  send(3);
+}
+
+produce((value) => {
+  console.log('Nhận:', value);
+});
+```
+
+`produce` biết cách tạo dữ liệu. Callback được truyền vào biết làm gì với dữ liệu. Producer chủ động gọi callback, nên đây là cơ chế **push**:
+
+```text
+produce chạy
+  → send(1) → callback của bạn nhận 1
+  → send(2) → callback của bạn nhận 2
+  → send(3) → callback của bạn nhận 3
+```
+
+Không có thread hay queue đặc biệt nào ở đây. Nó chỉ là function gọi function trên cùng call stack.
+
+## Observable chỉ giữ hàm tạo dữ liệu
+
+### Constructor chưa chạy producer
+
+Mình bọc hàm tạo dữ liệu trong một object:
+
+```ts
+class SimpleObservable<T> {
+  constructor(
+    private producer: (send: (value: T) => void) => void,
+  ) {}
+
+  subscribe(onValue: (value: T) => void): void {
+    this.producer(onValue);
+  }
+}
+```
+
+Cú pháp `private producer` trong constructor là cách TypeScript khai báo và gán property. Bạn có thể hiểu nó tương đương:
+
+```ts
+// Minh họa ý nghĩa của constructor, không phải class mới.
+constructor(producer) {
+  this.producer = producer;
+}
+```
+
+Dòng này **lưu function**, không gọi function. Producer chưa chạy khi `new SimpleObservable(...)`.
+
+### Subscribe mới chạy producer
+
+```ts
+const numbers$ = new SimpleObservable<number>((send) => {
+  console.log('B: producer chạy');
+  send(10);
+  send(20);
+});
+
+console.log('A: đã tạo Observable');
+
+numbers$.subscribe((value) => {
+  console.log('Nhận:', value);
+});
+
+console.log('C: subscribe đã trả về');
+```
+
+Output:
+
+```text
+A: đã tạo Observable
+B: producer chạy
+Nhận: 10
+Nhận: 20
+C: subscribe đã trả về
+```
+
+Dữ liệu xuất hiện trước dòng C vì producer này đồng bộ. `subscribe` không có nghĩa là tự chuyển công việc sang bất đồng bộ.
+
+Subscribe lần hai sẽ gọi producer lần hai. Với source tạo công việc riêng trong producer, mỗi subscription có execution riêng: đó là hành vi cold của các source trong bài này. Dấu `$` chỉ là quy ước đặt tên biến, không thay đổi cách JavaScript chạy.
+
+## Observer là object chứa ba callback
+
+Một callback `send` chưa đủ nếu producer cần báo lỗi hoặc báo hết dữ liệu. Mình thay nó bằng object có ba callback:
+
+```ts
+interface Observer<T> {
+  next(value: T): void;
+  error(error: unknown): void;
+  complete(): void;
+}
+```
+
+### Interface không làm gì ở runtime
+
+`Observer<T>` chỉ là mô tả kiểu cho TypeScript. Nó không tạo object, không tự chặn dữ liệu và không tự cleanup.
+
+Object thật do người dùng cung cấp:
+
+```ts
+const observer: Observer<number> = {
+  next: (value) => console.log('Nhận:', value),
+  error: (error) => console.log('Lỗi:', error),
+  complete: () => console.log('Xong'),
+};
+```
+
+### Ai gọi next và complete
+
+Mình sửa Observable để truyền object này vào producer:
+
+```ts
+class ObserverObservable<T> {
+  constructor(
+    private producer: (observer: Observer<T>) => void,
+  ) {}
+
+  subscribe(observer: Observer<T>): void {
+    this.producer(observer);
+  }
+}
+
+const source$ = new ObserverObservable<number>((observer) => {
+  observer.next(10);
+  observer.next(20);
+  observer.complete();
+});
+
+source$.subscribe({
+  next: (value) => console.log('Nhận:', value),
+  error: (error) => console.log('Lỗi:', error),
+  complete: () => console.log('Xong'),
+});
+```
+
+Object ở `subscribe` chính là object producer nhận được. Vì vậy `observer.next(10)` là gọi callback `next` mà người dùng vừa truyền vào, với tham số 10.
+
+```text
+subscribe(object chứa callback)
+  → producer(object đó)
+    → object.next(10)
+      → console.log('Nhận:', 10)
+```
+
+Ở phiên bản này, `complete()` vẫn chỉ là lời gọi callback. Viết `observer.next(999)` sau complete vẫn gọi callback next. Mình cần bổ sung trạng thái, không thể trông chờ `interface Observer` làm việc đó.
+
+## Subscriber chặn notification sau khi kết thúc
+
+### Đặt trạng thái dừng ở đâu
+
+Mình thêm một object đứng giữa producer và Observer:
+
+```ts
+class StoppingSubscriber<T> {
+  private stopped = false;
+
+  constructor(private observer: Observer<T>) {}
+
+  next(value: T): void {
+    if (this.stopped) return;
+    this.observer.next(value);
+  }
+
+  error(error: unknown): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.observer.error(error);
+  }
+
+  complete(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.observer.complete();
+  }
+}
+```
+
+Dòng chặn sau kết thúc nằm ngay ở đầu `next`:
+
+```ts
+if (this.stopped) return;
+```
+
+Cả `error` và `complete` đặt `stopped = true`. Từ đó, mọi notification tiếp theo đều bị bỏ qua, kể cả lần gọi complete thứ hai hoặc error sau complete.
+
+Đặt trạng thái dừng **trước** khi gọi callback giúp xử lý cả trường hợp callback tự gọi lại Subscriber. Nếu callback complete cố gọi next, trạng thái đã dừng nên next bị chặn ngay.
+
+### Observable phải bọc Observer bằng Subscriber
+
+Trước đây Observable truyền Observer trực tiếp cho producer. Bây giờ nó tạo Subscriber trước:
+
+```ts
+// Phần cốt lõi của subscribe ở bước này.
+const subscriber = new StoppingSubscriber(observer);
+this.producer(subscriber);
+```
+
+Luồng gọi trở thành:
+
+```text
+Producer → Subscriber.next(value) → Observer.next(value)
+              kiểm tra stopped       callback người dùng
+```
+
+**Observer là callback bạn cung cấp; Subscriber là object implementation tạo ra để bảo vệ callback đó.**
+
+### Chặn notification chưa phải dừng công việc
+
+Nếu producer làm như sau:
+
+```ts
+subscriber.complete();
+console.log('Producer vẫn chạy đến dòng này');
+subscriber.next(999);
+```
+
+`next(999)` bị bỏ qua nhưng `console.log` vẫn chạy. `complete()` không làm JavaScript tự thoát khỏi function producer.
+
+Với timer cũng vậy: chỉ chặn next thì timer vẫn hoạt động. Mình cần cơ chế dọn tài nguyên thật sự.
+
+## Subscription và teardown dọn tài nguyên
+
+### Producer trả về cách dọn dẹp
+
+Ví dụ producer mở một timer:
+
+```ts
+// Dùng Observable hoàn chỉnh ở các phần sau.
+const timer$ = new Observable<number>((subscriber) => {
+  let value = 0;
+
+  const timer = setInterval(() => {
+    subscriber.next(value++);
+  }, 1000);
+
+  return () => {
+    clearInterval(timer);
+    console.log('Đã dọn timer');
+  };
+});
+```
+
+Hàm được trả về là **teardown**. Nó mô tả cách dọn công việc producer đã tạo, không chạy ngay tại câu lệnh return.
+
+```ts
+return () => clearInterval(timer); // Trả một function.
+```
+
+Khác với:
+
+```ts
+clearInterval(timer); // Dọn ngay bây giờ.
+```
+
+Observable lấy function producer trả về và đăng ký nó vào Subscription.
+
+### Hàm add ở đâu ra
+
+`add` là method mình tự viết trong class `Subscription`, không phải hàm có sẵn của JavaScript. Đây là bản tối giản, chỉ nhận cleanup dạng function:
+
+```ts
+class BasicSubscription {
+  closed = false;
+  private cleanups: (() => void)[] = [];
+
+  add(cleanup: void | (() => void)): void {
+    if (!cleanup) return;
+
+    if (this.closed) cleanup();
+    else this.cleanups.push(cleanup);
+  }
+
+  unsubscribe(): void {
+    if (this.closed) return;
+    this.closed = true;
+
+    const pending = this.cleanups;
+    this.cleanups = [];
+
+    for (const cleanup of pending) {
+      cleanup();
+    }
+  }
+}
+```
+
+Hiểu `add(fn)` là: **“Khi tôi bị hủy, hãy chạy thêm công việc fn này.”**
+
+```ts
+subscription.add(() => console.log('Cleanup'));
+// Chưa in gì nếu subscription còn mở.
+
+subscription.unsubscribe();
+// Bây giờ mới in Cleanup.
+```
+
+Kiểm tra `closed` làm `unsubscribe` có tính idempotent: gọi nhiều lần không chạy lại cleanup.
+
+Bản hoàn chỉnh cuối bài mở rộng `add` để nhận cả Subscription con. Nếu nhận function thì gọi function; nếu nhận Subscription thì gọi `unsubscribe` của nó. Bản đó cũng gom lỗi cleanup để một cleanup throw không ngăn các cleanup khác chạy.
+
+### Subscriber kế thừa Subscription
+
+Đến đây mình ghép hai trách nhiệm:
+
+```ts
+class Subscriber<T> extends Subscription {
+  // next, error, complete và trạng thái stopped.
+}
+```
+
+Nhờ `extends`, Subscriber có sẵn `add`, `unsubscribe` và `closed` từ Subscription. Constructor của Subscriber gọi `super()` để khởi tạo phần Subscription.
+
+`next` kiểm tra cả kết thúc và hủy thủ công:
+
+```ts
+if (this.closed || this.stopped) return;
+```
+
+`complete` báo kết thúc rồi cleanup:
+
+```ts
+complete(): void {
+  if (this.closed || this.stopped) return;
+  this.stopped = true;
+
+  try {
+    this.destination.complete?.();
+  } finally {
+    this.unsubscribe();
+  }
+}
+```
+
+Đây là đoạn cốt lõi; bản cuối còn bắt lỗi callback. `error` cũng đi qua `unsubscribe` trong finally.
+
+| Hành động | Callback người dùng | Cleanup |
+| --- | --- | --- |
+| `complete()` | Gọi complete | Có |
+| `error(err)` | Gọi error nếu đăng ký | Có |
+| `unsubscribe()` thủ công | Không gọi complete hoặc error | Có |
+
+`stopped` bảo vệ terminal notification ngay trong lúc callback đang chạy. `closed` biểu thị Subscription đã bị đóng. Hai trạng thái có liên quan nhưng không hoàn toàn trùng nhau về thời điểm.
+
+### Complete đồng bộ trước khi nhận teardown
+
+Một producer có thể hoàn thành ngay:
+
+```ts
+const source$ = new Observable<number>((subscriber) => {
+  subscriber.next(1);
+  subscriber.complete();
+
+  return () => console.log('Cleanup');
+});
+```
+
+Thứ tự bên trong subscribe:
+
+```text
+1. Producer chạy.
+2. Producer gọi complete, Subscriber unsubscribe và đóng.
+3. Producer trả về teardown.
+4. Observable gọi subscriber.add(teardown).
+```
+
+Ở bước 4 Subscription đã đóng. Nếu `add` chỉ lưu function thì sẽ không còn lần unsubscribe nào để chạy nó. Vì vậy cần nhánh:
+
+```ts
+if (this.closed) {
+  cleanup();
+}
+```
+
+Đây không phải trường hợp hiếm: source đồng bộ có thể kết thúc ngay bên trong lời gọi subscribe.
+
+## Ghép thành Observable có lifecycle
+
+Phần constructor và subscribe hoàn chỉnh:
+
+```ts
+class Observable<T> {
+  constructor(
+    private producer: (subscriber: Subscriber<T>) => Teardown,
+  ) {}
+
+  subscribe(
+    observer: Partial<Observer<T>> | ((value: T) => void) = {},
+  ): Subscription {
+    const subscriber = observer instanceof Subscriber
+      ? observer
+      : new Subscriber(
+          typeof observer === 'function' ? { next: observer } : observer,
+        );
+
+    if (subscriber.closed) return subscriber;
+
+    try {
+      subscriber.add(this.producer(subscriber));
+    } catch (error) {
+      if (subscriber.closed) reportUnhandledError(error);
+      else subscriber.error(error);
+    }
+
+    return subscriber;
+  }
+}
+```
+
+`Teardown`, `Subscriber` và `reportUnhandledError` được định nghĩa đầy đủ trong khối code cuối bài. `Partial<Observer<T>>` cho phép bạn bỏ các callback không cần; truyền một function riêng thì function đó được dùng làm callback next.
+
+Đọc dòng quan trọng từ trong ra ngoài:
+
+```ts
+subscriber.add(this.producer(subscriber));
+```
+
+1. Chạy producer với Subscriber.
+2. Producer trả về teardown nếu có.
+3. Đăng ký teardown vào Subscriber.
+4. Trả Subscriber như một Subscription cho người dùng.
+
+### Subscribe nhận cả Subscriber đã tạo sẵn
+
+Vì Subscriber có các method next, error, complete nên nó cũng phù hợp với kiểu Observer. Khi operator tự tạo Subscriber, mình không muốn Observable bọc thêm một Subscriber khác:
+
+```ts
+observer instanceof Subscriber
+  ? observer
+  : new Subscriber(...)
+```
+
+Nhánh này đảm bảo Subscriber được operator liên kết cleanup cũng chính là Subscriber producer sử dụng. Nó đặc biệt quan trọng khi source đồng bộ cần nhìn thấy `closed` ngay trong vòng lặp.
+
+### Phân biệt lỗi producer và lỗi callback
+
+Có hai loại lỗi khác nhau:
+
+| Lỗi phát sinh ở đâu | Cách bản mini xử lý |
+| --- | --- |
+| Producer throw trong lúc subscribe, trước khi đóng | Gọi subscriber.error |
+| Hàm biến đổi của map hoặc predicate của filter throw | Operator bắt và gọi downstream.error |
+| Callback next, error hoặc complete của người dùng throw | Báo lỗi chưa được xử lý, không biến nó thành notification của cùng Observer |
+
+Trong bản cuối, mình dùng helper này cho lỗi chưa được xử lý:
+
+```ts
+function reportUnhandledError(error: unknown): void {
+  queueMicrotask(() => { throw error; });
+}
+```
+
+Đây là lựa chọn của bản học tập, không phải bản sao scheduler báo lỗi của RxJS. Lỗi được throw ở microtask tiếp theo và có thể khiến chương trình Node thoát nếu không được xử lý ở cấp ứng dụng.
+
+Nếu callback next của người dùng throw, mình không gọi ngược lại error của cùng Observer. Còn một lỗi trong hàm biến đổi của map là lỗi của pipeline, nên đi qua notification error.
+
+<Callout type="warn" title="Try/catch của subscribe không bao quanh mọi công việc tương lai">
+  Khi callback timer chạy, subscribe đã trả về. Lỗi bên trong timer cần được xử lý tại nơi phát sinh. Vì vậy map và filter tự bắt lỗi hàm biến đổi/predicate, thay vì chỉ dựa vào try/catch trong Observable.subscribe.
+</Callout>
+
+## Tự viết source of và interval
+
+`of` là producer đồng bộ:
+
+```ts
+function of<T>(...values: T[]): Observable<T> {
+  return new Observable<T>((subscriber) => {
+    for (const value of values) {
+      if (subscriber.closed) break;
+      subscriber.next(value);
+    }
+
+    subscriber.complete();
+  });
+}
+```
+
+Kiểm tra `closed` là sự hợp tác của producer với cancellation. Nếu downstream hủy trong lúc nhận một giá trị, vòng lặp không phát giá trị tiếp theo.
+
+`interval` là producer dùng timer:
+
+```ts
+function interval(periodMs: number): Observable<number> {
+  if (!Number.isFinite(periodMs) || periodMs < 0) {
+    throw new RangeError('periodMs phải hữu hạn và không âm');
+  }
+
+  return new Observable<number>((subscriber) => {
+    let counter = 0;
+    const timer = setInterval(() => subscriber.next(counter++), periodMs);
+
+    return () => clearInterval(timer);
+  });
+}
+```
+
+Timer và counter nằm trong producer nên mỗi subscribe tạo một bộ riêng. Async ở đây đến từ timer của JavaScript, không phải Observable tự tạo thread.
+
+## Operator là hàm bọc Observable
+
+Chữ ký operator:
+
+```ts
+type OperatorFunction<T, R> =
+  (source: Observable<T>) => Observable<R>;
+```
+
+Nó nhận cả Observable, không phải một giá trị đơn lẻ. Observable mới biết cách nghe source và chuyển tiếp kết quả, nhưng producer của nó chỉ chạy khi có subscribe.
+
+Với map có ba lớp cần phân biệt:
+
+```text
+map(hàm biến đổi)
+  → trả về operator
+
+operator(source)
+  → trả về Observable mới
+
+Observable mới.subscribe(observer)
+  → chạy công việc, bắt đầu nghe source
+```
+
+### Upstream và downstream bằng tên dễ hiểu
+
+Chỉ nhìn một operator ở giữa:
+
+```text
+Nguồn phát 2 → map nhân 10 → bạn nhận 20
+```
+
+Đứng ở vị trí map:
+
+```text
+source ──→ map ──→ bạn
+ đầu vào          đầu ra
+ upstream         downstream
+```
+
+Hai từ này là **tên gọi tương đối theo hướng dữ liệu**, không phải hai loại object mới. Trong phần map mình dùng tên rõ hơn:
+
+| Tên biến | Nó làm gì | Tên ngắn thường dùng |
+| --- | --- | --- |
+| `nguoiNhanTuNguon` | Subscriber nhận giá trị gốc để map xử lý | upstream Subscriber |
+| `nguoiNhanKetQua` | Subscriber nhận kết quả map chuyển tiếp | downstream Subscriber |
+
+Map vừa là người nhận đối với source, vừa là người gửi đối với phía sau nó. Vì thế có hai Subscriber phục vụ hai phía.
+
+Nếu phía sau map còn có filter, người nhận kết quả của map là Subscriber của filter, chưa phải callback cuối cùng của người dùng. Không nên hiểu downstream luôn là người dùng cuối.
+
+## Implement map không giấu trong helper
+
+### Code của map
+
+```ts
+function map<T, R>(
+  bienDoi: (value: T) => R,
+): OperatorFunction<T, R> {
+  return function operator(nguon: Observable<T>): Observable<R> {
+    return new Observable<R>((nguoiNhanKetQua) => {
+      const nguoiNhanTuNguon = new Subscriber<T>({
+        next: (value) => {
+          let ketQua: R;
+
+          try {
+            ketQua = bienDoi(value);
+          } catch (error) {
+            nguoiNhanKetQua.error(error);
+            return;
+          }
+
+          nguoiNhanKetQua.next(ketQua);
+        },
+
+        error: (error) => nguoiNhanKetQua.error(error),
+        complete: () => nguoiNhanKetQua.complete(),
+      });
+
+      nguoiNhanKetQua.add(() => nguoiNhanTuNguon.unsubscribe());
+      nguon.subscribe(nguoiNhanTuNguon);
+    });
+  };
+}
+```
+
+Phần biến đổi thực sự chỉ là hai thao tác:
+
+```ts
+ketQua = bienDoi(value);
+nguoiNhanKetQua.next(ketQua);
+```
+
+Các dòng còn lại giúp đăng ký nguồn, chuyển tiếp kết thúc, xử lý lỗi và giữ cleanup đúng.
+
+### Ba thời điểm khác nhau
+
+Tạm chưa dùng pipe:
+
+```ts
+const nguon$ = of(1, 2, 3);
+
+// A: giữ hàm nhân 10, trả về operator.
+const nhan10 = map((value: number) => value * 10);
+
+// B: giữ nguồn, trả về Observable mới.
+const ketQua$ = nhan10(nguon$);
+
+// C: chạy producer của Observable mới.
+ketQua$.subscribe({
+  next: (value) => console.log('Nhận:', value),
+  error: (error) => console.log('Lỗi:', error),
+  complete: () => console.log('Xong'),
+});
+```
+
+Output:
+
+```text
+Nhận: 10
+Nhận: 20
+Nhận: 30
+Xong
+```
+
+**Ở A:** `map` trả về function `operator`. Function này vẫn truy cập được `bienDoi` nhờ closure. Chưa có source nào chạy.
+
+**Ở B:** `operator(nguon$)` tạo Observable mới. Producer mới giữ được `nguon` và `bienDoi` nhờ closure. Constructor chỉ lưu producer nên source vẫn chưa chạy.
+
+**Ở C:** subscribe tạo `nguoiNhanKetQua`, chạy producer của Observable mới, tạo `nguoiNhanTuNguon`, liên kết cleanup rồi gọi `nguon.subscribe(...)`.
+
+### Theo dõi một giá trị đi qua map
+
+Khi source phát 2:
+
+```text
+Producer của nguồn gọi nguoiNhanTuNguon.next(2)
+  → Subscriber kiểm tra trạng thái
+  → callback next trong map nhận value = 2
+  → bienDoi(2) trả về 20
+  → nguoiNhanKetQua.next(20)
+  → callback của bạn in Nhận: 20
+```
+
+Không có dữ liệu nào được lưu vào một array trung gian. Mỗi giá trị được xử lý ngay khi source gọi next. Nếu hàm biến đổi trả về một object hoặc Promise, map cũng chỉ chuyển tiếp giá trị đó; nó không tự đợi Promise hay tự subscribe một Observable trả về.
+
+### Map chuyển tiếp kết thúc và liên kết cleanup
+
+Nếu source complete, map phải chuyển tiếp complete để phía nhận biết chuỗi đã kết thúc:
+
+```ts
+complete: () => nguoiNhanKetQua.complete()
+```
+
+Nếu source error, map chuyển tiếp error. Nếu `bienDoi` throw, map bắt lỗi đó và chủ động gọi error phía kết quả. Sau error không có complete cho cùng subscription.
+
+Dòng cleanup này không chạy ngay khi add:
+
+```ts
+nguoiNhanKetQua.add(() => nguoiNhanTuNguon.unsubscribe());
+```
+
+Nó lưu quy tắc: **khi phía nhận kết quả bị hủy, cũng ngừng nghe source**.
+
+```text
+nguoiNhanKetQua.unsubscribe()
+  → chạy function đã add
+  → nguoiNhanTuNguon.unsubscribe()
+  → source cleanup
+```
+
+Phải liên kết cleanup trước khi subscribe source. Với source đồng bộ, việc phát giá trị có thể hoàn tất ngay bên trong lời gọi subscribe. Nếu tạo liên kết sau đó, cancellation từ phía ngoài có thể đến quá muộn để ngăn source tiếp tục tính toán.
+
+## Pipe chỉ ghép các operator
+
+Sau khi có operator, pipe không cần biết map hoặc filter làm gì. Nó chỉ đưa Observable kết quả của bước trước vào bước sau:
+
+```ts
+// Method bên trong class Observable; bản cuối thêm overload TypeScript.
+pipe(...operators: OperatorFunction<any, any>[]): Observable<any> {
+  let result: Observable<any> = this;
+
+  for (const operator of operators) {
+    result = operator(result);
+  }
+
+  return result;
+}
+```
+
+Tương đương dùng reduce:
+
+```ts
+return operators.reduce(
+  (source, operator) => operator(source),
+  this as Observable<any>,
+);
+```
+
+Ví dụ:
+
+```ts
+source$.pipe(operatorA, operatorB, operatorC);
+
+// Cấu trúc tương đương:
+operatorC(operatorB(operatorA(source$)));
+```
+
+Trong ví dụ map phía trên:
+
+```ts
+const ketQua$ = nhan10(nguon$);
+
+// Tương đương:
+const ketQuaTuPipe$ = nguon$.pipe(
+  map((value) => value * 10),
+);
+```
+
+Pipe chỉ dựng các lớp Observable. Subscribe mới bắt đầu nghe các lớp đó. Bản cuối có overload cho tối đa ba operator để TypeScript suy luận đầu vào/đầu ra từng bước; `any` chỉ nằm ở implementation runtime ghép các hàm.
+
+## Viết tiếp filter và take
+
+### Tách phần nối Subscriber thành connect
+
+Đến đây mới nên tách helper, vì bạn đã nhìn thấy phần nối trong map. Filter và take cũng cần tạo Subscriber nghe source, chuyển tiếp error/complete và liên kết cleanup:
+
+```ts
+function connect<T, R>(
+  source: Observable<T>,
+  downstream: Subscriber<R>,
+  next: (value: T) => void,
+): void {
+  const upstream = new Subscriber<T>({
+    next,
+    error: (error) => downstream.error(error),
+    complete: () => downstream.complete(),
+  });
+
+  downstream.add(() => upstream.unsubscribe());
+  source.subscribe(upstream);
+}
+```
+
+`upstream` ở đây là `nguoiNhanTuNguon`, `downstream` là `nguoiNhanKetQua`. Helper chỉ gom phần lặp lại, không bổ sung cơ chế mới.
+
+### Filter chỉ quyết định có chuyển tiếp không
+
+```ts
+function filter<T>(
+  predicate: (value: T) => boolean,
+): OperatorFunction<T, T> {
+  return (source) => new Observable<T>((downstream) => {
+    connect(source, downstream, (value) => {
+      let passes: boolean;
+
+      try {
+        passes = predicate(value);
+      } catch (error) {
+        downstream.error(error);
+        return;
+      }
+
+      if (passes) downstream.next(value);
+    });
+  });
+}
+```
+
+Giá trị không thỏa predicate thì không chuyển tiếp, nhưng subscription vẫn mở và tiếp tục nghe giá trị khác. Filter không phải complete mỗi khi gặp một giá trị bị loại.
+
+### Take đếm rồi đóng cả chuỗi
+
+```ts
+function take<T>(count: number): OperatorFunction<T, T> {
+  if (!Number.isInteger(count) || count < 0) {
+    throw new RangeError('count phải là số nguyên không âm');
+  }
+
+  return (source) => new Observable<T>((downstream) => {
+    if (count === 0) {
+      downstream.complete();
+      return;
+    }
+
+    let seen = 0;
+
+    connect(source, downstream, (value) => {
+      seen++;
+      if (seen <= count) downstream.next(value);
+      if (seen >= count) downstream.complete();
+    });
+  });
+}
+```
+
+`seen` nằm **trong producer**, vì mỗi subscribe cần bộ đếm riêng. Đặt nó ngoài producer sẽ làm các subscription dùng chung state.
+
+Khi đủ count, take gọi downstream.complete. Complete gọi unsubscribe, chạy cleanup đã đăng ký, rồi unsubscribe upstream. Source đồng bộ thấy closed thì ngừng vòng lặp; source timer chạy teardown để clear timer.
+
+Take không thể ép một producer tùy ý ngừng mọi việc. Producer phải hợp tác bằng cách kiểm tra closed hoặc đăng ký cleanup có khả năng hủy công việc thật sự.
+
+`take(0)` complete mà không subscribe source. Nếu source là timer thì timer chưa từng được tạo. Bản mini cố ý giới hạn count là số nguyên không âm, không cố tương thích mọi input của RxJS thật.
+
+## Lần theo một pipeline hoàn chỉnh
+
+```ts
+const result$ = of(1, 2, 3, 4, 5).pipe(
+  map((value) => value * 2),
+  filter((value) => value >= 4),
+  take(2),
+);
+
+result$.subscribe({
+  next: (value) => console.log('Nhận:', value),
+  error: (error) => console.log('Lỗi:', error),
+  complete: () => console.log('Xong'),
+});
+```
+
+Output:
+
+```text
+Nhận: 4
+Nhận: 6
+Xong
+```
+
+Theo từng giá trị:
+
+| Source phát | Map nhân 2 | Filter >= 4 | Take |
+| --- | --- | --- | --- |
+| 1 | 2 | Loại | Không nhận |
+| 2 | 4 | Giữ | Đếm 1, phát 4 |
+| 3 | 6 | Giữ | Đếm 2, phát 6, complete |
+| 4, 5 | Không được phát | Không được xử lý | Đã đóng |
+
+Có ba hướng gọi cần phân biệt:
+
+```text
+Đăng ký nghe:   bạn → take → filter → map → source
+Chuyển dữ liệu: source → map → filter → take → bạn
+Hủy công việc:  subscription ngoài → subscription trong → source cleanup
+```
+
+Take complete phía ngoài rồi cascade unsubscribe vào trong. Nhờ connect liên kết từ trước, Subscriber mà of sử dụng đã closed ngay trong lần gọi next thứ ba của source. Vòng lặp of kiểm tra closed trước lượt tiếp theo nên không phát 4, 5.
+
+Không có array kết quả được tính sẵn lúc pipe. Tất cả diễn ra theo lời gọi next của source.
+
+## Toàn bộ implementation trong một khối code
+
+Đây là bản thống nhất để đọc hoặc copy thử: các tên không bị đổi giữa các đoạn, map được viết trực tiếp, filter/take dùng connect. Không cần các file demo riêng hay package RxJS. Bản này dùng `AggregateError`, nên chọn TypeScript target ES2021 trở lên nếu tự compile.
+
+```ts title="mini-rxjs.ts"
+// Bản học tập: không import RxJS. Đọc Observable trước, rồi Subscriber/Subscription.
+interface Observer<T> {
+  next(value: T): void;
+  error(error: unknown): void;
+  complete(): void;
+}
+
+type Teardown = void | (() => void) | Subscription;
+type OperatorFunction<T, R> = (source: Observable<T>) => Observable<R>;
+
+// Lỗi trong callback của người dùng không phải lỗi của stream.
+// Báo ở microtask tiếp theo thay vì gọi ngược vào observer.error().
+function reportUnhandledError(error: unknown): void {
+  queueMicrotask(() => { throw error; });
+}
+
+// 1. Subscription = công tắc dừng + danh sách công việc dọn dẹp.
+class Subscription {
+  closed = false;
+  private teardowns: Exclude<Teardown, void>[] = [];
+
+  add(teardown: Teardown): void {
+    if (!teardown || teardown === this) return;
+
+    // Source có thể complete đồng bộ, trước khi trả về hàm cleanup!
+    if (this.closed) {
+      this.run(teardown);
+    } else {
+      this.teardowns.push(teardown);
+    }
+  }
+
+  unsubscribe(): void {
+    if (this.closed) return;
+    this.closed = true;
+
+    const pending = this.teardowns;
+    this.teardowns = [];
+    const errors: unknown[] = [];
+    for (const teardown of pending) {
+      try {
+        this.run(teardown);
+      } catch (error) {
+        // Một cleanup lỗi không được ngăn các cleanup còn lại chạy.
+        errors.push(error);
+      }
+    }
+    if (errors.length) throw new AggregateError(errors, 'Cleanup thất bại');
+  }
+
+  private run(teardown: Exclude<Teardown, void>): void {
+    if (typeof teardown === 'function') teardown();
+    else teardown.unsubscribe();
+  }
+}
+
+// 2. Subscriber = Observer có thêm trạng thái và khả năng cleanup.
+// Source gọi Subscriber, không gọi trực tiếp callback của người dùng.
+class Subscriber<T> extends Subscription implements Observer<T> {
+  private stopped = false;
+
+  constructor(private destination: Partial<Observer<T>>) {
+    super();
+  }
+
+  next(value: T): void {
+    if (this.closed || this.stopped) return;
+    try {
+      this.destination.next?.(value);
+    } catch (error) {
+      reportUnhandledError(error);
+    }
+  }
+
+  error(error: unknown): void {
+    if (this.closed || this.stopped) return;
+    this.stopped = true;
+    try {
+      if (this.destination.error) this.destination.error(error);
+      else reportUnhandledError(error);
+    } catch (callbackError) {
+      reportUnhandledError(callbackError);
+    } finally {
+      this.unsubscribe();
+    }
+  }
+
+  complete(): void {
+    if (this.closed || this.stopped) return;
+    this.stopped = true;
+    try {
+      this.destination.complete?.();
+    } catch (error) {
+      reportUnhandledError(error);
+    } finally {
+      this.unsubscribe();
+    }
+  }
+}
+
+// 3. Observable chỉ GIỮ hàm mô tả cách tạo dữ liệu, chưa chạy nó.
+class Observable<T> {
+  constructor(private producer: (subscriber: Subscriber<T>) => Teardown) {}
+
+  subscribe(
+    observer: Partial<Observer<T>> | ((value: T) => void) = {},
+  ): Subscription {
+    const subscriber = observer instanceof Subscriber
+      ? observer
+      : new Subscriber(typeof observer === 'function' ? { next: observer } : observer);
+
+    if (subscriber.closed) return subscriber;
+    try {
+      // Chính dòng này bắt đầu công việc, không phải constructor!
+      subscriber.add(this.producer(subscriber));
+    } catch (error) {
+      if (subscriber.closed) reportUnhandledError(error);
+      else subscriber.error(error);
+    }
+    return subscriber;
+  }
+
+  pipe(): Observable<T>;
+  pipe<A>(op1: OperatorFunction<T, A>): Observable<A>;
+  pipe<A, B>(op1: OperatorFunction<T, A>, op2: OperatorFunction<A, B>): Observable<B>;
+  pipe<A, B, C>(
+    op1: OperatorFunction<T, A>,
+    op2: OperatorFunction<A, B>,
+    op3: OperatorFunction<B, C>,
+  ): Observable<C>;
+  // Overload ở trên kiểm tra kiểu từng bước; runtime chỉ ghép các hàm.
+  pipe(...operators: OperatorFunction<any, any>[]): Observable<any> {
+    return operators.reduce((source, operator) => operator(source), this as Observable<any>);
+  }
+}
+
+// Source đồng bộ: phát ngay trên call stack của subscribe().
+function of<T>(...values: T[]): Observable<T> {
+  return new Observable<T>((subscriber) => {
+    for (const value of values) {
+      // take() hoặc unsubscribe() có thể yêu cầu dừng ngay trong next().
+      if (subscriber.closed) break;
+      subscriber.next(value);
+    }
+    subscriber.complete();
+  });
+}
+
+// Source bất đồng bộ: timer do JavaScript cung cấp, không phải RxJS tạo thread.
+function interval(periodMs: number): Observable<number> {
+  if (!Number.isFinite(periodMs) || periodMs < 0) {
+    throw new RangeError('periodMs phải hữu hạn và không âm');
+  }
+  return new Observable<number>((subscriber) => {
+    let counter = 0; // Mỗi subscribe có một counter và timer riêng.
+    const timer = setInterval(() => subscriber.next(counter++), periodMs);
+    return () => clearInterval(timer);
+  });
+}
+
+// Nối upstream vào downstream TRƯỚC khi source bắt đầu phát đồng bộ.
+// Downstream đóng => upstream đóng => cleanup của source được chạy.
+function connect<T, R>(
+  source: Observable<T>,
+  downstream: Subscriber<R>,
+  next: (value: T) => void,
+): void {
+  const upstream = new Subscriber<T>({
+    next,
+    error: (error) => downstream.error(error),
+    complete: () => downstream.complete(),
+  });
+  downstream.add(() => upstream.unsubscribe());
+  source.subscribe(upstream);
+}
+
+function map<T, R>(
+  bienDoi: (value: T) => R,
+): OperatorFunction<T, R> {
+  return function operator(nguon: Observable<T>): Observable<R> {
+    return new Observable<R>((nguoiNhanKetQua) => {
+      const nguoiNhanTuNguon = new Subscriber<T>({
+        next: (value) => {
+          let ketQua: R;
+
+          try {
+            ketQua = bienDoi(value);
+          } catch (error) {
+            nguoiNhanKetQua.error(error);
+            return;
+          }
+
+          nguoiNhanKetQua.next(ketQua);
+        },
+
+        error: (error) => nguoiNhanKetQua.error(error),
+        complete: () => nguoiNhanKetQua.complete(),
+      });
+
+      nguoiNhanKetQua.add(() => nguoiNhanTuNguon.unsubscribe());
+      nguon.subscribe(nguoiNhanTuNguon);
+    });
+  };
+}
+
+function filter<T>(predicate: (value: T) => boolean): OperatorFunction<T, T> {
+  return (source) => new Observable<T>((downstream) => {
+    connect(source, downstream, (value) => {
+      let passes: boolean;
+      try {
+        passes = predicate(value);
+      } catch (error) {
+        downstream.error(error);
+        return;
+      }
+      if (passes) downstream.next(value);
+    });
+  });
+}
+
+function take<T>(count: number): OperatorFunction<T, T> {
+  // Bản mini cố ý chỉ nhận số nguyên không âm.
+  if (!Number.isInteger(count) || count < 0) {
+    throw new RangeError('count phải là số nguyên không âm');
+  }
+  return (source) => new Observable<T>((downstream) => {
+    if (count === 0) {
+      downstream.complete();
+      return; // Không subscribe source, nên không tạo timer.
+    }
+
+    let seen = 0; // State riêng cho MỖI subscription, không đặt ngoài producer.
+    connect(source, downstream, (value) => {
+      seen++;
+      if (seen <= count) downstream.next(value);
+      if (seen >= count) downstream.complete();
+    });
+  });
+}
+```
+
+Ví dụ đặt ngay dưới khối implementation:
+
+```ts
+of(1, 2, 3, 4, 5).pipe(
+  map((value) => value * 2),
+  filter((value) => value >= 4),
+  take(2),
+).subscribe({
+  next: (value) => console.log('Nhận:', value),
+  complete: () => console.log('Xong'),
+});
+```
+
+Để thử cleanup bất đồng bộ, dùng ví dụ này thay cho ví dụ trên:
+
+```ts
+const subscription = interval(1000).subscribe({
+  next: (value) => console.log('Tick:', value),
+  complete: () => console.log('Dòng này không chạy khi hủy thủ công'),
+});
+
+setTimeout(() => {
+  subscription.unsubscribe();
+  console.log('Đã hủy:', subscription.closed);
+}, 2500);
+```
+
+Thông thường có tick 0 và 1 trước khi hủy; thời gian thực tế còn tùy event loop. Teardown dừng timer, nhưng hủy thủ công không gọi complete.
+
+## Tự kiểm tra các quy tắc
+
+Các đoạn sau dùng bản implementation hoàn chỉnh, không dùng thư viện RxJS thật. Chạy từng ví dụ riêng sau khối code; điều cần kiểm tra là cả notification lẫn cleanup.
+
+**Constructor và pipe không chạy producer:**
+
+```ts
+let runs = 0;
+
+const source$ = new Observable<number>((subscriber) => {
+  subscriber.next(++runs);
+  subscriber.complete();
+}).pipe(map((value) => value * 10));
+
+console.assert(runs === 0);
+source$.subscribe(console.log); // 10
+source$.subscribe(console.log); // 20, producer chạy lại
+console.assert(runs === 2);
+```
+
+**Complete chặn notification và vẫn chạy teardown trả về sau đó:**
+
+```ts
+const events: string[] = [];
+
+new Observable<number>((subscriber) => {
+  subscriber.next(1);
+  subscriber.complete();
+  subscriber.next(999);
+
+  return () => events.push('cleanup');
+}).subscribe({
+  next: (value) => events.push(String(value)),
+  complete: () => events.push('complete'),
+});
+
+console.assert(events.join(',') === '1,complete,cleanup');
+```
+
+**Take dừng producer đồng bộ, không chỉ bỏ giá trị ở đầu ra:**
+
+```ts
+let produced = 0;
+let cleaned = 0;
+
+const source$ = new Observable<number>((subscriber) => {
+  for (let value = 0; value < 5 && !subscriber.closed; value++) {
+    produced++;
+    subscriber.next(value);
+  }
+
+  return () => { cleaned++; };
+});
+
+source$.pipe(map((value) => value * 10), take(2)).subscribe(console.log);
+console.assert(produced === 2);
+console.assert(cleaned === 1);
+```
+
+**Lỗi hàm biến đổi kết thúc chuỗi:**
+
+```ts
+of(1, 2, 3).pipe(
+  map((value) => {
+    if (value === 2) throw new Error('Không xử lý được số 2');
+    return value * 10;
+  }),
+).subscribe({
+  next: (value) => console.log(value),
+  error: (error) => console.log(error),
+  complete: () => console.log('Không xuất hiện sau error'),
+});
+```
+
+Nhận 10 rồi error. Không nhận 30, không có complete. Subscriber của source được đóng qua liên kết cleanup, nên vòng lặp of ngừng.
+
+**Mỗi subscription có bộ đếm take riêng:**
+
+```ts
+const result$ = of(1, 2, 3).pipe(take(2));
+result$.subscribe(console.log); // 1, 2
+result$.subscribe(console.log); // 1, 2
+```
+
+Thử chuyển seen ra ngoài producer của take rồi chạy lại để thấy sai lệch, sau đó khôi phục. Đây là cách trực tiếp để hiểu state thuộc về operator được tạo một lần hay subscription được tạo nhiều lần.
+
+<Callout type="warn" title="Không hủy bằng biến chưa được khởi tạo">
+  Với source đồng bộ, callback có thể chạy trước khi subscribe trả về. Vì vậy `const sub = of(1, 2).subscribe(() => sub.unsubscribe())` truy cập sub khi nó chưa được khởi tạo. Dùng take để giới hạn một source đồng bộ; đừng dùng mẫu này để kiểm tra cancellation.
+</Callout>
+
+## Giới hạn và bước tiếp theo
+
+Bản này chưa có Subject, multicast, scheduler, switchMap, retry, share hay toàn bộ các chi tiết tương thích của RxJS. Các source of/interval ở đây cold; không nên suy ra mọi Observable đều cold hoặc mọi nguồn bên ngoài đều chỉ tồn tại sau subscribe.
+
+Unsubscribe cũng không tự abort một Promise hoặc request. Nó chỉ có thể chạy cleanup đã được cung cấp. Nếu cần abort request, producer phải tích hợp cơ chế như AbortController; nếu có vòng lặp nặng, producer phải kiểm tra trạng thái để ngừng tính toán.
+
+Bản mini cũng chưa xử lý toàn bộ quan hệ parent/child subscription như thư viện thật. Teardown throw, cleanup lỗi, source phát reentrant và callback người dùng lỗi đều cần policy rõ ràng trong code production. Mình khuyên dùng bài này để xây mental model rồi dùng RxJS thật cho ứng dụng, không mang nguyên implementation học tập vào production.
+
+Nếu muốn tự viết tiếp, bắt đầu với `tap(effect)`: nó gọi effect khi nhận dữ liệu rồi chuyển tiếp giá trị gốc. Trước khi thêm code, hãy trả lời ba câu: effect chạy lúc nào, lỗi effect đi đâu, và khi người nhận bị hủy thì source được dọn bằng đường nào?
+
+<Cards>
+  <Card title="Subscription và teardown" href="/docs/observable-subscription/subscription-teardown" description="Đối chiếu cleanup và ownership với API RxJS thật." />
+  <Card title="Tự tạo Observable" href="/docs/observable-subscription/custom-observable" description="Áp dụng cơ chế producer và teardown để bọc một nguồn dữ liệu thực tế." />
+  <Card title="Pipe và operator" href="/docs/bat-dau/pipe-va-operator" description="Chuyển từ implementation sang cách xây pipeline bằng thư viện." />
+</Cards>
